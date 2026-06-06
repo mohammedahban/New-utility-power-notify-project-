@@ -43,7 +43,7 @@ function computeDailyStats(events: PowerEvent[]): DayStat[] {
   for (const [dateStr, dayEvents] of byDate.entries()) {
     const [m, d, y] = dateStr.split('/');
     const dateKey = `${y}-${m}-${d}`;
-    const dateLabel = new Date(`${y}-${m}-${d}T12:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const dateLabel = new Date(`${y}-${m}-${d}T12:00:00Z`).toLocaleDateString('ar-SA', { month: 'long', day: 'numeric', year: 'numeric' });
     const dayEnd = new Date(`${y}-${m}-${d}T00:00:00+03:00`).getTime() + 24 * 3600000;
     let outageMs = 0, offTime: number | null = null;
     const offDurations: number[] = [], onDurations: number[] = [];
@@ -253,7 +253,7 @@ const modalStyles = StyleSheet.create({
 function AdminEventItem({ event, onEdit, onDelete }: { event: PowerEvent; onEdit: (e: PowerEvent) => void; onDelete: (e: PowerEvent) => void }) {
   const [expanded, setExpanded] = useState(false);
   const isOn = event.event_type === 'UTILITY_ON';
-  const time = new Date(event.occurred_at).toLocaleString('en-US', { timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short' });
+  const time = new Date(event.occurred_at).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short' });
   return (
     <TouchableOpacity onPress={() => setExpanded(v => !v)} activeOpacity={0.85}>
       <View style={[aeiStyles.row, { borderRightColor: isOn ? '#22c55e' : '#ef4444' }]}>

@@ -131,7 +131,7 @@ function ResyncTimeline({ onViewConflicts, conflictsCount }: { onViewConflicts: 
         events.map((ev, i) => {
           const isOn = ev.reported_state === 'UTILITY_ON';
           const color = isOn ? '#22c55e' : '#ef4444';
-          const effectiveTime = new Date(ev.effective_transition_at).toLocaleString('en-US', {
+          const effectiveTime = new Date(ev.effective_transition_at).toLocaleString('ar-SA', {
             timeZone: 'Asia/Aden', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
           });
           return (

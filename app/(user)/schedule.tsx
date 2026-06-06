@@ -100,7 +100,7 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive }: {
               👥 تم الضبط عبر بلاغ مجتمعي من{' '}
               <Text style={{ fontWeight: '700' }}>{resyncMatch.reporter_username ?? 'جار'}</Text>
               {' '}في{' '}
-              {new Date(resyncMatch.effective_transition_at).toLocaleString('en-US', {
+              {new Date(resyncMatch.effective_transition_at).toLocaleString('ar-SA', {
                 timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit',
               })}
             </Text>
@@ -291,7 +291,7 @@ export default function ScheduleScreen() {
       {userPrediction?.computedAt && (
         <Text style={styles.computedAt}>
           {AR.computedAt}{' '}
-          {new Date(userPrediction.computedAt).toLocaleString('en-US', {
+          {new Date(userPrediction.computedAt).toLocaleString('ar-SA', {
             timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short',
           })} (اليمن)
         </Text>

@@ -72,7 +72,7 @@ serve(async (req) => {
       .select('username')
       .eq('id', reporterId)
       .single();
-    const reporterName = reporterProfile?.username ?? 'Someone';
+    const reporterName = reporterProfile?.username ?? 'شخص ما';
 
     // 2. Get all accepted followers of the reporter
     const { data: follows, error: followsError } = await supabaseAdmin
@@ -144,21 +144,20 @@ serve(async (req) => {
       .in('user_id', recipientIds);
 
     const stateEmoji = reportedState === 'UTILITY_ON' ? '⚡' : '🔴';
-    const stateLabel = reportedState === 'UTILITY_ON' ? 'came ON' : 'went OFF';
-    const timeLabel: Record<string, string> = {
-      now: 'just now',
-      '5min': 'about 5 minutes ago',
-      '10min': 'about 10 minutes ago',
-      '15min': 'about 15 minutes ago',
-      '20min': 'about 20 minutes ago',
+    const stateAr = reportedState === 'UTILITY_ON' ? 'اشتغلت الكهرباء' : 'طفت الكهرباء';
+    const timeLabelAr: Record<string, string> = {
+      now: 'الآن',
+      '5min': 'منذ ~5 دقائق',
+      '10min': 'منذ ~10 دقائق',
+      '15min': 'منذ ~15 دقيقة',
+      '20min': 'منذ ~20 دقيقة',
     };
+    const timeAr = timeLabelAr[timeOption] ?? timeOption;
 
     const pushMessages = (tokens ?? []).map((t: any) => ({
       to: t.token,
-      title: `${stateEmoji} Grid Update from ${reporterName}`,
-      body:
-        `${reporterName} reports electricity ${stateLabel} ` +
-        `(${timeLabel[timeOption] ?? timeOption}). Is this correct for your location?`,
+      title: `${stateEmoji} بلاغ من ${reporterName}`,
+      body: `أفاد ${reporterName} أن ${stateAr} (${timeAr}) — هل هذا صحيح في موقعك؟`,
       data: { type: 'community_resync', reportId },
       priority: 'high',
       sound: 'default',

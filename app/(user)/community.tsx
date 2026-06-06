@@ -602,11 +602,11 @@ const frStyles = StyleSheet.create({
 function HistoryCard({ entry }: { entry: any }) {
   const isOn = entry.reported_state === 'UTILITY_ON';
   const color = isOn ? T.success : T.danger;
-  const effectiveTime = new Date(entry.effective_transition_at).toLocaleString('en-US', {
+  const effectiveTime = new Date(entry.effective_transition_at).toLocaleString('ar-SA', {
     timeZone: 'Asia/Aden', month: 'short', day: 'numeric',
     hour: '2-digit', minute: '2-digit',
   });
-  const confirmedTime = new Date(entry.confirmed_at).toLocaleString('en-US', {
+  const confirmedTime = new Date(entry.confirmed_at).toLocaleString('ar-SA', {
     timeZone: 'Asia/Aden', timeStyle: 'short',
   });
 

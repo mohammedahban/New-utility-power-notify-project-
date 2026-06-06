@@ -127,7 +127,7 @@ function CountdownCard({ prediction }: { prediction: UserPrediction | null }) {
 const cdStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 20, padding: 20, marginBottom: 12, borderWidth: 1, borderColor: T.border },
   label: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 1, marginBottom: 12, textAlign: 'center' },
-  timerRow: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'center', gap: 4, marginBottom: 16 },
+  timerRow: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'center', gap: 4, marginBottom: 16, direction: 'ltr' as any },
   timerUnit: { alignItems: 'center', minWidth: 56 },
   timerVal: { fontSize: 52, fontWeight: '900', letterSpacing: -2, fontVariant: ['tabular-nums'] },
   timerSub: { color: T.textMuted, fontSize: 10, fontWeight: '600', marginTop: -4 },
@@ -304,7 +304,7 @@ function CurrentStatusCard() {
   const isOffline = state.inverter_offline === true;
   const stateColor = isOffline ? T.warning : isOn ? T.success : T.danger;
   const lastPolled = state.last_polled
-    ? new Date(state.last_polled).toLocaleString('en-US', { timeZone: 'Asia/Aden', timeStyle: 'short' })
+    ? new Date(state.last_polled).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', timeStyle: 'short' })
     : '—';
 
   return (
@@ -455,7 +455,7 @@ function WhyPanel({ prediction }: { prediction: UserPrediction | null }) {
             </Text>
             {prediction.computedAt && (
               <Text style={wpStyles.metaItem}>
-                {AR.lastUpdated}: {new Date(prediction.computedAt).toLocaleString('en-US', { timeZone: 'Asia/Aden', timeStyle: 'short', dateStyle: 'short' })}
+                {AR.lastUpdated}: {new Date(prediction.computedAt).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', timeStyle: 'short', dateStyle: 'short' })}
               </Text>
             )}
           </View>

@@ -126,8 +126,8 @@ function ConflictCard({ conflict, onReview }: { conflict: Conflict; onReview: ()
   const reportedColor = isOn(conflict.reported_state) ? T.success : T.danger;
 
   const occurredAt = conflict.estimated_transition_at
-    ? new Date(conflict.estimated_transition_at).toLocaleString('en-US', { timeZone: 'Asia/Aden', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-    : new Date(conflict.created_at).toLocaleString('en-US', { timeZone: 'Asia/Aden', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    ? new Date(conflict.estimated_transition_at).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : new Date(conflict.created_at).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
   return (
     <View style={[ccStyles.card, isReviewed && { opacity: 0.55 }]}>

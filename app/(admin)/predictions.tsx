@@ -316,7 +316,7 @@ export default function AdminPredictions() {
 
   const computedLabel = useMemo(() => {
     if (!computedAt) return null;
-    return new Date(computedAt).toLocaleString('en-US', { timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short' });
+    return new Date(computedAt).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short' });
   }, [computedAt]);
 
   if (loading) {
