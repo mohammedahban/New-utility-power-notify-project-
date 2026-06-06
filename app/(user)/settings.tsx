@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View, Text, ScrollView, Switch, TouchableOpacity, StyleSheet,
   ActivityIndicator, TextInput, Alert, KeyboardAvoidingView, Platform,
@@ -8,19 +8,13 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { useAuth } from '../../contexts/AuthContext';
 import { supabase } from '../../lib/supabase';
+import { AR } from '../../constants/arabic';
 
 const T = {
-  bg: '#0a0f1e',
-  surface: '#0f172a',
-  elevated: '#1e293b',
-  border: '#334155',
-  primary: '#3b82f6',
-  accent: '#38bdf8',
-  textPrimary: '#f1f5f9',
-  textSecondary: '#94a3b8',
-  textMuted: '#64748b',
-  success: '#22c55e',
-  danger: '#ef4444',
+  bg: '#0a0f1e', surface: '#0f172a', elevated: '#1e293b',
+  border: '#334155', primary: '#3b82f6', accent: '#38bdf8',
+  textPrimary: '#f1f5f9', textSecondary: '#94a3b8', textMuted: '#64748b',
+  success: '#22c55e', danger: '#ef4444',
 };
 
 const STORAGE_KEY_SOUND = 'user_notif_sound_enabled';
@@ -29,17 +23,14 @@ export default function UserSettings() {
   const insets = useSafeAreaInsets();
   const { profile, refreshProfile, signOut } = useAuth();
 
-  // ── Profile edit state ──
   const [editingUsername, setEditingUsername] = useState(false);
   const [usernameInput, setUsernameInput] = useState('');
   const [savingUsername, setSavingUsername] = useState(false);
   const [usernameError, setUsernameError] = useState('');
   const [usernameSuccess, setUsernameSuccess] = useState(false);
 
-  // ── Delete account state ──
   const [deletingAccount, setDeletingAccount] = useState(false);
 
-  // ── Notification prefs ──
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [loadingPrefs, setLoadingPrefs] = useState(true);
   const [testSending, setTestSending] = useState(false);
@@ -55,11 +46,8 @@ export default function UserSettings() {
     })();
   }, []);
 
-  // Seed username input when profile loads
   useEffect(() => {
-    if (profile?.username) {
-      setUsernameInput(profile.username);
-    }
+    if (profile?.username) setUsernameInput(profile.username);
   }, [profile?.username]);
 
   const toggleSound = useCallback(async (val: boolean) => {
@@ -69,35 +57,34 @@ export default function UserSettings() {
 
   const handleDeleteAccount = useCallback(() => {
     Alert.alert(
-      'Delete Account',
-      'This will permanently delete your account, all reports, follow connections, and resync history. This cannot be undone.',
+      AR.deleteAccountConfirmTitle,
+      AR.deleteAccountConfirmBody,
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: AR.cancel, style: 'cancel' },
         {
-          text: 'Delete Forever',
+          text: AR.deleteForever,
           style: 'destructive',
           onPress: async () => {
             Alert.alert(
-              'Are you absolutely sure?',
-              `Type "DELETE" to confirm — your account for ${profile?.email} will be permanently removed.`,
+              AR.deleteAccountFinal,
+              AR.deleteAccountFinalBody.replace('{email}', profile?.email ?? ''),
               [
-                { text: 'Cancel', style: 'cancel' },
+                { text: AR.cancel, style: 'cancel' },
                 {
-                  text: 'Yes, Delete',
+                  text: AR.yesDelete,
                   style: 'destructive',
                   onPress: async () => {
                     setDeletingAccount(true);
                     try {
                       const { error } = await supabase.functions.invoke('delete-account', { body: {} });
                       if (error) {
-                        Alert.alert('Error', 'Failed to delete account. Please try again.');
+                        Alert.alert(AR.error, AR.deleteError);
                         setDeletingAccount(false);
                       } else {
-                        // Sign out locally — account is already deleted server-side
                         await signOut();
                       }
                     } catch (_) {
-                      Alert.alert('Error', 'Failed to delete account. Please try again.');
+                      Alert.alert(AR.error, AR.deleteError);
                       setDeletingAccount(false);
                     }
                   },
@@ -112,11 +99,11 @@ export default function UserSettings() {
 
   const handleSaveUsername = useCallback(async () => {
     const trimmed = usernameInput.trim();
-    if (!trimmed) { setUsernameError('Username cannot be empty.'); return; }
-    if (trimmed.length < 3) { setUsernameError('Must be at least 3 characters.'); return; }
-    if (trimmed.length > 30) { setUsernameError('Must be 30 characters or fewer.'); return; }
+    if (!trimmed) { setUsernameError(AR.usernameEmpty); return; }
+    if (trimmed.length < 3) { setUsernameError(AR.usernameTooShort); return; }
+    if (trimmed.length > 30) { setUsernameError(AR.usernameTooLong); return; }
     if (!/^[a-zA-Z0-9_\-.]+$/.test(trimmed)) {
-      setUsernameError('Only letters, numbers, underscores, hyphens, and dots allowed.');
+      setUsernameError(AR.usernameInvalidChars);
       return;
     }
 
@@ -159,8 +146,8 @@ export default function UserSettings() {
       }
       await Notifications.scheduleNotificationAsync({
         content: {
-          title: '⚡ Test Notification',
-          body: 'Grid Monitor notifications are working correctly.',
+          title: '⚡ إشعار تجريبي',
+          body: 'إشعارات مراقب الكهرباء تعمل بشكل صحيح.',
           sound: soundEnabled ? 'alarm.wav' : undefined,
           data: { test: true },
         },
@@ -183,48 +170,36 @@ export default function UserSettings() {
   }
 
   return (
-    <KeyboardAvoidingView
-      style={{ flex: 1, backgroundColor: T.bg }}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-    >
+    <KeyboardAvoidingView style={{ flex: 1, backgroundColor: T.bg }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
       <ScrollView
         style={styles.root}
         contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 40 }]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
-        {/* ── Profile Section ─────────────────────────────────────── */}
-        <Text style={styles.sectionLabel}>PROFILE</Text>
+        {/* Profile */}
+        <Text style={styles.sectionLabel}>{AR.profile}</Text>
         <View style={styles.card}>
-          {/* Avatar row */}
           <View style={styles.avatarRow}>
+            <View style={styles.profileInfo}>
+              <View style={[styles.rolePill, profile?.role === 'admin' && styles.rolePillAdmin]}>
+                <Text style={[styles.rolePillText, profile?.role === 'admin' && { color: '#fbbf24' }]}>
+                  {profile?.role === 'admin' ? AR.adminRole : AR.userRole}
+                </Text>
+              </View>
+              <Text style={styles.profileEmail}>{profile?.email}</Text>
+              <Text style={styles.profileName}>{profile?.username ?? AR.noUsername}</Text>
+            </View>
             <View style={styles.avatar}>
               <Text style={styles.avatarText}>
                 {(profile?.username ?? profile?.email ?? '?')[0].toUpperCase()}
               </Text>
             </View>
-            <View style={styles.profileInfo}>
-              <Text style={styles.profileName}>{profile?.username ?? 'No username set'}</Text>
-              <Text style={styles.profileEmail}>{profile?.email}</Text>
-              <View style={[styles.rolePill, profile?.role === 'admin' && styles.rolePillAdmin]}>
-                <Text style={[styles.rolePillText, profile?.role === 'admin' && { color: '#fbbf24' }]}>
-                  {profile?.role === 'admin' ? '🛡 Admin' : '👤 User'}
-                </Text>
-              </View>
-            </View>
           </View>
 
-          {/* Username editor */}
           <View style={styles.divider} />
           {!editingUsername ? (
             <View style={styles.usernameRow}>
-              <View style={styles.usernameLeft}>
-                <Text style={styles.fieldLabel}>DISPLAY NAME</Text>
-                <Text style={styles.usernameValue}>{profile?.username ?? '—'}</Text>
-                {usernameSuccess && (
-                  <Text style={styles.usernameSuccessText}>✅ Username updated!</Text>
-                )}
-              </View>
               <TouchableOpacity
                 style={styles.editBtn}
                 onPress={() => {
@@ -234,82 +209,78 @@ export default function UserSettings() {
                 }}
                 activeOpacity={0.8}
               >
-                <Text style={styles.editBtnText}>Edit</Text>
+                <Text style={styles.editBtnText}>{AR.edit}</Text>
               </TouchableOpacity>
+              <View style={styles.usernameLeft}>
+                {usernameSuccess && <Text style={styles.usernameSuccessText}>{AR.usernameUpdated}</Text>}
+                <Text style={styles.usernameValue}>{profile?.username ?? '—'}</Text>
+                <Text style={styles.fieldLabel}>{AR.displayName}</Text>
+              </View>
             </View>
           ) : (
             <View style={styles.usernameEditBox}>
-              <Text style={styles.fieldLabel}>DISPLAY NAME</Text>
-              <Text style={styles.usernameHint}>
-                This name appears to other users in the Community tab. Use 3–30 characters: letters, numbers, underscore, hyphen, dot.
-              </Text>
+              <Text style={styles.fieldLabel}>{AR.displayName}</Text>
+              <Text style={styles.usernameHint}>{AR.displayNameHint}</Text>
               <TextInput
                 style={[styles.input, usernameError ? styles.inputError : null]}
                 value={usernameInput}
                 onChangeText={text => { setUsernameInput(text); setUsernameError(''); }}
-                placeholder="Enter display name"
+                placeholder={AR.displayNamePlaceholder}
                 placeholderTextColor={T.textMuted}
                 autoCapitalize="none"
                 autoCorrect={false}
                 maxLength={30}
                 returnKeyType="done"
                 onSubmitEditing={handleSaveUsername}
-                accessibilityLabel="Display name"
+                textAlign="right"
+                accessibilityLabel={AR.displayName}
               />
               <Text style={styles.charCount}>{usernameInput.length}/30</Text>
-              {usernameError ? (
-                <Text style={styles.errorText}>{usernameError}</Text>
-              ) : null}
+              {usernameError ? <Text style={styles.errorText}>{usernameError}</Text> : null}
               <View style={styles.editActionRow}>
+                <TouchableOpacity
+                  style={styles.cancelEditBtn}
+                  onPress={() => { setEditingUsername(false); setUsernameError(''); }}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.cancelEditText}>{AR.cancel}</Text>
+                </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.saveBtn, savingUsername && { opacity: 0.6 }]}
                   onPress={handleSaveUsername}
                   disabled={savingUsername}
                   activeOpacity={0.85}
                 >
-                  {savingUsername
-                    ? <ActivityIndicator color="#fff" size="small" />
-                    : <Text style={styles.saveBtnText}>Save Name</Text>
-                  }
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.cancelEditBtn}
-                  onPress={() => { setEditingUsername(false); setUsernameError(''); }}
-                  activeOpacity={0.8}
-                >
-                  <Text style={styles.cancelEditText}>Cancel</Text>
+                  {savingUsername ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.saveBtnText}>{AR.saveName}</Text>}
                 </TouchableOpacity>
               </View>
             </View>
           )}
         </View>
 
-        {/* ── Notifications Section ───────────────────────────────── */}
-        <Text style={styles.sectionLabel}>NOTIFICATIONS</Text>
+        {/* Notifications */}
+        <Text style={styles.sectionLabel}>{AR.notifications}</Text>
         <View style={styles.card}>
           <View style={styles.row}>
-            <View style={styles.rowLeft}>
-              <Text style={styles.rowIcon}>🔔</Text>
-              <View style={styles.rowText}>
-                <Text style={styles.rowTitle}>Notification Sound</Text>
-                <Text style={styles.rowSub}>Play alarm when grid state changes</Text>
-              </View>
-            </View>
             <Switch
               value={soundEnabled}
               onValueChange={toggleSound}
               trackColor={{ false: T.elevated, true: T.primary }}
               thumbColor={soundEnabled ? T.accent : T.textMuted}
             />
+            <View style={styles.rowText}>
+              <Text style={styles.rowTitle}>{AR.notificationSound}</Text>
+              <Text style={styles.rowSub}>{AR.playSoundOnChange}</Text>
+            </View>
+            <Text style={styles.rowIcon}>🔔</Text>
           </View>
         </View>
 
-        {/* ── Diagnostics Section ─────────────────────────────────── */}
-        <Text style={styles.sectionLabel}>DIAGNOSTICS</Text>
+        {/* Diagnostics */}
+        <Text style={styles.sectionLabel}>{AR.diagnostics}</Text>
         <View style={styles.card}>
           <Text style={styles.testDesc}>
-            Send a test notification to verify alerts are working on your device.
-            {soundEnabled ? ' Sound will play.' : ' Sound is disabled.'}
+            {AR.testNotifDesc}{soundEnabled ? AR.testNotifDescSound : AR.testNotifDescNoSound}
           </Text>
           <TouchableOpacity
             style={[
@@ -326,70 +297,56 @@ export default function UserSettings() {
               <ActivityIndicator color="#fff" size="small" />
             ) : (
               <Text style={styles.testBtnText}>
-                {testResult === 'sent' ? '✓ Notification Sent!'
-                  : testResult === 'error' ? '✗ Permission Denied'
-                  : '🔔  Send Test Notification'}
+                {testResult === 'sent' ? AR.notifSent : testResult === 'error' ? AR.permDenied : AR.sendTestNotif}
               </Text>
             )}
           </TouchableOpacity>
-          {testResult === 'error' && (
-            <Text style={styles.errorHint}>
-              Please enable notification permissions in your device settings.
-            </Text>
-          )}
+          {testResult === 'error' && <Text style={styles.errorHint}>{AR.permDeniedHint}</Text>}
         </View>
 
-        {/* ── About Section ───────────────────────────────────────── */}
-        <Text style={styles.sectionLabel}>ABOUT</Text>
+        {/* About */}
+        <Text style={styles.sectionLabel}>{AR.about}</Text>
         <View style={styles.card}>
           <View style={styles.aboutRow}>
-            <Text style={styles.aboutLabel}>App</Text>
-            <Text style={styles.aboutValue}>Yemen Grid Monitor</Text>
+            <Text style={styles.aboutValue}>{AR.appName}</Text>
+            <Text style={styles.aboutLabel}>{AR.app}</Text>
           </View>
           <View style={[styles.aboutRow, { borderBottomWidth: 0 }]}>
-            <Text style={styles.aboutLabel}>Data Source</Text>
             <Text style={styles.aboutValue}>Growatt · KHM8EYS0SC</Text>
+            <Text style={styles.aboutLabel}>{AR.dataSource}</Text>
           </View>
         </View>
 
-        {/* ── Sign Out ────────────────────────────────────────────── */}
+        {/* Sign Out */}
         <TouchableOpacity
           style={styles.signOutBtn}
           onPress={() => {
-            Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
-              { text: 'Cancel', style: 'cancel' },
-              { text: 'Sign Out', style: 'destructive', onPress: signOut },
+            Alert.alert(AR.signOutConfirmTitle, AR.signOutConfirmBody, [
+              { text: AR.cancel, style: 'cancel' },
+              { text: AR.signOut, style: 'destructive', onPress: signOut },
             ]);
           }}
           activeOpacity={0.8}
         >
-          <Text style={styles.signOutText}>Sign Out</Text>
+          <Text style={styles.signOutText}>{AR.signOut}</Text>
         </TouchableOpacity>
 
-        {/* ── Delete Account ───────────────────────────────────────── */}
-        <Text style={styles.sectionLabel}>DANGER ZONE</Text>
+        {/* Danger Zone */}
+        <Text style={styles.sectionLabel}>{AR.dangerZone}</Text>
         <View style={[styles.card, styles.dangerCard]}>
-          <Text style={styles.dangerTitle}>Delete My Account</Text>
-          <Text style={styles.dangerDesc}>
-            Permanently deletes your account, all your reports, follow connections, resync history, and personal offset data. This action cannot be undone.
-          </Text>
+          <Text style={styles.dangerTitle}>{AR.deleteMyAccount}</Text>
+          <Text style={styles.dangerDesc}>{AR.deleteAccountDesc}</Text>
           <TouchableOpacity
             style={[styles.deleteBtn, deletingAccount && { opacity: 0.6 }]}
             onPress={handleDeleteAccount}
             disabled={deletingAccount}
             activeOpacity={0.8}
           >
-            {deletingAccount
-              ? <ActivityIndicator color="#fff" size="small" />
-              : <Text style={styles.deleteBtnText}>🗑️  Delete My Account</Text>
-            }
+            {deletingAccount ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.deleteBtnText}>{AR.deleteAccountBtn}</Text>}
           </TouchableOpacity>
         </View>
 
-        <Text style={styles.footer}>
-          Predictions are based on historical patterns and may not be 100% accurate.
-          Always verify with your local conditions.
-        </Text>
+        <Text style={styles.footer}>{AR.footer}</Text>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -398,175 +355,56 @@ export default function UserSettings() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: T.bg },
   content: { paddingHorizontal: 16, paddingTop: 16 },
-
-  sectionLabel: {
-    color: T.textMuted,
-    fontSize: 9,
-    fontWeight: '700',
-    letterSpacing: 1.5,
-    textTransform: 'uppercase',
-    marginBottom: 8,
-    marginTop: 8,
-  },
-
-  card: {
-    backgroundColor: T.surface,
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: T.border,
-  },
-
-  // Profile
-  avatarRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 14 },
-  avatar: {
-    width: 56, height: 56, borderRadius: 28,
-    backgroundColor: '#1e3a5a',
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 2, borderColor: T.accent + '44',
-  },
+  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 8, marginTop: 8, textAlign: 'right' },
+  card: { backgroundColor: T.surface, borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: T.border },
+  avatarRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 14, marginBottom: 14 },
+  avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#1e3a5a', alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: T.accent + '44' },
   avatarText: { color: T.accent, fontSize: 22, fontWeight: '900' },
   profileInfo: { flex: 1 },
-  profileName: { color: T.textPrimary, fontSize: 17, fontWeight: '800', marginBottom: 2 },
-  profileEmail: { color: T.textMuted, fontSize: 12, marginBottom: 6 },
-  rolePill: {
-    alignSelf: 'flex-start',
-    backgroundColor: T.elevated,
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderWidth: 1,
-    borderColor: T.border,
-  },
+  profileName: { color: T.textPrimary, fontSize: 17, fontWeight: '800', marginBottom: 2, textAlign: 'right' },
+  profileEmail: { color: T.textMuted, fontSize: 12, marginBottom: 6, textAlign: 'right' },
+  rolePill: { alignSelf: 'flex-end', backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: T.border },
   rolePillAdmin: { borderColor: '#854d0e', backgroundColor: '#1c1000' },
   rolePillText: { color: T.textMuted, fontSize: 10, fontWeight: '700' },
-
   divider: { height: 1, backgroundColor: T.elevated, marginBottom: 14 },
-
-  usernameRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  usernameRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between' },
   usernameLeft: { flex: 1 },
-  fieldLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1.5, marginBottom: 5 },
-  usernameValue: { color: T.textPrimary, fontSize: 15, fontWeight: '600' },
-  usernameSuccessText: { color: T.success, fontSize: 12, marginTop: 4, fontWeight: '600' },
-
-  editBtn: {
-    backgroundColor: T.elevated,
-    borderRadius: 8,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: T.border,
-  },
+  fieldLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 5, textAlign: 'right' },
+  usernameValue: { color: T.textPrimary, fontSize: 15, fontWeight: '600', textAlign: 'right' },
+  usernameSuccessText: { color: T.success, fontSize: 12, marginTop: 4, fontWeight: '600', textAlign: 'right' },
+  editBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
   editBtnText: { color: T.accent, fontSize: 13, fontWeight: '700' },
-
   usernameEditBox: {},
-  usernameHint: { color: T.textMuted, fontSize: 11, lineHeight: 17, marginBottom: 10 },
-  input: {
-    backgroundColor: T.bg,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: T.border,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    color: T.textPrimary,
-    fontSize: 15,
-    marginBottom: 4,
-  },
+  usernameHint: { color: T.textMuted, fontSize: 11, lineHeight: 17, marginBottom: 10, textAlign: 'right' },
+  input: { backgroundColor: T.bg, borderRadius: 10, borderWidth: 1, borderColor: T.border, paddingHorizontal: 14, paddingVertical: 12, color: T.textPrimary, fontSize: 15, marginBottom: 4, textAlign: 'right' },
   inputError: { borderColor: T.danger },
-  charCount: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginBottom: 4 },
-  errorText: { color: T.danger, fontSize: 12, marginBottom: 10, lineHeight: 17 },
-  editActionRow: { flexDirection: 'row', gap: 10, marginTop: 8 },
-  saveBtn: {
-    flex: 1, backgroundColor: T.primary,
-    borderRadius: 10, paddingVertical: 13, alignItems: 'center',
-  },
+  charCount: { color: T.textMuted, fontSize: 10, textAlign: 'left', marginBottom: 4 },
+  errorText: { color: T.danger, fontSize: 12, marginBottom: 10, lineHeight: 17, textAlign: 'right' },
+  editActionRow: { flexDirection: 'row-reverse', gap: 10, marginTop: 8 },
+  saveBtn: { flex: 1, backgroundColor: T.primary, borderRadius: 10, paddingVertical: 13, alignItems: 'center' },
   saveBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
-  cancelEditBtn: {
-    backgroundColor: T.elevated,
-    borderRadius: 10,
-    paddingHorizontal: 18,
-    paddingVertical: 13,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: T.border,
-  },
+  cancelEditBtn: { backgroundColor: T.elevated, borderRadius: 10, paddingHorizontal: 18, paddingVertical: 13, alignItems: 'center', borderWidth: 1, borderColor: T.border },
   cancelEditText: { color: T.textMuted, fontWeight: '600', fontSize: 13 },
-
-  // Notifications
-  row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  rowLeft: { flexDirection: 'row', alignItems: 'center', flex: 1, gap: 12 },
+  row: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between' },
+  rowText: { flex: 1, marginHorizontal: 12 },
   rowIcon: { fontSize: 24 },
-  rowText: { flex: 1 },
-  rowTitle: { color: T.textPrimary, fontSize: 15, fontWeight: '600' },
-  rowSub: { color: T.textMuted, fontSize: 12, marginTop: 2 },
-
-  // Diagnostics
-  testDesc: { color: T.textMuted, fontSize: 13, lineHeight: 20, marginBottom: 16 },
+  rowTitle: { color: T.textPrimary, fontSize: 15, fontWeight: '600', textAlign: 'right' },
+  rowSub: { color: T.textMuted, fontSize: 12, marginTop: 2, textAlign: 'right' },
+  testDesc: { color: T.textMuted, fontSize: 13, lineHeight: 20, marginBottom: 16, textAlign: 'right' },
   testBtn: { backgroundColor: T.primary, borderRadius: 12, paddingVertical: 14, alignItems: 'center' },
   testBtnSuccess: { backgroundColor: '#065f46' },
   testBtnError: { backgroundColor: '#450a0a' },
   testBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   errorHint: { color: '#f87171', fontSize: 12, marginTop: 8, textAlign: 'center' },
-
-  // About
-  aboutRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: T.elevated,
-  },
+  aboutRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: T.elevated },
   aboutLabel: { color: T.textMuted, fontSize: 13 },
   aboutValue: { color: T.textSecondary, fontSize: 13, fontWeight: '600' },
-
-  // Danger zone
-  dangerCard: {
-    borderColor: T.danger + '44',
-    backgroundColor: '#1a0808',
-  },
-  dangerTitle: {
-    color: T.danger,
-    fontSize: 15,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  dangerDesc: {
-    color: '#f87171',
-    fontSize: 12,
-    lineHeight: 18,
-    marginBottom: 16,
-  },
-  deleteBtn: {
-    backgroundColor: '#450a0a',
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: T.danger,
-  },
+  dangerCard: { borderColor: T.danger + '44', backgroundColor: '#1a0808' },
+  dangerTitle: { color: T.danger, fontSize: 15, fontWeight: '800', marginBottom: 8, textAlign: 'right' },
+  dangerDesc: { color: '#f87171', fontSize: 12, lineHeight: 18, marginBottom: 16, textAlign: 'right' },
+  deleteBtn: { backgroundColor: '#450a0a', borderRadius: 12, paddingVertical: 14, alignItems: 'center', borderWidth: 1, borderColor: T.danger },
   deleteBtnText: { color: T.danger, fontWeight: '700', fontSize: 14 },
-
-  // Sign out
-  signOutBtn: {
-    backgroundColor: '#1a0808',
-    borderRadius: 14,
-    paddingVertical: 15,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: T.danger + '44',
-    marginTop: 4,
-    marginBottom: 16,
-  },
+  signOutBtn: { backgroundColor: '#1a0808', borderRadius: 14, paddingVertical: 15, alignItems: 'center', borderWidth: 1, borderColor: T.danger + '44', marginTop: 4, marginBottom: 16 },
   signOutText: { color: T.danger, fontWeight: '700', fontSize: 15 },
-
-  footer: {
-    color: T.textMuted,
-    fontSize: 11,
-    textAlign: 'center',
-    lineHeight: 18,
-    marginBottom: 16,
-    opacity: 0.6,
-  },
+  footer: { color: T.textMuted, fontSize: 11, textAlign: 'center', lineHeight: 18, marginBottom: 16, opacity: 0.6 },
 });

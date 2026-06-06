@@ -15,6 +15,7 @@ import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../contexts/AuthContext';
 import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
+import { AR } from '../../constants/arabic';
 
 const T = {
   bg: '#0a0f1e', surface: '#0f172a', elevated: '#1e293b',
@@ -25,14 +26,21 @@ const T = {
 
 type Tab = 'nearby' | 'notifications' | 'history' | 'following' | 'leaderboard';
 
-// ── Time option labels ────────────────────────────────────────────────────────
 const TIME_OPTS: { key: TimeOption; label: string }[] = [
-  { key: 'now', label: 'Just now' },
-  { key: '5min', label: '~5 min ago' },
-  { key: '10min', label: '~10 min ago' },
-  { key: '15min', label: '~15 min ago' },
-  { key: '20min', label: '~20 min ago' },
+  { key: 'now', label: AR.timeNow },
+  { key: '5min', label: AR.time5min },
+  { key: '10min', label: AR.time10min },
+  { key: '15min', label: AR.time15min },
+  { key: '20min', label: AR.time20min },
 ];
+
+const TIME_LABELS_AR: Record<string, string> = {
+  now: AR.timeNow,
+  '5min': AR.time5min,
+  '10min': AR.time10min,
+  '15min': AR.time15min,
+  '20min': AR.time20min,
+};
 
 // ── Report Modal ──────────────────────────────────────────────────────────────
 function ReportModal({ visible, onClose, onSubmit, submitting }: {
@@ -48,10 +56,10 @@ function ReportModal({ visible, onClose, onSubmit, submitting }: {
       <View style={rmStyles.overlay}>
         <View style={rmStyles.sheet}>
           <View style={rmStyles.handle} />
-          <Text style={rmStyles.title}>Report Utility Transition</Text>
-          <Text style={rmStyles.sub}>Share what just happened so your followers can resync their schedules</Text>
+          <Text style={rmStyles.title}>{AR.reportUtilityTransition}</Text>
+          <Text style={rmStyles.sub}>{AR.reportSubtitle}</Text>
 
-          <Text style={rmStyles.sectionLabel}>WHAT HAPPENED?</Text>
+          <Text style={rmStyles.sectionLabel}>{AR.whatHappened}</Text>
           <View style={rmStyles.stateRow}>
             {(['UTILITY_ON', 'UTILITY_OFF'] as ReportedState[]).map(s => (
               <TouchableOpacity
@@ -62,13 +70,13 @@ function ReportModal({ visible, onClose, onSubmit, submitting }: {
               >
                 <Text style={rmStyles.stateEmoji}>{s === 'UTILITY_ON' ? '⚡' : '🔴'}</Text>
                 <Text style={[rmStyles.stateBtnText, state === s && { color: s === 'UTILITY_ON' ? T.success : T.danger }]}>
-                  {s === 'UTILITY_ON' ? 'Came ON' : 'Went OFF'}
+                  {s === 'UTILITY_ON' ? AR.cameOn : AR.wentOff}
                 </Text>
               </TouchableOpacity>
             ))}
           </View>
 
-          <Text style={rmStyles.sectionLabel}>WHEN DID IT HAPPEN?</Text>
+          <Text style={rmStyles.sectionLabel}>{AR.whenHappened}</Text>
           <View style={rmStyles.timeGrid}>
             {TIME_OPTS.map(opt => (
               <TouchableOpacity
@@ -90,11 +98,11 @@ function ReportModal({ visible, onClose, onSubmit, submitting }: {
           >
             {submitting
               ? <ActivityIndicator color="#fff" size="small" />
-              : <Text style={rmStyles.submitText}>📢  Share with Followers</Text>
+              : <Text style={rmStyles.submitText}>{AR.shareWithFollowers}</Text>
             }
           </TouchableOpacity>
           <TouchableOpacity style={rmStyles.cancelBtn} onPress={onClose}>
-            <Text style={rmStyles.cancelText}>Cancel</Text>
+            <Text style={rmStyles.cancelText}>{AR.cancel}</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -106,15 +114,15 @@ const rmStyles = StyleSheet.create({
   overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
   sheet: { backgroundColor: T.surface, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40 },
   handle: { width: 40, height: 4, backgroundColor: T.border, borderRadius: 2, alignSelf: 'center', marginBottom: 20 },
-  title: { color: T.textPrimary, fontSize: 20, fontWeight: '800', marginBottom: 6 },
-  sub: { color: T.textMuted, fontSize: 13, lineHeight: 19, marginBottom: 20 },
-  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1.5, marginBottom: 10 },
+  title: { color: T.textPrimary, fontSize: 20, fontWeight: '800', marginBottom: 6, textAlign: 'right' },
+  sub: { color: T.textMuted, fontSize: 13, lineHeight: 19, marginBottom: 20, textAlign: 'right' },
+  sectionLabel: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 1, marginBottom: 10, textAlign: 'right' },
   stateRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
   stateBtn: { flex: 1, backgroundColor: T.elevated, borderRadius: 14, padding: 16, alignItems: 'center', gap: 6, borderWidth: 1, borderColor: T.border },
   stateBtnOnActive: { borderColor: T.success, backgroundColor: '#052e16' },
   stateBtnOffActive: { borderColor: T.danger, backgroundColor: '#2d0a0a' },
   stateEmoji: { fontSize: 26 },
-  stateBtnText: { color: T.textMuted, fontSize: 14, fontWeight: '700' },
+  stateBtnText: { color: T.textMuted, fontSize: 14, fontWeight: '700', textAlign: 'center' },
   timeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 24 },
   timeBtn: { backgroundColor: T.elevated, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1, borderColor: T.border },
   timeBtnActive: { borderColor: T.accent, backgroundColor: '#001a2e' },
@@ -131,20 +139,21 @@ function NotifCard({ notif, onRespond }: {
   onRespond: (notif: any, response: 'yes' | 'no' | 'ignore') => void;
 }) {
   const isExpired = new Date(notif.expires_at) < new Date();
-  const stateLabel = notif.reported_state === 'UTILITY_ON' ? 'came ON' : 'went OFF';
+  const stateLabel = notif.reported_state === 'UTILITY_ON' ? AR.electricityCameOn : AR.electricityWentOff;
   const stateEmoji = notif.reported_state === 'UTILITY_ON' ? '⚡' : '🔴';
-  const timeLabel: Record<string, string> = {
-    now: 'just now', '5min': '~5 min ago', '10min': '~10 min ago',
-    '15min': '~15 min ago', '20min': '~20 min ago',
-  };
   const expiresMin = Math.max(0, Math.round((new Date(notif.expires_at).getTime() - Date.now()) / 60000));
+  const timeLabel = TIME_LABELS_AR[notif.time_option] ?? '';
 
   if (notif.response) {
     const colors = { yes: T.success, no: T.danger, ignore: T.textMuted };
-    const labels = { yes: '✅ You confirmed YES', no: '❌ You said NO', ignore: '⏭ Ignored' };
+    const labels = {
+      yes: AR.youConfirmedYes,
+      no: AR.youSaidNo,
+      ignore: AR.ignored,
+    };
     return (
       <View style={[ncStyles.card, { borderColor: T.border, opacity: 0.6 }]}>
-        <Text style={ncStyles.reporterLine}>{stateEmoji} {notif.reporter_username ?? 'Someone'} — electricity {stateLabel} ({timeLabel[notif.time_option] ?? ''})</Text>
+        <Text style={ncStyles.reporterLine}>{stateEmoji} {notif.reporter_username ?? 'شخص ما'} — {stateLabel} ({timeLabel})</Text>
         <Text style={[ncStyles.responseLabel, { color: colors[notif.response] }]}>{labels[notif.response]}</Text>
       </View>
     );
@@ -153,8 +162,8 @@ function NotifCard({ notif, onRespond }: {
   if (isExpired) {
     return (
       <View style={[ncStyles.card, { opacity: 0.4 }]}>
-        <Text style={ncStyles.reporterLine}>{stateEmoji} {notif.reporter_username ?? 'Someone'} — electricity {stateLabel}</Text>
-        <Text style={{ color: T.textMuted, fontSize: 11, marginTop: 4 }}>Expired</Text>
+        <Text style={ncStyles.reporterLine}>{stateEmoji} {notif.reporter_username ?? 'شخص ما'} — {stateLabel}</Text>
+        <Text style={{ color: T.textMuted, fontSize: 11, marginTop: 4, textAlign: 'right' }}>{AR.expired}</Text>
       </View>
     );
   }
@@ -162,20 +171,23 @@ function NotifCard({ notif, onRespond }: {
   return (
     <View style={ncStyles.card}>
       <View style={ncStyles.header}>
-        <Text style={ncStyles.reporterLine}>{stateEmoji} <Text style={{ color: T.textPrimary, fontWeight: '700' }}>{notif.reporter_username ?? 'Someone'}</Text> reports electricity {stateLabel}</Text>
-        <Text style={ncStyles.expiry}>⏱ {expiresMin}m left</Text>
+        <Text style={ncStyles.expiry}>⏱ {expiresMin} {AR.minutesLeft}</Text>
+        <Text style={ncStyles.reporterLine}>
+          {stateEmoji} <Text style={{ color: T.textPrimary, fontWeight: '700' }}>{notif.reporter_username ?? 'شخص ما'}</Text>
+          {' '}{AR.reportedBy} {stateLabel}
+        </Text>
       </View>
-      <Text style={ncStyles.timeLabel}>{timeLabel[notif.time_option] ?? ''}</Text>
-      <Text style={ncStyles.question}>Is this correct for your location?</Text>
+      <Text style={ncStyles.timeLabel}>{timeLabel}</Text>
+      <Text style={ncStyles.question}>{AR.isThisCorrect}</Text>
       <View style={ncStyles.btnRow}>
-        <TouchableOpacity style={[ncStyles.btn, ncStyles.yesBtn]} onPress={() => onRespond(notif, 'yes')} activeOpacity={0.85}>
-          <Text style={ncStyles.yesBtnText}>✅  YES</Text>
+        <TouchableOpacity style={[ncStyles.btn, ncStyles.ignBtn]} onPress={() => onRespond(notif, 'ignore')} activeOpacity={0.85}>
+          <Text style={ncStyles.ignBtnText}>{AR.skipBtn}</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[ncStyles.btn, ncStyles.noBtn]} onPress={() => onRespond(notif, 'no')} activeOpacity={0.85}>
-          <Text style={ncStyles.noBtnText}>❌  NO</Text>
+          <Text style={ncStyles.noBtnText}>{AR.noBtn}</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={[ncStyles.btn, ncStyles.ignBtn]} onPress={() => onRespond(notif, 'ignore')} activeOpacity={0.85}>
-          <Text style={ncStyles.ignBtnText}>Skip</Text>
+        <TouchableOpacity style={[ncStyles.btn, ncStyles.yesBtn]} onPress={() => onRespond(notif, 'yes')} activeOpacity={0.85}>
+          <Text style={ncStyles.yesBtnText}>{AR.yesBtn}</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -184,12 +196,12 @@ function NotifCard({ notif, onRespond }: {
 
 const ncStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 16, padding: 16, marginBottom: 10, borderWidth: 1, borderColor: '#1e3a5a' },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 },
-  reporterLine: { color: T.textSecondary, fontSize: 14, lineHeight: 20, flex: 1 },
-  expiry: { color: T.textMuted, fontSize: 11, marginLeft: 8 },
-  timeLabel: { color: T.textMuted, fontSize: 12, marginBottom: 10, fontStyle: 'italic' },
-  question: { color: T.textPrimary, fontSize: 15, fontWeight: '700', marginBottom: 14 },
-  btnRow: { flexDirection: 'row', gap: 8 },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 },
+  reporterLine: { color: T.textSecondary, fontSize: 14, lineHeight: 20, flex: 1, textAlign: 'right' },
+  expiry: { color: T.textMuted, fontSize: 11, marginRight: 8 },
+  timeLabel: { color: T.textMuted, fontSize: 12, marginBottom: 10, fontStyle: 'italic', textAlign: 'right' },
+  question: { color: T.textPrimary, fontSize: 15, fontWeight: '700', marginBottom: 14, textAlign: 'right' },
+  btnRow: { flexDirection: 'row-reverse', gap: 8 },
   btn: { flex: 1, borderRadius: 10, paddingVertical: 12, alignItems: 'center', borderWidth: 1 },
   yesBtn: { backgroundColor: '#052e16', borderColor: T.success },
   yesBtnText: { color: T.success, fontWeight: '700', fontSize: 13 },
@@ -197,10 +209,10 @@ const ncStyles = StyleSheet.create({
   noBtnText: { color: T.danger, fontWeight: '700', fontSize: 13 },
   ignBtn: { backgroundColor: T.elevated, borderColor: T.border, flex: 0.6 },
   ignBtnText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
-  responseLabel: { fontSize: 13, fontWeight: '700', marginTop: 6 },
+  responseLabel: { fontSize: 13, fontWeight: '700', marginTop: 6, textAlign: 'right' },
 });
 
-// ── Leaderboard Card ─────────────────────────────────────────────────────────
+// ── Leaderboard ───────────────────────────────────────────────────────────────
 function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number | null }) {
   const [entries, setEntries] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -210,7 +222,6 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
     (async () => {
       setLoading(true);
       try {
-        // Fetch all users with locations within ~2km bounding box
         const latDelta = 2 / 111.0;
         const lonDelta = 2 / (111.0 * Math.cos(myLat * (Math.PI / 180)));
         const { data: locations } = await supabase
@@ -223,7 +234,6 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
 
         if (!locations || locations.length === 0) { setEntries([]); setLoading(false); return; }
 
-        // Haversine filter <= 2km
         const nearby2km = locations.filter(loc => {
           const R = 6371;
           const dLat = (loc.latitude - myLat) * Math.PI / 180;
@@ -255,7 +265,7 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
 
         const enriched = (reliabilities ?? []).map(rel => ({
           user_id: rel.user_id,
-          username: profileMap[rel.user_id] ?? `User_${rel.user_id.slice(0, 6)}`,
+          username: profileMap[rel.user_id] ?? `مستخدم_${rel.user_id.slice(0, 6)}`,
           reliability_score: Math.round(rel.reliability_score ?? 50),
           accepted_reports: rel.accepted_reports ?? 0,
           total_reports: rel.total_reports ?? 0,
@@ -277,7 +287,7 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
   if (myLat === null || myLon === null) {
     return (
       <View style={lbStyles.noLocBox}>
-        <Text style={lbStyles.noLocText}>📍 Share your location in the Nearby tab to see local leaders.</Text>
+        <Text style={lbStyles.noLocText}>📍 شارك موقعك في تبويب القريبون لرؤية المتميزين المحليين.</Text>
       </View>
     );
   }
@@ -286,7 +296,7 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
     return (
       <View style={lbStyles.center}>
         <ActivityIndicator color={T.accent} size="large" />
-        <Text style={lbStyles.loadingText}>Finding local reporters…</Text>
+        <Text style={lbStyles.loadingText}>جارٍ البحث عن المُبلِّغين المحليين…</Text>
       </View>
     );
   }
@@ -295,8 +305,8 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
     return (
       <View style={lbStyles.emptyBox}>
         <Text style={{ fontSize: 48, marginBottom: 14 }}>🏆</Text>
-        <Text style={lbStyles.emptyTitle}>No Local Leaders Yet</Text>
-        <Text style={lbStyles.emptySub}>No reporters found within 2km. Invite neighbors to join and start sharing grid reports to build your local leaderboard.</Text>
+        <Text style={lbStyles.emptyTitle}>لا يوجد مميزون محليون بعد</Text>
+        <Text style={lbStyles.emptySub}>لا يوجد مُبلِّغون ضمن 2 كم. ادعُ الجيران للانضمام وابدأ مشاركة بلاغات الكهرباء.</Text>
       </View>
     );
   }
@@ -304,36 +314,30 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
   return (
     <View style={lbStyles.root}>
       <View style={lbStyles.headerRow}>
-        <Text style={lbStyles.sectionLabel}>TOP REPORTERS WITHIN 2KM</Text>
-        <Text style={lbStyles.subtitle}>{entries.length} local reporter{entries.length !== 1 ? 's' : ''}</Text>
+        <Text style={lbStyles.subtitle}>{entries.length} مُبلِّغ محلي</Text>
+        <Text style={lbStyles.sectionLabel}>أفضل المُبلِّغين ضمن 2 كم</Text>
       </View>
       {entries.map((e, i) => {
         const badge = getReliabilityBadge(e.reliability_score);
         const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`;
         return (
           <View key={e.user_id} style={[lbStyles.row, i === 0 && lbStyles.rowFirst]}>
-            <Text style={lbStyles.medal}>{medal}</Text>
             <View style={lbStyles.info}>
               <View style={lbStyles.nameRow}>
-                <Text style={lbStyles.username}>{e.username}</Text>
                 <View style={[lbStyles.badge, { borderColor: badge.color + '44' }]}>
                   <Text style={[lbStyles.badgeText, { color: badge.color }]}>{badge.label}</Text>
                 </View>
+                <Text style={lbStyles.username}>{e.username}</Text>
               </View>
               <View style={lbStyles.statsRow}>
-                <Text style={lbStyles.stat}>
-                  <Text style={{ color: T.success, fontWeight: '700' }}>{e.reliability_score}%</Text> reliability
-                </Text>
+                <Text style={lbStyles.stat}><Text style={{ color: T.accent, fontWeight: '700' }}>{e.yes_rate}%</Text> نسبة نعم</Text>
                 <Text style={lbStyles.dot}> · </Text>
-                <Text style={lbStyles.stat}>
-                  <Text style={{ color: T.textPrimary, fontWeight: '700' }}>{e.accepted_reports}</Text> accepted reports
-                </Text>
+                <Text style={lbStyles.stat}><Text style={{ color: T.textPrimary, fontWeight: '700' }}>{e.accepted_reports}</Text> بلاغ مقبول</Text>
                 <Text style={lbStyles.dot}> · </Text>
-                <Text style={lbStyles.stat}>
-                  <Text style={{ color: T.accent, fontWeight: '700' }}>{e.yes_rate}%</Text> YES rate
-                </Text>
+                <Text style={lbStyles.stat}><Text style={{ color: T.success, fontWeight: '700' }}>{e.reliability_score}%</Text> موثوقية</Text>
               </View>
             </View>
+            <Text style={lbStyles.medal}>{medal}</Text>
           </View>
         );
       })}
@@ -343,34 +347,30 @@ function LeaderboardTab({ myLat, myLon }: { myLat: number | null; myLon: number 
 
 const lbStyles = StyleSheet.create({
   root: { paddingTop: 4 },
-  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1.5 },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
   subtitle: { color: T.textMuted, fontSize: 11 },
-  row: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 8,
-    borderWidth: 1, borderColor: T.border,
-  },
+  row: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: T.border },
   rowFirst: { borderColor: '#854d0e', backgroundColor: '#1c1000' },
   medal: { fontSize: 24, minWidth: 32, textAlign: 'center' },
   info: { flex: 1 },
-  nameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 5 },
+  nameRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 5 },
   username: { color: T.textPrimary, fontSize: 15, fontWeight: '700' },
   badge: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 5, paddingVertical: 2 },
   badgeText: { fontSize: 9, fontWeight: '600' },
-  statsRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center' },
+  statsRow: { flexDirection: 'row-reverse', flexWrap: 'wrap', alignItems: 'center' },
   stat: { color: T.textMuted, fontSize: 11 },
   dot: { color: T.border, fontSize: 11 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 60 },
   loadingText: { color: T.textMuted, marginTop: 12, fontSize: 13 },
   emptyBox: { alignItems: 'center', paddingVertical: 60, paddingHorizontal: 24 },
   emptyTitle: { color: T.textSecondary, fontSize: 18, fontWeight: '700', marginBottom: 10, textAlign: 'center' },
-  emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 20 },
+  emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 22 },
   noLocBox: { backgroundColor: T.surface, borderRadius: 14, padding: 20, margin: 16, borderWidth: 1, borderColor: T.border },
   noLocText: { color: T.textMuted, fontSize: 13, lineHeight: 19, textAlign: 'center' },
 });
 
-// ── Suggested Users Section ───────────────────────────────────────────────────
+// ── Suggested Users ───────────────────────────────────────────────────────────
 function SuggestedUsers({ nearbyUsers, following, outgoing, offsetMinutes, onFollow }: {
   nearbyUsers: any[];
   following: any[];
@@ -378,7 +378,6 @@ function SuggestedUsers({ nearbyUsers, following, outgoing, offsetMinutes, onFol
   offsetMinutes: number;
   onFollow: (userId: string) => void;
 }) {
-  // Score: reliability (60%) + offset similarity (20%) + active participation (20%)
   const scored = nearbyUsers
     .filter(u => {
       const alreadyFollowing = following.some(f => f.target_id === u.user_id);
@@ -401,41 +400,36 @@ function SuggestedUsers({ nearbyUsers, following, outgoing, offsetMinutes, onFol
   return (
     <View style={suStyles.section}>
       <View style={suStyles.header}>
-        <Text style={suStyles.headerIcon}>⭐</Text>
-        <Text style={suStyles.headerTitle}>SUGGESTED USERS</Text>
-        <Text style={suStyles.headerSub}>Based on reliability &amp; utility behavior</Text>
+        <Text style={suStyles.headerSub}>بناءً على الموثوقية وسلوك الكهرباء</Text>
+        <Text style={suStyles.headerTitle}>⭐ مستخدمون مقترحون</Text>
       </View>
       {scored.map(u => {
         const badge = getReliabilityBadge(u.reliabilityScore);
         const dist = u.distanceKm < 0.1
-          ? `${Math.round(u.distanceKm * 1000)}m`
-          : `${u.distanceKm.toFixed(2)}km`;
+          ? `${Math.round(u.distanceKm * 1000)}م`
+          : `${u.distanceKm.toFixed(2)}كم`;
         return (
           <View key={u.user_id} style={suStyles.card}>
+            <TouchableOpacity style={suStyles.followBtn} onPress={() => onFollow(u.user_id)} activeOpacity={0.85}>
+              <Text style={suStyles.followBtnText}>+ {AR.follow}</Text>
+            </TouchableOpacity>
             <View style={suStyles.left}>
-              <View style={suStyles.avatarCircle}>
-                <Text style={suStyles.avatarText}>{(u.username ?? '?')[0].toUpperCase()}</Text>
-              </View>
               <View style={{ flex: 1 }}>
                 <View style={suStyles.nameRow}>
-                  <Text style={suStyles.username}>{u.username ?? 'Unknown'}</Text>
                   <View style={[suStyles.badge, { borderColor: badge.color + '44' }]}>
                     <Text style={[suStyles.badgeText, { color: badge.color }]}>{badge.label}</Text>
                   </View>
+                  <Text style={suStyles.username}>{u.username ?? 'مجهول'}</Text>
                 </View>
                 <Text style={suStyles.meta}>
-                  {dist} away · {u.reliabilityScore}% reliability
-                  {u.totalReports > 0 ? ` · ${u.totalReports} reports` : ''}
+                  {dist} {AR.away} · {u.reliabilityScore}% موثوقية
+                  {u.totalReports > 0 ? ` · ${u.totalReports} بلاغات` : ''}
                 </Text>
               </View>
+              <View style={suStyles.avatarCircle}>
+                <Text style={suStyles.avatarText}>{(u.username ?? '?')[0].toUpperCase()}</Text>
+              </View>
             </View>
-            <TouchableOpacity
-              style={suStyles.followBtn}
-              onPress={() => onFollow(u.user_id)}
-              activeOpacity={0.85}
-            >
-              <Text style={suStyles.followBtnText}>+ Follow</Text>
-            </TouchableOpacity>
           </View>
         );
       })}
@@ -445,19 +439,18 @@ function SuggestedUsers({ nearbyUsers, following, outgoing, offsetMinutes, onFol
 
 const suStyles = StyleSheet.create({
   section: { backgroundColor: '#0a1929', borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: '#1e3a5a' },
-  header: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 12 },
-  headerIcon: { fontSize: 13 },
-  headerTitle: { color: T.accent, fontSize: 9, fontWeight: '700', letterSpacing: 1.5 },
-  headerSub: { color: T.textMuted, fontSize: 10, marginLeft: 'auto' },
-  card: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#122238' },
-  left: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 },
+  header: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, marginBottom: 12 },
+  headerTitle: { color: T.accent, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
+  headerSub: { color: T.textMuted, fontSize: 10, marginRight: 'auto' },
+  card: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#122238' },
+  left: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
   avatarCircle: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#1e3a5a', alignItems: 'center', justifyContent: 'center' },
   avatarText: { color: T.accent, fontSize: 15, fontWeight: '800' },
-  nameRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2 },
+  nameRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, marginBottom: 2 },
   username: { color: T.textPrimary, fontSize: 14, fontWeight: '700' },
   badge: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 5, paddingVertical: 2 },
   badgeText: { fontSize: 9, fontWeight: '600' },
-  meta: { color: T.textMuted, fontSize: 11 },
+  meta: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
   followBtn: { backgroundColor: T.primary, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 9 },
   followBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
 });
@@ -470,14 +463,14 @@ function NearbyUserCard({ item, followStatus, onFollowAction }: {
 }) {
   const badge = getReliabilityBadge(item.reliabilityScore);
   const distLabel = item.distanceKm < 0.1
-    ? `${Math.round(item.distanceKm * 1000)}m away`
-    : `${item.distanceKm.toFixed(2)}km away`;
+    ? `${Math.round(item.distanceKm * 1000)}م`
+    : `${item.distanceKm.toFixed(2)}كم`;
 
   const followBtnLabel =
-    followStatus === 'accepted' ? '✓ Following'
-    : followStatus === 'pending' ? '⏳ Pending'
-    : followStatus === 'incoming' ? '← Accept'
-    : '+ Follow';
+    followStatus === 'accepted' ? `✓ ${AR.following}`
+    : followStatus === 'pending' ? AR.followPending
+    : followStatus === 'incoming' ? AR.followAccept
+    : `+ ${AR.follow}`;
 
   const followBtnStyle =
     followStatus === 'accepted' ? nuStyles.followBtnActive
@@ -488,15 +481,6 @@ function NearbyUserCard({ item, followStatus, onFollowAction }: {
   return (
     <View style={nuStyles.card}>
       <View style={nuStyles.header}>
-        <View style={nuStyles.headerLeft}>
-          <Text style={nuStyles.username}>{item.username ?? 'Unknown'}</Text>
-          <View style={nuStyles.metaRow}>
-            <Text style={nuStyles.distance}>{distLabel}</Text>
-            <View style={[nuStyles.badge, { borderColor: badge.color + '44' }]}>
-              <Text style={[nuStyles.badgeText, { color: badge.color }]}>{badge.label}</Text>
-            </View>
-          </View>
-        </View>
         <TouchableOpacity
           style={[nuStyles.followBtn, followBtnStyle]}
           onPress={() => onFollowAction(item.user_id)}
@@ -510,36 +494,45 @@ function NearbyUserCard({ item, followStatus, onFollowAction }: {
             {followBtnLabel}
           </Text>
         </TouchableOpacity>
+        <View style={nuStyles.headerLeft}>
+          <Text style={nuStyles.username}>{item.username ?? 'مجهول'}</Text>
+          <View style={nuStyles.metaRow}>
+            <View style={[nuStyles.badge, { borderColor: badge.color + '44' }]}>
+              <Text style={[nuStyles.badgeText, { color: badge.color }]}>{badge.label}</Text>
+            </View>
+            <Text style={nuStyles.distance}>{distLabel}</Text>
+          </View>
+        </View>
       </View>
 
       <View style={nuStyles.statsRow}>
+        {item.lastReportAt && (
+          <>
+            <View style={nuStyles.stat}>
+              <Text style={[nuStyles.statVal, { fontSize: 10 }]}>
+                {new Date(item.lastReportAt).toLocaleDateString('ar-SA', { month: 'short', day: 'numeric' })}
+              </Text>
+              <Text style={nuStyles.statLabel}>آخر نشاط</Text>
+            </View>
+            <View style={nuStyles.statDivider} />
+          </>
+        )}
         <View style={nuStyles.stat}>
-          <Text style={nuStyles.statVal}>{item.reliabilityScore}%</Text>
-          <Text style={nuStyles.statLabel}>Reliability</Text>
+          <Text style={[nuStyles.statVal, { fontSize: 11 }]}>
+            {item.offsetMinutes > 0 ? '+' : ''}{item.offsetMinutes}د
+          </Text>
+          <Text style={nuStyles.statLabel}>الفارق</Text>
         </View>
         <View style={nuStyles.statDivider} />
         <View style={nuStyles.stat}>
           <Text style={nuStyles.statVal}>{item.totalReports}</Text>
-          <Text style={nuStyles.statLabel}>Reports</Text>
+          <Text style={nuStyles.statLabel}>بلاغات</Text>
         </View>
         <View style={nuStyles.statDivider} />
         <View style={nuStyles.stat}>
-          <Text style={[nuStyles.statVal, { fontSize: 11 }]}>
-            {item.offsetMinutes > 0 ? '+' : ''}{item.offsetMinutes}m
-          </Text>
-          <Text style={nuStyles.statLabel}>Offset</Text>
+          <Text style={nuStyles.statVal}>{item.reliabilityScore}%</Text>
+          <Text style={nuStyles.statLabel}>موثوقية</Text>
         </View>
-        {item.lastReportAt && (
-          <>
-            <View style={nuStyles.statDivider} />
-            <View style={nuStyles.stat}>
-              <Text style={[nuStyles.statVal, { fontSize: 10 }]}>
-                {new Date(item.lastReportAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-              </Text>
-              <Text style={nuStyles.statLabel}>Last Active</Text>
-            </View>
-          </>
-        )}
       </View>
     </View>
   );
@@ -547,10 +540,10 @@ function NearbyUserCard({ item, followStatus, onFollowAction }: {
 
 const nuStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 16, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: T.border },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 },
   headerLeft: { flex: 1 },
-  username: { color: T.textPrimary, fontSize: 16, fontWeight: '700', marginBottom: 4 },
-  metaRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  username: { color: T.textPrimary, fontSize: 16, fontWeight: '700', marginBottom: 4, textAlign: 'right' },
+  metaRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
   distance: { color: T.textMuted, fontSize: 12 },
   badge: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 2 },
   badgeText: { fontSize: 11, fontWeight: '600' },
@@ -560,7 +553,7 @@ const nuStyles = StyleSheet.create({
   followBtnPending: { backgroundColor: T.elevated, borderColor: T.border, opacity: 0.7 },
   followBtnIncoming: { backgroundColor: '#1a120a', borderColor: T.warning },
   followBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
-  statsRow: { flexDirection: 'row', backgroundColor: T.bg, borderRadius: 10, paddingVertical: 10, alignItems: 'center', justifyContent: 'space-evenly' },
+  statsRow: { flexDirection: 'row-reverse', backgroundColor: T.bg, borderRadius: 10, paddingVertical: 10, alignItems: 'center', justifyContent: 'space-evenly' },
   stat: { alignItems: 'center', flex: 1 },
   statVal: { color: T.textPrimary, fontSize: 14, fontWeight: '800', marginBottom: 2 },
   statLabel: { color: T.textMuted, fontSize: 9, fontWeight: '600', letterSpacing: 0.5 },
@@ -573,39 +566,39 @@ function FollowRequestCard({ follow, onAccept, onReject }: {
 }) {
   return (
     <View style={frStyles.card}>
-      <View style={frStyles.info}>
-        <Text style={frStyles.icon}>👤</Text>
-        <View>
-          <Text style={frStyles.name}>{follow.requester_username ?? 'Unknown'}</Text>
-          <Text style={frStyles.sub}>Wants to follow you</Text>
-        </View>
-      </View>
       <View style={frStyles.btns}>
-        <TouchableOpacity style={frStyles.acceptBtn} onPress={onAccept} activeOpacity={0.85}>
-          <Text style={frStyles.acceptText}>Accept</Text>
-        </TouchableOpacity>
         <TouchableOpacity style={frStyles.rejectBtn} onPress={onReject} activeOpacity={0.85}>
-          <Text style={frStyles.rejectText}>Decline</Text>
+          <Text style={frStyles.rejectText}>{AR.decline}</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={frStyles.acceptBtn} onPress={onAccept} activeOpacity={0.85}>
+          <Text style={frStyles.acceptText}>{AR.accept}</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={frStyles.info}>
+        <View>
+          <Text style={frStyles.name}>{follow.requester_username ?? 'مجهول'}</Text>
+          <Text style={frStyles.sub}>{AR.wantsToFollow}</Text>
+        </View>
+        <Text style={frStyles.icon}>👤</Text>
       </View>
     </View>
   );
 }
 
 const frStyles = StyleSheet.create({
-  card: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: T.border, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  info: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 },
+  card: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: T.border, flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
+  info: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
   icon: { fontSize: 24 },
-  name: { color: T.textPrimary, fontSize: 15, fontWeight: '700' },
-  sub: { color: T.textMuted, fontSize: 11, marginTop: 2 },
-  btns: { flexDirection: 'row', gap: 8 },
+  name: { color: T.textPrimary, fontSize: 15, fontWeight: '700', textAlign: 'right' },
+  sub: { color: T.textMuted, fontSize: 11, marginTop: 2, textAlign: 'right' },
+  btns: { flexDirection: 'row-reverse', gap: 8 },
   acceptBtn: { backgroundColor: T.primary, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8 },
   acceptText: { color: '#fff', fontWeight: '700', fontSize: 13 },
   rejectBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
   rejectText: { color: T.textMuted, fontWeight: '600', fontSize: 13 },
 });
 
-// ── Resync History Entry ──────────────────────────────────────────────────────
+// ── History Card ──────────────────────────────────────────────────────────────
 function HistoryCard({ entry }: { entry: any }) {
   const isOn = entry.reported_state === 'UTILITY_ON';
   const color = isOn ? T.success : T.danger;
@@ -619,34 +612,34 @@ function HistoryCard({ entry }: { entry: any }) {
 
   return (
     <View style={hcStyles.card}>
-      <View style={[hcStyles.bar, { backgroundColor: color }]} />
       <View style={hcStyles.content}>
         <View style={hcStyles.headerRow}>
-          <Text style={[hcStyles.state, { color }]}>{isOn ? '⚡ Grid ON' : '🔴 Grid OFF'}</Text>
-          <Text style={hcStyles.source}>{entry.source === 'community_resync' ? '👥 Community' : entry.source}</Text>
+          <Text style={hcStyles.source}>{entry.source === 'community_resync' ? '👥 مجتمعي' : entry.source}</Text>
+          <Text style={[hcStyles.state, { color }]}>{isOn ? '⚡ ' + AR.gridOn : '🔴 ' + AR.gridOff}</Text>
         </View>
-        <Text style={hcStyles.time}>Effective: {effectiveTime} (Yemen)</Text>
+        <Text style={hcStyles.time}>الوقت الفعلي: {effectiveTime} (اليمن)</Text>
         <Text style={hcStyles.reporter}>
-          Reported by: <Text style={{ color: T.textSecondary }}>{entry.reporter_username ?? 'Unknown'}</Text>
-          {'  '}· Confirmed at {confirmedTime}
+          {AR.reportedByLabel}: <Text style={{ color: T.textSecondary }}>{entry.reporter_username ?? 'مجهول'}</Text>
+          {'  '}· أُكّد في {confirmedTime}
         </Text>
       </View>
+      <View style={[hcStyles.bar, { backgroundColor: color }]} />
     </View>
   );
 }
 
 const hcStyles = StyleSheet.create({
-  card: { flexDirection: 'row', backgroundColor: T.surface, borderRadius: 14, marginBottom: 8, overflow: 'hidden', borderWidth: 1, borderColor: T.border },
+  card: { flexDirection: 'row-reverse', backgroundColor: T.surface, borderRadius: 14, marginBottom: 8, overflow: 'hidden', borderWidth: 1, borderColor: T.border },
   bar: { width: 4 },
   content: { flex: 1, padding: 14 },
-  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
   state: { fontSize: 15, fontWeight: '800' },
   source: { color: T.textMuted, fontSize: 11 },
-  time: { color: T.textSecondary, fontSize: 12, marginBottom: 3 },
-  reporter: { color: T.textMuted, fontSize: 11 },
+  time: { color: T.textSecondary, fontSize: 12, marginBottom: 3, textAlign: 'right' },
+  reporter: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
 });
 
-// ── Main Community Screen ─────────────────────────────────────────────────────
+// ── Main Screen ───────────────────────────────────────────────────────────────
 export default function CommunityScreen() {
   const insets = useSafeAreaInsets();
   const { user } = useAuth();
@@ -666,10 +659,8 @@ export default function CommunityScreen() {
   const [myOffsetMinutes, setMyOffsetMinutes] = React.useState(0);
   const { applyResync } = useResync();
 
-  // Register push token for community resync alerts on mount
   useEffect(() => { registerPushToken(); }, []);
 
-  // Fetch own offset for suggestion scoring
   useEffect(() => {
     if (!user) return;
     supabase.from('user_offsets').select('offset_minutes').eq('user_id', user.id).maybeSingle()
@@ -687,9 +678,7 @@ export default function CommunityScreen() {
       setMyLat(loc.coords.latitude);
       setMyLon(loc.coords.longitude);
       setLocationStatus('granted');
-    } catch {
-      setLocationStatus('denied');
-    }
+    } catch { setLocationStatus('denied'); }
   }, []);
 
   const handleSaveLocation = useCallback(async () => {
@@ -698,7 +687,7 @@ export default function CommunityScreen() {
     const { error } = await supabase
       .from('user_locations')
       .upsert({ user_id: user.id, latitude: myLat, longitude: myLon, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
-    if (error) { Alert.alert('Error', error.message); }
+    if (error) { Alert.alert(AR.error, error.message); }
     else {
       setLocationSaved(true);
       setTimeout(() => setLocationSaved(false), 4000);
@@ -710,11 +699,9 @@ export default function CommunityScreen() {
   const handleFollowAction = useCallback(async (userId: string) => {
     const status = getStatusWith(userId);
     if (status === 'accepted') {
-      // Unfollow
       const row = following.find(f => f.target_id === userId);
       if (row) await cancelOrUnfollow(row.id);
     } else if (status === 'incoming') {
-      // Accept incoming
       const row = pending.find(f => f.requester_id === userId);
       if (row) await respondToRequest(row.id, true);
     } else if (status === 'none') {
@@ -726,28 +713,24 @@ export default function CommunityScreen() {
     const { selfResync, error } = await submitReport(state, time);
     setReportModalVisible(false);
     if (error) {
-      Alert.alert('Error', error);
+      Alert.alert(AR.error, error);
     } else {
       if (selfResync) await applyResync(selfResync);
-      Alert.alert('Report Shared', 'Your schedule has been updated and your followers have been notified.');
+      Alert.alert(AR.reportShared, AR.reportSharedBody);
     }
   }, [submitReport, applyResync]);
 
   const handleRespond = useCallback(async (notif: any, response: 'yes' | 'no' | 'ignore') => {
     const { yesResult, error } = await respond(notif, response);
     if (error) {
-      Alert.alert('Error', error);
+      Alert.alert(AR.error, error);
     } else if (response === 'yes' && yesResult) {
-      // Apply the resync point so the home screen immediately reflects the new state
       await applyResync({
         syncedState: yesResult.reportedState === 'UTILITY_ON' ? 'ON' : 'OFF',
         syncedAtIso: yesResult.effectiveTransitionAt,
         appliedAtIso: new Date().toISOString(),
       });
-      Alert.alert(
-        'Schedule Updated',
-        'Your personal schedule has been resynchronized based on this community report.',
-      );
+      Alert.alert(AR.scheduleUpdated, AR.scheduleUpdatedBody);
     }
   }, [respond, applyResync]);
 
@@ -755,52 +738,49 @@ export default function CommunityScreen() {
   const { profile } = useAuth();
   const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? null;
 
-  // Participation restriction check
   const isParticipationRestricted = myScore
     ? myScore.total_responses >= 10 &&
       myScore.ignored_notifications / myScore.total_responses > 0.7
     : false;
 
   const tabLabels: { key: Tab; label: string; badge?: number }[] = [
-    { key: 'nearby', label: 'Nearby' },
-    { key: 'notifications', label: 'Alerts', badge: pendingCount > 0 ? pendingCount : undefined },
-    { key: 'history', label: 'History' },
-    { key: 'following', label: 'Following' },
-    { key: 'leaderboard', label: '🏆' },
+    { key: 'nearby', label: AR.nearby },
+    { key: 'notifications', label: 'تنبيهات', badge: pendingCount > 0 ? pendingCount : undefined },
+    { key: 'history', label: AR.history },
+    { key: 'following', label: AR.following },
+    { key: 'leaderboard', label: AR.leaderboard },
   ];
 
   const isLoadingLocation = locationStatus === 'idle' || locationStatus === 'requesting';
 
   return (
     <View style={styles.root}>
-      {/* Participation restriction banner */}
       {isParticipationRestricted && (
         <View style={styles.restrictionBanner}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.restrictionTitle}>{AR.communityAlertsRestricted}</Text>
+            <Text style={styles.restrictionBody}>
+              {AR.ignoreRateTooHigh
+                .replace('{pct}', String(Math.round((myScore!.ignored_notifications / myScore!.total_responses) * 100)))
+                .replace('{total}', String(myScore!.total_responses))}
+            </Text>
+          </View>
           <View style={styles.restrictionIconWrap}>
             <Text style={styles.restrictionIcon}>🚫</Text>
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.restrictionTitle}>COMMUNITY ALERTS RESTRICTED</Text>
-            <Text style={styles.restrictionBody}>
-              Your ignore rate is too high ({Math.round((myScore!.ignored_notifications / myScore!.total_responses) * 100)}% of {myScore!.total_responses} notifications ignored). Respond to upcoming alerts to restore access automatically.
-            </Text>
           </View>
         </View>
       )}
 
-      {/* My reliability bar */}
       {myScore && (
         <View style={styles.myScoreBar}>
-          <View style={styles.myScoreLeft}>
-            <Text style={styles.myScoreLabel}>YOUR RELIABILITY</Text>
-            {displayName ? (
-              <Text style={styles.myScoreName}>{displayName}</Text>
-            ) : null}
-          </View>
           <View style={styles.myScoreRight}>
-            <Text style={[styles.myScoreVal, { color: myBadge?.color }]}>{myScore.reliability_score}%</Text>
+            <Text style={styles.myScoreSub}>{myScore.total_reports} {AR.reports} · {myScore.total_responses} {AR.responses}</Text>
             <Text style={[styles.myBadge, { color: myBadge?.color }]}>{myBadge?.label}</Text>
-            <Text style={styles.myScoreSub}>{myScore.total_reports} reports · {myScore.total_responses} responses</Text>
+            <Text style={[styles.myScoreVal, { color: myBadge?.color }]}>{myScore.reliability_score}%</Text>
+          </View>
+          <View style={styles.myScoreLeft}>
+            <Text style={styles.myScoreLabel}>{AR.yourReliability}</Text>
+            {displayName ? <Text style={styles.myScoreName}>{displayName}</Text> : null}
           </View>
         </View>
       )}
@@ -810,16 +790,15 @@ export default function CommunityScreen() {
         {tabLabels.map(t => (
           <TouchableOpacity key={t.key} style={[styles.tabBtn, tab === t.key && styles.tabBtnActive]} onPress={() => setTab(t.key)} activeOpacity={0.8}>
             <View style={styles.tabLabelWrap}>
-              <Text style={[styles.tabLabel, tab === t.key && styles.tabLabelActive]}>{t.label}</Text>
               {t.badge ? (
                 <View style={styles.tabBadge}><Text style={styles.tabBadgeText}>{t.badge}</Text></View>
               ) : null}
+              <Text style={[styles.tabLabel, tab === t.key && styles.tabLabelActive]}>{t.label}</Text>
             </View>
           </TouchableOpacity>
         ))}
       </View>
 
-      {/* Tab content */}
       {tab === 'nearby' && (
         <FlatList
           style={styles.list}
@@ -831,10 +810,9 @@ export default function CommunityScreen() {
           refreshing={nearbyLoading || followsLoading}
           ListHeaderComponent={() => (
             <>
-              {/* Incoming follow requests */}
               {pending.length > 0 && (
                 <View style={styles.section}>
-                  <Text style={styles.sectionLabel}>FOLLOW REQUESTS ({pending.length})</Text>
+                  <Text style={styles.sectionLabel}>{AR.followRequests} ({pending.length})</Text>
                   {pending.map(f => (
                     <FollowRequestCard
                       key={f.id}
@@ -846,25 +824,20 @@ export default function CommunityScreen() {
                 </View>
               )}
 
-              {/* Location sharing */}
               {isLoadingLocation ? (
                 <View style={styles.locLoadingBox}>
+                  <Text style={styles.locLoadingText}>{AR.gettingLocation}</Text>
                   <ActivityIndicator color={T.accent} size="small" />
-                  <Text style={styles.locLoadingText}>Getting location…</Text>
                 </View>
               ) : locationStatus === 'denied' ? (
                 <View style={styles.locDeniedBox}>
-                  <Text style={styles.locDeniedText}>📍 Location denied — allow in settings to find nearby users</Text>
+                  <Text style={styles.locDeniedText}>{AR.locationDenied}</Text>
                   <TouchableOpacity style={styles.retryBtn} onPress={requestLocation}>
-                    <Text style={styles.retryBtnText}>Try Again</Text>
+                    <Text style={styles.retryBtnText}>{AR.tryAgain}</Text>
                   </TouchableOpacity>
                 </View>
               ) : myLat && myLon ? (
                 <View style={styles.locCard}>
-                  <View style={styles.locRow}>
-                    <Text style={styles.locIcon}>📍</Text>
-                    <Text style={styles.locCoords}>{myLat.toFixed(4)}, {myLon.toFixed(4)}</Text>
-                  </View>
                   <TouchableOpacity
                     style={[styles.shareBtn, (savingLocation || locationSaved) && (locationSaved ? styles.shareBtnSaved : { opacity: 0.6 })]}
                     onPress={handleSaveLocation}
@@ -873,17 +846,20 @@ export default function CommunityScreen() {
                   >
                     {savingLocation
                       ? <ActivityIndicator color="#fff" size="small" />
-                      : <Text style={styles.shareBtnText}>{locationSaved ? '✓ Location Shared!' : '📍  Share My Location'}</Text>
+                      : <Text style={styles.shareBtnText}>{locationSaved ? '✓ ' + AR.locationShared : AR.shareMyLocation}</Text>
                     }
                   </TouchableOpacity>
+                  <View style={styles.locRow}>
+                    <Text style={styles.locCoords}>{myLat.toFixed(4)}, {myLon.toFixed(4)}</Text>
+                    <Text style={styles.locIcon}>📍</Text>
+                  </View>
                 </View>
               ) : null}
 
               {nearbyUsers.length > 0 && (
-                <Text style={styles.sectionLabel}>NEARBY USERS — {nearbyUsers.length} WITHIN 0.5KM</Text>
+                <Text style={styles.sectionLabel}>{AR.nearbyUsers} — {nearbyUsers.length} ضمن 0.5 كم</Text>
               )}
 
-              {/* Suggested Users — show prominently when user has few/no following connections */}
               {(following.length === 0 || following.length < 3) && nearbyUsers.length > 0 && (
                 <SuggestedUsers
                   nearbyUsers={nearbyUsers}
@@ -896,18 +872,14 @@ export default function CommunityScreen() {
             </>
           )}
           renderItem={({ item }) => (
-            <NearbyUserCard
-              item={item}
-              followStatus={getStatusWith(item.user_id)}
-              onFollowAction={handleFollowAction}
-            />
+            <NearbyUserCard item={item} followStatus={getStatusWith(item.user_id)} onFollowAction={handleFollowAction} />
           )}
           ListEmptyComponent={() => (
             (nearbyLoading || isLoadingLocation) ? null : (
               <View style={styles.emptyBox}>
                 <Text style={{ fontSize: 48, marginBottom: 14 }}>👥</Text>
-                <Text style={styles.emptyTitle}>No Users Within 0.5km</Text>
-                <Text style={styles.emptySub}>Share your location above and invite neighbors to join so you can compare block timings.</Text>
+                <Text style={styles.emptyTitle}>{AR.noNearbyUsers}</Text>
+                <Text style={styles.emptySub}>{AR.noNearbyUsersSub}</Text>
               </View>
             )
           )}
@@ -925,18 +897,16 @@ export default function CommunityScreen() {
           refreshing={notifLoading}
           ListHeaderComponent={() => (
             <Text style={styles.sectionLabel}>
-              COMMUNITY ALERTS — {pendingCount > 0 ? `${pendingCount} AWAITING YOUR RESPONSE` : 'ALL CAUGHT UP'}
+              {AR.communityAlerts} — {pendingCount > 0 ? `${pendingCount} ${AR.awaitingResponse}` : AR.allCaughtUp}
             </Text>
           )}
-          renderItem={({ item }) => (
-            <NotifCard notif={item} onRespond={handleRespond} />
-          )}
+          renderItem={({ item }) => <NotifCard notif={item} onRespond={handleRespond} />}
           ListEmptyComponent={() => (
             notifLoading ? null : (
               <View style={styles.emptyBox}>
                 <Text style={{ fontSize: 48, marginBottom: 14 }}>🔔</Text>
-                <Text style={styles.emptyTitle}>No Alerts</Text>
-                <Text style={styles.emptySub}>When someone you follow reports a grid transition, their notification will appear here for 30 minutes.</Text>
+                <Text style={styles.emptyTitle}>{AR.noAlerts}</Text>
+                <Text style={styles.emptySub}>{AR.noAlertsSub}</Text>
               </View>
             )
           )}
@@ -951,47 +921,39 @@ export default function CommunityScreen() {
           keyExtractor={h => String(h.id)}
           showsVerticalScrollIndicator={false}
           ListHeaderComponent={() => (
-            <Text style={styles.sectionLabel}>YOUR RESYNC HISTORY — LAST {history.length} EVENTS</Text>
+            <Text style={styles.sectionLabel}>سجل مزامنتك — آخر {history.length} أحداث</Text>
           )}
           renderItem={({ item }) => <HistoryCard entry={item} />}
           ListEmptyComponent={() => (
             <View style={styles.emptyBox}>
               <Text style={{ fontSize: 48, marginBottom: 14 }}>📋</Text>
-              <Text style={styles.emptyTitle}>No History Yet</Text>
-              <Text style={styles.emptySub}>When you confirm a community grid report, the resync event will appear here.</Text>
+              <Text style={styles.emptyTitle}>{AR.noHistory}</Text>
+              <Text style={styles.emptySub}>{AR.noHistorySub}</Text>
             </View>
           )}
         />
       )}
 
       {tab === 'leaderboard' && (
-        <ScrollView
-          style={styles.list}
-          contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]}
-          showsVerticalScrollIndicator={false}
-        >
+        <ScrollView style={styles.list} contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]} showsVerticalScrollIndicator={false}>
           <LeaderboardTab myLat={myLat} myLon={myLon} />
         </ScrollView>
       )}
 
       {tab === 'following' && (
-        <ScrollView
-          style={styles.list}
-          contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]}
-          showsVerticalScrollIndicator={false}
-        >
+        <ScrollView style={styles.list} contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]} showsVerticalScrollIndicator={false}>
           {following.length > 0 && (
             <>
-              <Text style={styles.sectionLabel}>FOLLOWING ({following.length})</Text>
+              <Text style={styles.sectionLabel}>{AR.following} ({following.length})</Text>
               {following.map(f => (
                 <View key={f.id} style={styles.followRow}>
-                  <View style={styles.followRowLeft}>
-                    <Text style={styles.followName}>{f.target_username ?? 'Unknown'}</Text>
-                    <Text style={styles.followSub}>You receive their grid alerts</Text>
-                  </View>
                   <TouchableOpacity style={styles.unfollowBtn} onPress={() => cancelOrUnfollow(f.id)} activeOpacity={0.85}>
-                    <Text style={styles.unfollowText}>Unfollow</Text>
+                    <Text style={styles.unfollowText}>{AR.unfollow}</Text>
                   </TouchableOpacity>
+                  <View style={styles.followRowLeft}>
+                    <Text style={styles.followName}>{f.target_username ?? 'مجهول'}</Text>
+                    <Text style={styles.followSub}>{AR.youReceiveAlerts}</Text>
+                  </View>
                 </View>
               ))}
             </>
@@ -999,16 +961,16 @@ export default function CommunityScreen() {
 
           {followers.length > 0 && (
             <>
-              <Text style={[styles.sectionLabel, { marginTop: 16 }]}>YOUR FOLLOWERS ({followers.length})</Text>
+              <Text style={[styles.sectionLabel, { marginTop: 16 }]}>{AR.followingLabel} ({followers.length})</Text>
               {followers.map(f => (
                 <View key={f.id} style={styles.followRow}>
-                  <View style={styles.followRowLeft}>
-                    <Text style={styles.followName}>{f.requester_username ?? 'Unknown'}</Text>
-                    <Text style={styles.followSub}>Receives your grid alerts</Text>
-                  </View>
                   <TouchableOpacity style={styles.removeBtn} onPress={() => cancelOrUnfollow(f.id)} activeOpacity={0.85}>
-                    <Text style={styles.removeText}>Remove</Text>
+                    <Text style={styles.removeText}>{AR.remove}</Text>
                   </TouchableOpacity>
+                  <View style={styles.followRowLeft}>
+                    <Text style={styles.followName}>{f.requester_username ?? 'مجهول'}</Text>
+                    <Text style={styles.followSub}>{AR.receivesYourAlerts}</Text>
+                  </View>
                 </View>
               ))}
             </>
@@ -1016,16 +978,16 @@ export default function CommunityScreen() {
 
           {outgoing.length > 0 && (
             <>
-              <Text style={[styles.sectionLabel, { marginTop: 16 }]}>SENT REQUESTS ({outgoing.length})</Text>
+              <Text style={[styles.sectionLabel, { marginTop: 16 }]}>الطلبات المُرسَلة ({outgoing.length})</Text>
               {outgoing.map(f => (
                 <View key={f.id} style={styles.followRow}>
-                  <View style={styles.followRowLeft}>
-                    <Text style={styles.followName}>{f.target_username ?? 'Unknown'}</Text>
-                    <Text style={styles.followSub}>Request pending approval</Text>
-                  </View>
                   <TouchableOpacity style={styles.cancelBtn} onPress={() => cancelOrUnfollow(f.id)} activeOpacity={0.85}>
-                    <Text style={styles.cancelText}>Cancel</Text>
+                    <Text style={styles.cancelText}>{AR.cancel}</Text>
                   </TouchableOpacity>
+                  <View style={styles.followRowLeft}>
+                    <Text style={styles.followName}>{f.target_username ?? 'مجهول'}</Text>
+                    <Text style={styles.followSub}>{AR.requestPending}</Text>
+                  </View>
                 </View>
               ))}
             </>
@@ -1034,8 +996,8 @@ export default function CommunityScreen() {
           {following.length === 0 && followers.length === 0 && outgoing.length === 0 && (
             <View style={styles.emptyBox}>
               <Text style={{ fontSize: 48, marginBottom: 14 }}>🤝</Text>
-              <Text style={styles.emptyTitle}>No Connections Yet</Text>
-              <Text style={styles.emptySub}>Go to Nearby tab to find trusted users and send follow requests.</Text>
+              <Text style={styles.emptyTitle}>{AR.noConnections}</Text>
+              <Text style={styles.emptySub}>{AR.noConnectionsSub}</Text>
             </View>
           )}
         </ScrollView>
@@ -1053,55 +1015,55 @@ export default function CommunityScreen() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: T.bg },
-  myScoreBar: { flexDirection: 'row', backgroundColor: T.surface, paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: T.border, alignItems: 'center', justifyContent: 'space-between' },
+  myScoreBar: { flexDirection: 'row-reverse', backgroundColor: T.surface, paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: T.border, alignItems: 'center', justifyContent: 'space-between' },
   myScoreLeft: { flexDirection: 'column', justifyContent: 'center' },
-  myScoreLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1.5 },
-  myScoreName: { color: T.textPrimary, fontSize: 14, fontWeight: '700', marginTop: 2 },
-  myScoreRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  myScoreLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, textAlign: 'right' },
+  myScoreName: { color: T.textPrimary, fontSize: 14, fontWeight: '700', marginTop: 2, textAlign: 'right' },
+  myScoreRight: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
   myScoreVal: { fontSize: 15, fontWeight: '800' },
   myBadge: { fontSize: 12, fontWeight: '600' },
   myScoreSub: { color: T.textMuted, fontSize: 10 },
-  tabBar: { flexDirection: 'row', backgroundColor: T.surface, borderBottomWidth: 1, borderBottomColor: T.border },
+  tabBar: { flexDirection: 'row-reverse', backgroundColor: T.surface, borderBottomWidth: 1, borderBottomColor: T.border },
   tabBtn: { flex: 1, paddingVertical: 13, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent' },
   tabBtnActive: { borderBottomColor: T.accent },
-  tabLabelWrap: { flexDirection: 'row', alignItems: 'center', gap: 5 },
-  tabLabel: { color: T.textMuted, fontSize: 12, fontWeight: '600' },
+  tabLabelWrap: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5 },
+  tabLabel: { color: T.textMuted, fontSize: 11, fontWeight: '600' },
   tabLabelActive: { color: T.accent },
   tabBadge: { backgroundColor: T.danger, borderRadius: 8, minWidth: 16, height: 16, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
   tabBadgeText: { color: '#fff', fontSize: 9, fontWeight: '800' },
   list: { flex: 1 },
   listContent: { paddingHorizontal: 16, paddingTop: 12 },
   section: { marginBottom: 16 },
-  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1.5, marginBottom: 10, textTransform: 'uppercase' },
-  locLoadingBox: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: T.surface, borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: T.border },
-  locLoadingText: { color: T.textMuted, fontSize: 12 },
+  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 10, textAlign: 'right' },
+  locLoadingBox: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: T.surface, borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: T.border },
+  locLoadingText: { color: T.textMuted, fontSize: 12, textAlign: 'right' },
   locDeniedBox: { backgroundColor: '#1a0a00', borderRadius: 12, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: '#451a03', alignItems: 'center' },
   locDeniedText: { color: '#92400e', fontSize: 13, textAlign: 'center', lineHeight: 19, marginBottom: 10 },
   retryBtn: { backgroundColor: T.primary, borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10 },
   retryBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
   locCard: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: T.border },
-  locRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
+  locRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 10 },
   locIcon: { fontSize: 18 },
   locCoords: { color: T.textMuted, fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  shareBtn: { backgroundColor: T.primary, borderRadius: 12, paddingVertical: 12, alignItems: 'center' },
+  shareBtn: { backgroundColor: T.primary, borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginTop: 8 },
   shareBtnSaved: { backgroundColor: '#065f46' },
   shareBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   emptyBox: { alignItems: 'center', paddingVertical: 40, paddingHorizontal: 24 },
   emptyTitle: { color: T.textSecondary, fontSize: 18, fontWeight: '700', marginBottom: 10, textAlign: 'center' },
-  emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 20 },
-  followRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: T.surface, borderRadius: 12, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: T.border },
+  emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 22 },
+  followRow: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: T.surface, borderRadius: 12, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: T.border },
   followRowLeft: { flex: 1 },
-  followName: { color: T.textPrimary, fontSize: 15, fontWeight: '700' },
-  followSub: { color: T.textMuted, fontSize: 11, marginTop: 2 },
+  followName: { color: T.textPrimary, fontSize: 15, fontWeight: '700', textAlign: 'right' },
+  followSub: { color: T.textMuted, fontSize: 11, marginTop: 2, textAlign: 'right' },
   unfollowBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
   unfollowText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
   removeBtn: { backgroundColor: '#2d0a0a', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.danger + '44' },
   removeText: { color: T.danger, fontWeight: '600', fontSize: 12 },
   cancelBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
   cancelText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
-  restrictionBanner: { backgroundColor: '#1a0808', borderBottomWidth: 1, borderBottomColor: '#7f1d1d', paddingHorizontal: 16, paddingVertical: 12, flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  restrictionBanner: { backgroundColor: '#1a0808', borderBottomWidth: 1, borderBottomColor: '#7f1d1d', paddingHorizontal: 16, paddingVertical: 12, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12 },
   restrictionIconWrap: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#450a0a', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   restrictionIcon: { fontSize: 18 },
-  restrictionTitle: { color: '#f87171', fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginBottom: 4 },
-  restrictionBody: { color: '#fca5a5', fontSize: 12, lineHeight: 18 },
+  restrictionTitle: { color: '#f87171', fontSize: 10, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
+  restrictionBody: { color: '#fca5a5', fontSize: 12, lineHeight: 18, textAlign: 'right' },
 });

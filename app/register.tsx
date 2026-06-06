@@ -6,6 +6,7 @@ import {
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../contexts/AuthContext';
+import { AR } from '../constants/arabic';
 
 export default function RegisterScreen() {
   const router = useRouter();
@@ -22,15 +23,15 @@ export default function RegisterScreen() {
 
   const handleRegister = async () => {
     if (!username.trim() || !email.trim() || !password.trim()) {
-      setError('Please fill in all fields.');
+      setError(AR.fillAllFields);
       return;
     }
     if (password.length < 6) {
-      setError('Password must be at least 6 characters.');
+      setError(AR.passwordMin6);
       return;
     }
     if (password !== confirm) {
-      setError('Passwords do not match.');
+      setError(AR.passwordsNoMatch);
       return;
     }
     setLoading(true);
@@ -48,12 +49,12 @@ export default function RegisterScreen() {
     return (
       <View style={[styles.root, { justifyContent: 'center', alignItems: 'center', padding: 32 }]}>
         <Text style={{ fontSize: 56, marginBottom: 16 }}>✅</Text>
-        <Text style={styles.cardTitle}>Account Created!</Text>
+        <Text style={styles.cardTitle}>{AR.accountCreated}</Text>
         <Text style={{ color: '#64748b', fontSize: 14, textAlign: 'center', lineHeight: 22, marginVertical: 16 }}>
-          Your account has been created. Please check your email to verify your address, then sign in.
+          {AR.accountCreatedBody}
         </Text>
         <TouchableOpacity style={styles.btn} onPress={() => router.replace('/login')}>
-          <Text style={styles.btnText}>Go to Sign In</Text>
+          <Text style={styles.btnText}>{AR.goToSignIn}</Text>
         </TouchableOpacity>
       </View>
     );
@@ -70,17 +71,17 @@ export default function RegisterScreen() {
         showsVerticalScrollIndicator={false}
       >
         <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
-          <Text style={styles.backText}>← Back</Text>
+          <Text style={styles.backText}>{AR.back}</Text>
         </TouchableOpacity>
 
         <View style={styles.brandRow}>
+          <Text style={styles.brandName}>{AR.appName}</Text>
           <Text style={styles.brandIcon}>⚡</Text>
-          <Text style={styles.brandName}>Grid Monitor</Text>
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Create Account</Text>
-          <Text style={styles.cardSub}>Join the community power tracking network</Text>
+          <Text style={styles.cardTitle}>{AR.createAccount}</Text>
+          <Text style={styles.cardSub}>{AR.joinNetwork}</Text>
 
           {error ? (
             <View style={styles.errorBox}>
@@ -89,56 +90,60 @@ export default function RegisterScreen() {
           ) : null}
 
           <View style={styles.field}>
-            <Text style={styles.fieldLabel}>Username</Text>
+            <Text style={styles.fieldLabel}>{AR.username}</Text>
             <TextInput
               style={styles.input}
               value={username}
               onChangeText={setUsername}
-              placeholder="Your display name"
+              placeholder={AR.displayNamePlaceholder}
               placeholderTextColor="#475569"
               autoCapitalize="none"
-              accessibilityLabel="Username"
+              textAlign="right"
+              accessibilityLabel={AR.username}
             />
           </View>
 
           <View style={styles.field}>
-            <Text style={styles.fieldLabel}>Email</Text>
+            <Text style={styles.fieldLabel}>{AR.email}</Text>
             <TextInput
               style={styles.input}
               value={email}
               onChangeText={setEmail}
-              placeholder="you@example.com"
+              placeholder={AR.emailPlaceholder}
               placeholderTextColor="#475569"
               keyboardType="email-address"
               autoCapitalize="none"
               autoCorrect={false}
-              accessibilityLabel="Email"
+              textAlign="right"
+              accessibilityLabel={AR.email}
             />
           </View>
 
           <View style={styles.field}>
-            <Text style={styles.fieldLabel}>Password</Text>
+            <Text style={styles.fieldLabel}>{AR.password}</Text>
             <TextInput
               style={styles.input}
               value={password}
               onChangeText={setPassword}
-              placeholder="Min 6 characters"
+              placeholder={AR.minSixChars}
               placeholderTextColor="#475569"
               secureTextEntry
-              accessibilityLabel="Password"
+              textAlign="right"
+              accessibilityLabel={AR.password}
             />
           </View>
 
           <View style={styles.field}>
-            <Text style={styles.fieldLabel}>Confirm Password</Text>
+            <Text style={styles.fieldLabel}>{AR.confirmPassword}</Text>
             <TextInput
               style={styles.input}
               value={confirm}
               onChangeText={setConfirm}
-              placeholder="Re-enter password"
+              placeholder={AR.reEnterPassword}
               placeholderTextColor="#475569"
               secureTextEntry
-              accessibilityLabel="Confirm password"
+              textAlign="right"
+              accessibilityLabel={AR.confirmPassword}
             />
           </View>
 
@@ -151,7 +156,7 @@ export default function RegisterScreen() {
             {loading ? (
               <ActivityIndicator color="#fff" size="small" />
             ) : (
-              <Text style={styles.btnText}>Create Account</Text>
+              <Text style={styles.btnText}>{AR.createAccount}</Text>
             )}
           </TouchableOpacity>
         </View>
@@ -163,47 +168,29 @@ export default function RegisterScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#060d1a' },
   container: { paddingHorizontal: 24 },
-  backBtn: { marginBottom: 20 },
+  backBtn: { marginBottom: 20, alignSelf: 'flex-end' },
   backText: { color: '#38bdf8', fontSize: 15, fontWeight: '600' },
-  brandRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 24 },
+  brandRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, marginBottom: 24 },
   brandIcon: { fontSize: 32 },
-  brandName: { fontSize: 24, fontWeight: '800', color: '#f1f5f9' },
+  brandName: { fontSize: 24, fontWeight: '800', color: '#f1f5f9', textAlign: 'right' },
   card: {
-    backgroundColor: '#0f1a2e',
-    borderRadius: 20,
-    padding: 24,
-    borderWidth: 1,
-    borderColor: '#1e3a5f',
+    backgroundColor: '#0f1a2e', borderRadius: 20, padding: 24,
+    borderWidth: 1, borderColor: '#1e3a5f',
   },
-  cardTitle: { color: '#e2e8f0', fontSize: 22, fontWeight: '700', marginBottom: 4 },
-  cardSub: { color: '#64748b', fontSize: 13, marginBottom: 24 },
+  cardTitle: { color: '#e2e8f0', fontSize: 22, fontWeight: '700', marginBottom: 4, textAlign: 'right' },
+  cardSub: { color: '#64748b', fontSize: 13, marginBottom: 24, textAlign: 'right' },
   errorBox: {
-    backgroundColor: 'rgba(239,68,68,0.12)',
-    borderRadius: 10,
-    padding: 12,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(239,68,68,0.3)',
+    backgroundColor: 'rgba(239,68,68,0.12)', borderRadius: 10, padding: 12,
+    marginBottom: 16, borderWidth: 1, borderColor: 'rgba(239,68,68,0.3)',
   },
-  errorText: { color: '#f87171', fontSize: 13, lineHeight: 19 },
+  errorText: { color: '#f87171', fontSize: 13, lineHeight: 19, textAlign: 'right' },
   field: { marginBottom: 16 },
-  fieldLabel: { color: '#94a3b8', fontSize: 12, fontWeight: '600', marginBottom: 8 },
+  fieldLabel: { color: '#94a3b8', fontSize: 12, fontWeight: '600', marginBottom: 8, textAlign: 'right' },
   input: {
-    backgroundColor: '#060d1a',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#1e3a5f',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    color: '#f1f5f9',
-    fontSize: 15,
+    backgroundColor: '#060d1a', borderRadius: 12, borderWidth: 1, borderColor: '#1e3a5f',
+    paddingHorizontal: 16, paddingVertical: 14, color: '#f1f5f9', fontSize: 15,
+    textAlign: 'right',
   },
-  btn: {
-    backgroundColor: '#1d4ed8',
-    borderRadius: 14,
-    paddingVertical: 16,
-    alignItems: 'center',
-    marginTop: 8,
-  },
+  btn: { backgroundColor: '#1d4ed8', borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginTop: 8 },
   btnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
 });

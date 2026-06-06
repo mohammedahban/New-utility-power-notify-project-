@@ -1,8 +1,8 @@
 import { Stack } from 'expo-router';
 import { useAuth } from '../../contexts/AuthContext';
 import { TouchableOpacity, Text, View } from 'react-native';
-import { useRouter } from 'expo-router';
 import { useUnreviewedConflictsCount } from '../../hooks/useResyncHistory';
+import { AR } from '../../constants/arabic';
 
 function ConflictsBadge() {
   const { count } = useUnreviewedConflictsCount();
@@ -24,29 +24,30 @@ export default function AdminLayout() {
         headerTintColor: '#e2e8f0',
         headerTitleStyle: { fontWeight: '700' },
         contentStyle: { backgroundColor: '#0f172a' },
-        headerRight: () => (
-          <TouchableOpacity onPress={signOut} style={{ marginRight: 4 }}>
-            <Text style={{ color: '#64748b', fontSize: 13 }}>Sign Out</Text>
+        headerLeft: () => (
+          <TouchableOpacity onPress={signOut} style={{ marginLeft: 4 }}>
+            <Text style={{ color: '#64748b', fontSize: 13 }}>{AR.signOut}</Text>
           </TouchableOpacity>
         ),
+        headerRight: () => null,
       }}
     >
-      <Stack.Screen name="index" options={{ title: 'Grid Monitor', headerShown: true }} />
-      <Stack.Screen name="history" options={{ title: 'Power History' }} />
-      <Stack.Screen name="predictions" options={{ title: 'Smart Predictions' }} />
+      <Stack.Screen name="index" options={{ title: AR.growattMonitor, headerShown: true }} />
+      <Stack.Screen name="history" options={{ title: AR.powerHistory }} />
+      <Stack.Screen name="predictions" options={{ title: AR.smartPredictions }} />
       <Stack.Screen
         name="settings"
         options={{
-          title: 'Settings',
+          title: AR.settings,
           headerTitle: () => (
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <Text style={{ color: '#e2e8f0', fontWeight: '700', fontSize: 17 }}>Settings</Text>
+            <View style={{ flexDirection: 'row-reverse', alignItems: 'center' }}>
+              <Text style={{ color: '#e2e8f0', fontWeight: '700', fontSize: 17 }}>{AR.settings}</Text>
               <ConflictsBadge />
             </View>
           ),
         }}
       />
-      <Stack.Screen name="conflicts" options={{ title: 'Community Conflicts' }} />
+      <Stack.Screen name="conflicts" options={{ title: AR.conflictsTitle }} />
     </Stack>
   );
 }

@@ -177,10 +177,10 @@ export async function sendTestNotification(isOn: boolean): Promise<void> {
   await ensureAndroidChannel();
   await Notifications.scheduleNotificationAsync({
     content: {
-      title: isOn ? '⚡ TEST: Utility Power IS BACK ON' : '🔴 TEST: Utility Power WENT OFF',
+      title: isOn ? '⚡ اختبار: الكهرباء اشتغلت' : '🔴 اختبار: الكهرباء طفت',
       body: isOn
-        ? 'Test notification — grid restored'
-        : 'Test notification — grid lost, running on solar/battery',
+        ? 'إشعار تجريبي — عادت الكهرباء'
+        : 'إشعار تجريبي — انقطعت الكهرباء، يعمل على الطاقة الشمسية/البطارية',
       sound: 'alarm.wav',
       data: { play_sound: true, eventType: isOn ? 'UTILITY_ON' : 'UTILITY_OFF' },
       ...(Platform.OS === 'android' ? { channelId: 'grid-monitor' } : {}),

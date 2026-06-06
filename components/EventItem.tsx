@@ -22,9 +22,9 @@ export default React.memo(function EventItem({ event }: Props) {
 
       <View style={styles.info}>
         <Text style={[styles.type, { color: isOn ? '#22c55e' : '#ef4444' }]}>
-          Utility {isOn ? 'CAME ON' : 'WENT OFF'}
+          {isOn ? 'الكهرباء اشتغلت' : 'الكهرباء طفت'}
         </Text>
-        <Text style={styles.time}>{time} (Yemen)</Text>
+        <Text style={styles.time}>{time} (اليمن)</Text>
         {event.status_text ? (
           <Text style={styles.statusText}>{event.status_text}</Text>
         ) : null}
@@ -42,17 +42,17 @@ export default React.memo(function EventItem({ event }: Props) {
 
 const styles = StyleSheet.create({
   row: {
-    flexDirection: 'row',
+    flexDirection: 'row-reverse',
     alignItems: 'center',
     backgroundColor: '#1e293b',
     borderRadius: 12,
     padding: 14,
     marginBottom: 8,
-    borderLeftWidth: 3,
+    borderRightWidth: 3,
   },
   icon: {
     fontSize: 22,
-    marginRight: 12,
+    marginLeft: 12,
   },
   info: {
     flex: 1,
@@ -61,10 +61,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 14,
     marginBottom: 2,
+    textAlign: 'right',
   },
   time: {
     color: '#64748b',
     fontSize: 12,
+    textAlign: 'right',
   },
   statusText: {
     color: '#475569',
