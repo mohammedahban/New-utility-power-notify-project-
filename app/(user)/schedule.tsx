@@ -38,10 +38,11 @@ function parseFormattedTime(label: string): number | null {
   }
 }
 
-function ScheduleBlock({ slot, index, resyncEvents }: {
+function ScheduleBlock({ slot, index, resyncEvents, isActive }: {
   slot: ShiftedScheduleSlot;
   index: number;
   resyncEvents: any[];
+  isActive?: boolean;
 }) {
   const isOn = slot.state === 'ON';
   const color = isOn ? T.success : T.danger;
@@ -75,9 +76,15 @@ function ScheduleBlock({ slot, index, resyncEvents }: {
         sbStyles.block,
         { borderLeftColor: color, borderLeftWidth: 3 },
         resyncMatch ? sbStyles.resyncBlock : undefined,
+        isActive ? [sbStyles.activeBlock, { borderColor: color }] : undefined,
       ]}>
         <View style={sbStyles.blockHeader}>
           <Text style={[sbStyles.state, { color }]}>Grid {slot.state}</Text>
+          {isActive && (
+            <View style={[sbStyles.nowBadge, { backgroundColor: color + '22', borderColor: color + '88' }]}>
+              <Text style={[sbStyles.nowBadgeText, { color }]}>NOW</Text>
+            </View>
+          )}
           {slot.isEstimated && (
             <View style={sbStyles.estBadge}><Text style={sbStyles.estText}>estimated</Text></View>
           )}
@@ -143,6 +150,9 @@ const sbStyles = StyleSheet.create({
   ongoing: { color: T.textMuted, fontSize: 13 },
   duration: { fontSize: 12, fontWeight: '600' },
   // Community resync styling
+  activeBlock: { borderWidth: 1.5, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 6, elevation: 4 },
+  nowBadge: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
+  nowBadgeText: { fontSize: 9, fontWeight: '800', letterSpacing: 1.5 },
   resyncBlock: { borderColor: '#1e3a5a', backgroundColor: '#0a1929' },
   resyncBadge: {
     backgroundColor: '#001a2e', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3,
@@ -247,12 +257,58 @@ export default function ScheduleScreen() {
       ) : (
         <View style={styles.timeline}>
           <Text style={styles.sectionLabel}>NEXT 24 HOURS (YEMEN TIME, UTC+3)</Text>
-          {slots.map((slot, i) => (
-            <ScheduleBlock key={i} slot={slot} index={i} resyncEvents={resyncHistory} />
-          ))}
+          {slots.map((slot, i) => {
+            const nowMs = Date.now();
+            const slotStartMs = new Date(slot.startIso).getTime();
+            const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
+            const isActive = nowMs >= slotStartMs && nowMs < slotEndMs;
+            return (
+              <ScheduleBlock key={i} slot={slot} index={i} resyncEvents={resyncHistory} isActive={isActive} />
+            );
+          })}
           <View style={styles.endDot} />
         </View>
       )}
+
+      {/* Cycle stats row */}
+      {slots.length >= 2 && (() => {
+        const completedSlots = slots.filter(s => s.endIso);
+        const onSlots = completedSlots.filter(s => s.state === 'ON');
+        const offSlots = completedSlots.filter(s => s.state === 'OFF');
+        if (onSlots.length === 0 && offSlots.length === 0) return null;
+        const avgMin = (arr: ShiftedScheduleSlot[]) =>
+          Math.round(arr.reduce((sum, s) => {
+            const ms = new Date(s.endIso!).getTime() - new Date(s.startIso).getTime();
+            return sum + ms / 60_000;
+          }, 0) / arr.length);
+        const fmtMin = (m: number) => {
+          const h = Math.floor(m / 60);
+          const mins = Math.round(m % 60);
+          if (h === 0) return `${mins}m`;
+          if (mins === 0) return `${h}h`;
+          return `${h}h ${mins}m`;
+        };
+        const onAvg = onSlots.length > 0 ? fmtMin(avgMin(onSlots)) : null;
+        const offAvg = offSlots.length > 0 ? fmtMin(avgMin(offSlots)) : null;
+        return (
+          <View style={styles.statsRow}>
+            {onAvg && (
+              <View style={styles.statItem}>
+                <View style={[styles.statDot, { backgroundColor: T.success }]} />
+                <Text style={styles.statText}>~{onAvg} <Text style={{ color: T.success, fontWeight: '700' }}>ON</Text></Text>
+              </View>
+            )}
+            {onAvg && offAvg && <Text style={styles.statSlash}>/</Text>}
+            {offAvg && (
+              <View style={styles.statItem}>
+                <View style={[styles.statDot, { backgroundColor: T.danger }]} />
+                <Text style={styles.statText}>~{offAvg} <Text style={{ color: T.danger, fontWeight: '700' }}>OFF</Text></Text>
+              </View>
+            )}
+            <Text style={styles.statLabel}>per cycle</Text>
+          </View>
+        );
+      })()}
 
       {userPrediction?.computedAt && (
         <Text style={styles.computedAt}>
@@ -291,4 +347,14 @@ const styles = StyleSheet.create({
   emptyTitle: { color: T.textSecondary, fontSize: 20, fontWeight: '700', marginBottom: 12 },
   emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 20 },
   computedAt: { color: T.textMuted, fontSize: 10, textAlign: 'center', marginTop: 8 },
+  statsRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+    backgroundColor: T.surface, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 16,
+    marginTop: 8, marginBottom: 4, borderWidth: 1, borderColor: T.border,
+  },
+  statItem: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  statDot: { width: 7, height: 7, borderRadius: 4 },
+  statText: { color: T.textSecondary, fontSize: 13 },
+  statSlash: { color: T.border, fontSize: 14, fontWeight: '300' },
+  statLabel: { color: T.textMuted, fontSize: 11, marginLeft: 2 },
 });
