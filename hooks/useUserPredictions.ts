@@ -115,9 +115,16 @@ function durationLabelFromMin(min: number): string {
 // ── Step 1: Extend master schedule to 48 h ────────────────────────────────────
 /**
  * The master daySchedule typically covers 24 h.
- * We extend it by repeating the observed ON/OFF durations so the user
- * always sees several future cycles — no independent pattern generation.
- * All durations come exclusively from the master prediction.
+ * We extend it by repeating the ACTUAL ON/OFF durations extracted from
+ * the master slots themselves — never from aggregate averages.
+ *
+ * Strategy:
+ *   1. Find the last complete ON→OFF pair in master slots to get real durations.
+ *   2. Fall back to the last single complete slot's duration if no pair found.
+ *   3. Only fall back to aggregate stats as a last resort.
+ *
+ * This ensures the extension mirrors the real cycle structure (e.g. 2h ON /
+ * 7h OFF) rather than introducing phantom extra cycles from wrong averages.
  */
 function extendScheduleTo48h(
   masterSlots: ScheduleSlot[],
@@ -125,19 +132,34 @@ function extendScheduleTo48h(
 ): ScheduleSlot[] {
   if (masterSlots.length === 0) return [];
 
-  // Use master expected durations for extension
-  const extOffMin =
-    prediction.allPattern?.avgOffMin ??
-    prediction.dayPattern?.avgOffMin ??
-    prediction.nightPattern?.avgOffMin ??
-    prediction.expectedOffRange?.minMin ??
-    360;
-  const extOnMin =
+  // ── Extract real ON and OFF durations from the master slot sequence ──────
+  // Walk the master slots to find the most recent complete ON duration and
+  // the most recent complete OFF duration.
+  let realOnMin: number | null = null;
+  let realOffMin: number | null = null;
+
+  for (let i = masterSlots.length - 1; i >= 0; i--) {
+    const s = masterSlots[i];
+    if (!s.endIso) continue; // skip open-ended (current) slot
+    const durMin = (new Date(s.endIso).getTime() - new Date(s.startIso).getTime()) / 60_000;
+    if (durMin < 5) continue; // skip suspiciously short slots (noise)
+    if (s.state === 'ON' && realOnMin === null) realOnMin = durMin;
+    if (s.state === 'OFF' && realOffMin === null) realOffMin = durMin;
+    if (realOnMin !== null && realOffMin !== null) break;
+  }
+
+  // Last-resort fallbacks — prefer range labels over aggregate averages
+  // because aggregates can include stale/outlier cycles.
+  const extOnMin = realOnMin ??
+    prediction.expectedOnRange?.minMin ??
     prediction.allPattern?.avgOnMin ??
     prediction.dayPattern?.avgOnMin ??
-    prediction.nightPattern?.avgOnMin ??
-    prediction.expectedOnRange?.minMin ??
     120;
+  const extOffMin = realOffMin ??
+    prediction.expectedOffRange?.minMin ??
+    prediction.allPattern?.avgOffMin ??
+    prediction.dayPattern?.avgOffMin ??
+    360;
 
   const horizonMs = Date.now() + 48 * 60 * 60 * 1000;
   const slots: ScheduleSlot[] = [...masterSlots];
@@ -162,7 +184,7 @@ function extendScheduleTo48h(
       endIso: nextEndIso,
       startFormatted: fmtYemenTime(nextStartIso),
       endFormatted: fmtYemenTime(nextEndIso),
-      durationLabel: durationLabelFromMin(durationMin),
+      durationLabel: durationLabelFromMin(Math.round(durationMin)),
       zone: 'extended',
       isEstimated: true,
     });
