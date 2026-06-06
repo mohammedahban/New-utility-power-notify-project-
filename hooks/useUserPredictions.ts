@@ -95,6 +95,21 @@ function fmtYemenTime(iso: string): string {
   });
 }
 
+/**
+ * Returns the zone label for a given ISO timestamp, matching the same
+ * getZone() logic used by the analyze-patterns Edge Function.
+ *
+ * Yemen time is UTC+3 so we shift before extracting the hour.
+ */
+function getZoneFromIso(iso: string): string {
+  const h = new Date(new Date(iso).getTime() + 3 * 60 * 60 * 1000).getUTCHours();
+  if (h < 6)  return 'Night';
+  if (h < 10) return 'Morning';
+  if (h < 16) return 'Midday';
+  if (h < 20) return 'Evening';
+  return 'Late Night';
+}
+
 function fmtWait(min: number): string {
   if (min <= 0) return 'soon';
   const h = Math.floor(min / 60);
@@ -185,7 +200,7 @@ function extendScheduleTo48h(
       startFormatted: fmtYemenTime(nextStartIso),
       endFormatted: fmtYemenTime(nextEndIso),
       durationLabel: durationLabelFromMin(Math.round(durationMin)),
-      zone: 'extended',
+      zone: getZoneFromIso(nextStartIso),
       isEstimated: true,
     });
   }
