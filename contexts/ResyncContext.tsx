@@ -27,6 +27,12 @@ export interface ResyncPoint {
    * The ISO timestamp at which this state effectively became active.
    * For reporter: now - selectedTimeOffsetMinutes
    * For recipient: now - (selectedTimeOffsetMinutes + responseDelayMinutes)
+   *
+   * This is the ABSOLUTE wall-clock time — it is used to compute the
+   * delta against whichever master slot matches, so it remains valid
+   * even when the master prediction is refreshed by Growatt updates.
+   * Community priority > Growatt is enforced by reapplying this delta
+   * on every master update.
    */
   syncedAtIso: string;
   /** When the resync was applied locally (for display / expiry) */

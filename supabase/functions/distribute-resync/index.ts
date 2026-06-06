@@ -2,12 +2,8 @@ import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { corsHeaders } from '../_shared/cors.ts';
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
-
 /**
- * If a report has a conflict record AND has received 3+ YES responses,
+ * If a report has an unreviewed conflict AND has received 3+ YES responses,
  * automatically mark the conflict as 'community-confirmed' (low-priority).
  */
 async function autoResolveConflictIfNeeded(
@@ -16,7 +12,6 @@ async function autoResolveConflictIfNeeded(
   reportedState: string,
 ) {
   try {
-    // Check if a conflict exists for this report that hasn't been reviewed
     const { data: conflicts } = await admin
       .from('community_conflicts')
       .select('id, reviewed_at')
@@ -24,43 +19,47 @@ async function autoResolveConflictIfNeeded(
       .is('reviewed_at', null)
       .limit(1);
 
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
+    if (!conflicts || conflicts.length === 0) return;
 
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
     const { count: yesCount } = await admin
       .from('resync_responses')
       .select('*', { count: 'exact', head: true })
       .eq('report_id', reportId)
       .eq('response', 'yes');
 
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
+    if ((yesCount ?? 0) < 3) return;
 
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
+    const note =
+      `Auto-resolved: ${yesCount} community YES confirmations received for ` +
+      `${reportedState} report. Community consensus overrides sensor reading.`;
 
     await admin
       .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
+      .update({ reviewed_at: new Date().toISOString(), notes: note })
+      .eq('id', conflicts[0].id);
 
     console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
+      `[auto-resolve] Conflict #${conflicts[0].id} for report ${reportId} ` +
+      `auto-confirmed with ${yesCount} YES responses.`,
     );
   } catch (err) {
     console.error('[auto-resolve] error:', err);
   }
 }
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
   }
 
   try {
-    const { reportId, reporterId, reportedState, estimatedTransitionAt, timeOption } = await req.json();
+    const {
+      reportId,
+      reporterId,
+      reportedState,
+      estimatedTransitionAt,
+      timeOption,
+    } = await req.json();
 
     const supabaseAdmin = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
@@ -87,66 +86,18 @@ async function autoResolveConflictIfNeeded(
     }
 
     const followerIds: string[] = (follows ?? []).map((f: any) => f.requester_id);
+
     if (followerIds.length === 0) {
       console.log('No followers to notify for reporter:', reporterId);
-      return new Response(JSON.stringify({ notified: 0 }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-/**
- * If a report has a conflict record AND has received 3+ YES responses,
- * automatically mark the conflict as 'community-confirmed' (low-priority).
- */
-async function autoResolveConflictIfNeeded(
-  admin: ReturnType<typeof createClient>,
-  reportId: number,
-  reportedState: string,
-) {
-  try {
-    // Check if a conflict exists for this report that hasn't been reviewed
-    const { data: conflicts } = await admin
-      .from('community_conflicts')
-      .select('id, reviewed_at')
-      .eq('report_id', reportId)
-      .is('reviewed_at', null)
-      .limit(1);
-
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
-
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
-    const { count: yesCount } = await admin
-      .from('resync_responses')
-      .select('*', { count: 'exact', head: true })
-      .eq('report_id', reportId)
-      .eq('response', 'yes');
-
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
-
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
-
-    await admin
-      .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
-
-    console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
-    );
-  } catch (err) {
-    console.error('[auto-resolve] error:', err);
-  }
-}
+      return new Response(
+        JSON.stringify({ notified: 0 }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
     }
 
     // 3. Create resync_notifications (expires in 30 min)
     const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-    const notifRows = followerIds.map(recipientId => ({
+    const notifRows = followerIds.map((recipientId) => ({
       report_id: reportId,
       reporter_id: reporterId,
       recipient_id: recipientId,
@@ -160,62 +111,10 @@ async function autoResolveConflictIfNeeded(
 
     if (notifError) {
       console.error('notif insert error:', notifError.message);
-      return new Response(JSON.stringify({ error: notifError.message }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-
-/**
- * If a report has a conflict record AND has received 3+ YES responses,
- * automatically mark the conflict as 'community-confirmed' (low-priority).
- */
-async function autoResolveConflictIfNeeded(
-  admin: ReturnType<typeof createClient>,
-  reportId: number,
-  reportedState: string,
-) {
-  try {
-    // Check if a conflict exists for this report that hasn't been reviewed
-    const { data: conflicts } = await admin
-      .from('community_conflicts')
-      .select('id, reviewed_at')
-      .eq('report_id', reportId)
-      .is('reviewed_at', null)
-      .limit(1);
-
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
-
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
-    const { count: yesCount } = await admin
-      .from('resync_responses')
-      .select('*', { count: 'exact', head: true })
-      .eq('report_id', reportId)
-      .eq('response', 'yes');
-
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
-
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
-
-    await admin
-      .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
-
-    console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
-    );
-  } catch (err) {
-    console.error('[auto-resolve] error:', err);
-  }
-}
+      return new Response(
+        JSON.stringify({ error: notifError.message }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      );
     }
 
     // 4. Check current Growatt state for conflict detection
@@ -228,64 +127,11 @@ async function autoResolveConflictIfNeeded(
     if (currentState && !currentState.inverter_offline) {
       const growattState = currentState.utility_on ? 'UTILITY_ON' : 'UTILITY_OFF';
       if (growattState !== reportedState) {
-        // Conflict: community report disagrees with Growatt
         await supabaseAdmin.from('community_conflicts').insert({
           report_id: reportId,
           growatt_state: growattState,
           reported_state: reportedState,
         });
-
-/**
- * If a report has a conflict record AND has received 3+ YES responses,
- * automatically mark the conflict as 'community-confirmed' (low-priority).
- */
-async function autoResolveConflictIfNeeded(
-  admin: ReturnType<typeof createClient>,
-  reportId: number,
-  reportedState: string,
-) {
-  try {
-    // Check if a conflict exists for this report that hasn't been reviewed
-    const { data: conflicts } = await admin
-      .from('community_conflicts')
-      .select('id, reviewed_at')
-      .eq('report_id', reportId)
-      .is('reviewed_at', null)
-      .limit(1);
-
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
-
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
-    const { count: yesCount } = await admin
-      .from('resync_responses')
-      .select('*', { count: 'exact', head: true })
-      .eq('report_id', reportId)
-      .eq('response', 'yes');
-
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
-
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
-
-    await admin
-      .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
-
-    console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
-    );
-  } catch (err) {
-    console.error('[auto-resolve] error:', err);
-  }
-}
         console.log(`Conflict recorded: Growatt=${growattState}, Reported=${reportedState}`);
       }
     }
@@ -310,7 +156,9 @@ async function autoResolveConflictIfNeeded(
     const pushMessages = (tokens ?? []).map((t: any) => ({
       to: t.token,
       title: `${stateEmoji} Grid Update from ${reporterName}`,
-      body: `${reporterName} reports electricity ${stateLabel} (${timeLabel[timeOption] ?? timeOption}). Is this correct for your location?`,
+      body:
+        `${reporterName} reports electricity ${stateLabel} ` +
+        `(${timeLabel[timeOption] ?? timeOption}). Is this correct for your location?`,
       data: { type: 'community_resync', reportId },
       priority: 'high',
       sound: 'default',
@@ -323,58 +171,6 @@ async function autoResolveConflictIfNeeded(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(pushMessages),
       });
-
-/**
- * If a report has a conflict record AND has received 3+ YES responses,
- * automatically mark the conflict as 'community-confirmed' (low-priority).
- */
-async function autoResolveConflictIfNeeded(
-  admin: ReturnType<typeof createClient>,
-  reportId: number,
-  reportedState: string,
-) {
-  try {
-    // Check if a conflict exists for this report that hasn't been reviewed
-    const { data: conflicts } = await admin
-      .from('community_conflicts')
-      .select('id, reviewed_at')
-      .eq('report_id', reportId)
-      .is('reviewed_at', null)
-      .limit(1);
-
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
-
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
-    const { count: yesCount } = await admin
-      .from('resync_responses')
-      .select('*', { count: 'exact', head: true })
-      .eq('report_id', reportId)
-      .eq('response', 'yes');
-
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
-
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
-
-    await admin
-      .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
-
-    console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
-    );
-  } catch (err) {
-    console.error('[auto-resolve] error:', err);
-  }
-}
     }
 
     // 6. Update reporter's reliability: increment total_reports
@@ -383,70 +179,24 @@ async function autoResolveConflictIfNeeded(
       .select('total_reports')
       .eq('user_id', reporterId)
       .single();
+
     await supabaseAdmin
       .from('user_reliability')
-      .upsert({
-        user_id: reporterId,
-        total_reports: (relRow?.total_reports ?? 0) + 1,
-        last_report_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_id' });
-
-/**
- * If a report has a conflict record AND has received 3+ YES responses,
- * automatically mark the conflict as 'community-confirmed' (low-priority).
- */
-async function autoResolveConflictIfNeeded(
-  admin: ReturnType<typeof createClient>,
-  reportId: number,
-  reportedState: string,
-) {
-  try {
-    // Check if a conflict exists for this report that hasn't been reviewed
-    const { data: conflicts } = await admin
-      .from('community_conflicts')
-      .select('id, reviewed_at')
-      .eq('report_id', reportId)
-      .is('reviewed_at', null)
-      .limit(1);
-
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
-
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
-    const { count: yesCount } = await admin
-      .from('resync_responses')
-      .select('*', { count: 'exact', head: true })
-      .eq('report_id', reportId)
-      .eq('response', 'yes');
-
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
-
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
-
-    await admin
-      .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
+      .upsert(
+        {
+          user_id: reporterId,
+          total_reports: (relRow?.total_reports ?? 0) + 1,
+          last_report_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' },
+      );
 
     console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
+      `Distributed ${followerIds.length} resync notifications for report ${reportId}`,
     );
-  } catch (err) {
-    console.error('[auto-resolve] error:', err);
-  }
-}
 
-    console.log(`Distributed ${followerIds.length} resync notifications for report ${reportId}`);
-
-    // 7. Check if 3+ YES responses exist for a conflict — auto-mark as community-confirmed
+    // 7. Auto-resolve conflict if 3+ YES responses already exist
     await autoResolveConflictIfNeeded(supabaseAdmin, reportId, reportedState);
 
     return new Response(
@@ -461,55 +211,3 @@ async function autoResolveConflictIfNeeded(
     );
   }
 });
-
-/**
- * If a report has a conflict record AND has received 3+ YES responses,
- * automatically mark the conflict as 'community-confirmed' (low-priority).
- */
-async function autoResolveConflictIfNeeded(
-  admin: ReturnType<typeof createClient>,
-  reportId: number,
-  reportedState: string,
-) {
-  try {
-    // Check if a conflict exists for this report that hasn't been reviewed
-    const { data: conflicts } = await admin
-      .from('community_conflicts')
-      .select('id, reviewed_at')
-      .eq('report_id', reportId)
-      .is('reviewed_at', null)
-      .limit(1);
-
-    if (!conflicts || conflicts.length === 0) return; // no unreviewed conflict
-
-    const conflict = conflicts[0];
-
-    // Count YES responses for this report
-    const { count: yesCount } = await admin
-      .from('resync_responses')
-      .select('*', { count: 'exact', head: true })
-      .eq('report_id', reportId)
-      .eq('response', 'yes');
-
-    if ((yesCount ?? 0) < 3) return; // not enough confirmations yet
-
-    // Auto-mark as community-confirmed
-    const note = `Auto-resolved: ${yesCount} community YES confirmations received for ${reportedState} report. ` +
-      `Community consensus overrides sensor reading. Low-priority review.`;
-
-    await admin
-      .from('community_conflicts')
-      .update({
-        reviewed_at: new Date().toISOString(),
-        notes: note,
-      })
-      .eq('id', conflict.id);
-
-    console.log(
-      `[auto-resolve] Conflict #${conflict.id} for report ${reportId} auto-confirmed ` +
-      `with ${yesCount} YES responses.`,
-    );
-  } catch (err) {
-    console.error('[auto-resolve] error:', err);
-  }
-}

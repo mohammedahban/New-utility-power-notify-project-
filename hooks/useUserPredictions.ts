@@ -1,25 +1,47 @@
 /**
- * useUserPredictions
+ * useUserPredictions — Layered Scheduling Engine
  *
- * Applies the user's personal offset AND an optional community resync point
- * to the master prediction to produce a personalised schedule view.
+ * Implements the formula:
+ *   Effective User Timeline
+ *     = Master Pattern (from utility_predictions)
+ *     + User Offset
+ *     + Growatt Expansion/Shortening Adjustments  (auto-applied via master update)
+ *     + Community Sync Adjustments
  *
- * When a resync point is active:
- *   - The "current state" shown on the home screen is the resynced state.
- *   - The "next transition" countdown is recalculated from the resynced
- *     state start time + expected duration for that state, using the
- *     existing prediction's duration ranges — NOT a new schedule.
- *   - The day-schedule slots are adjusted so the current slot's start
- *     time reflects the resync point.
+ * ── KEY DESIGN RULES ───────────────────────────────────────────────────────
  *
- * Nothing about Growatt data, the master prediction, offsets, or other
- * users is ever modified.
+ * 1. MASTER PATTERN IS THE ONLY SOURCE OF CYCLE DURATIONS
+ *    The user schedule inherits every ON/OFF duration exactly from the master.
+ *    No independent pattern generation is allowed.
+ *
+ * 2. GROWATT CORRECTIONS FLOW AUTOMATICALLY
+ *    When analyze-patterns updates utility_predictions, the Realtime channel
+ *    fires, rawPrediction updates, and the entire effective timeline is rebuilt
+ *    from scratch. Positive-offset users get extended cycles; negative-offset
+ *    users get corrections applied to future cycles.
+ *
+ * 3. COMMUNITY SYNC IS A TIMELINE SHIFT, NOT A TERMINAL STATE
+ *    A resync point sets a "delta" — the difference between where the master
+ *    says the current cycle started and where it actually started.
+ *    That delta shifts the current AND ALL FUTURE cycles uniformly.
+ *    The schedule never ends after a community sync.
+ *
+ * 4. PRIORITY ORDER: Community > Growatt > Master
+ *    Community-adjusted cycles are never overwritten by Growatt corrections
+ *    because the delta is reapplied on top of every master update.
+ *
+ * 5. EXTENDED FUTURE SCHEDULE
+ *    The master daySchedule may cover only 24h. We extend it to 48h by
+ *    repeating the master's ON/OFF cycle durations so future slots are
+ *    always visible.
  */
 
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { Prediction, ScheduleSlot } from './usePredictions';
 import { ResyncPoint } from '../contexts/ResyncContext';
+
+// ── Public types ──────────────────────────────────────────────────────────────
 
 export interface ShiftedTransition {
   type: 'UTILITY_ON' | 'UTILITY_OFF';
@@ -32,7 +54,7 @@ export interface ShiftedTransition {
 export interface ShiftedScheduleSlot extends ScheduleSlot {
   shiftedStartFormatted: string;
   shiftedEndFormatted: string | null;
-  /** True when this slot is the currently-active resynced slot */
+  /** True when this slot has been moved by a community sync */
   isResynced?: boolean;
 }
 
@@ -45,7 +67,6 @@ export interface UserPrediction {
   isUnstable: boolean;
   stabilityScore: number;
   stabilityLabel: string;
-  /** Current utility state (may be overridden by resync point) */
   currentState: 'ON' | 'OFF';
   currentStateDurationLabel: string;
   daySchedule: ShiftedScheduleSlot[];
@@ -55,16 +76,14 @@ export interface UserPrediction {
   offsetMinutes: number;
   crisisMode: boolean;
   crisisReason: string | null;
-  /** True when a community resync is actively shaping this prediction */
   isResynced: boolean;
-  /** ISO timestamp when the resynced state started (for display) */
   resyncedAtIso: string | null;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
-function shiftIsoByMinutes(iso: string, offsetMin: number): string {
-  return new Date(new Date(iso).getTime() + offsetMin * 60000).toISOString();
+function shiftMs(iso: string, deltaMs: number): string {
+  return new Date(new Date(iso).getTime() + deltaMs).toISOString();
 }
 
 function fmtYemenTime(iso: string): string {
@@ -79,48 +98,297 @@ function fmtYemenTime(iso: string): string {
 function fmtWait(min: number): string {
   if (min <= 0) return 'soon';
   const h = Math.floor(min / 60);
-  const m = Math.floor(min % 60);
+  const m = Math.round(min % 60);
   if (h === 0) return `~${m}m`;
   if (m === 0) return `~${h}h`;
   return `~${h}h ${m}m`;
 }
 
-function minutesFromNow(iso: string): number {
-  return (new Date(iso).getTime() - Date.now()) / 60000;
+function durationLabelFromMin(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
 }
 
-// ── Core offset-only transform (no resync) ────────────────────────────────────
+// ── Step 1: Extend master schedule to 48 h ────────────────────────────────────
+/**
+ * The master daySchedule typically covers 24 h.
+ * We extend it by repeating the observed ON/OFF durations so the user
+ * always sees several future cycles — no independent pattern generation.
+ * All durations come exclusively from the master prediction.
+ */
+function extendScheduleTo48h(
+  masterSlots: ScheduleSlot[],
+  prediction: Prediction,
+): ScheduleSlot[] {
+  if (masterSlots.length === 0) return [];
+
+  // Use master expected durations for extension
+  const extOffMin =
+    prediction.allPattern?.avgOffMin ??
+    prediction.dayPattern?.avgOffMin ??
+    prediction.nightPattern?.avgOffMin ??
+    prediction.expectedOffRange?.minMin ??
+    360;
+  const extOnMin =
+    prediction.allPattern?.avgOnMin ??
+    prediction.dayPattern?.avgOnMin ??
+    prediction.nightPattern?.avgOnMin ??
+    prediction.expectedOnRange?.minMin ??
+    120;
+
+  const horizonMs = Date.now() + 48 * 60 * 60 * 1000;
+  const slots: ScheduleSlot[] = [...masterSlots];
+
+  // Safety: cap at 40 slots to avoid infinite loop
+  while (slots.length < 40) {
+    const last = slots[slots.length - 1];
+    if (!last.endIso) break; // open-ended slot — can't extend safely
+
+    const lastEndMs = new Date(last.endIso).getTime();
+    if (lastEndMs >= horizonMs) break;
+
+    const nextState: 'ON' | 'OFF' = last.state === 'ON' ? 'OFF' : 'ON';
+    const durationMin = nextState === 'OFF' ? extOffMin : extOnMin;
+    const nextStartIso = last.endIso;
+    const nextEndMs = lastEndMs + durationMin * 60_000;
+    const nextEndIso = new Date(nextEndMs).toISOString();
+
+    slots.push({
+      state: nextState,
+      startIso: nextStartIso,
+      endIso: nextEndIso,
+      startFormatted: fmtYemenTime(nextStartIso),
+      endFormatted: fmtYemenTime(nextEndIso),
+      durationLabel: durationLabelFromMin(durationMin),
+      zone: 'extended',
+      isEstimated: true,
+    });
+  }
+
+  return slots;
+}
+
+// ── Step 2: Apply user offset to all slots ────────────────────────────────────
+function applyOffsetToSlots(
+  slots: ScheduleSlot[],
+  offsetMs: number,
+): ShiftedScheduleSlot[] {
+  return slots.map((slot) => {
+    const startIso = shiftMs(slot.startIso, offsetMs);
+    const endIso = slot.endIso ? shiftMs(slot.endIso, offsetMs) : null;
+    return {
+      ...slot,
+      // Keep original ISO references so community delta can be applied on top
+      startIso,
+      endIso,
+      startFormatted: fmtYemenTime(startIso),
+      endFormatted: endIso ? fmtYemenTime(endIso) : null,
+      shiftedStartFormatted: fmtYemenTime(startIso),
+      shiftedEndFormatted: endIso ? fmtYemenTime(endIso) : null,
+      isResynced: false,
+    };
+  });
+}
+
+// ── Step 3: Apply community sync delta ────────────────────────────────────────
+/**
+ * Community sync logic:
+ *
+ * 1. Find the slot in the offset-adjusted schedule whose state matches
+ *    resync.syncedState and whose time window contains resync.syncedAtIso.
+ *    (If the resync point is slightly before the slot's predicted start —
+ *    e.g. grid came ON earlier than predicted — we still match the first
+ *    slot with the correct state near that time.)
+ *
+ * 2. Compute delta = resync.syncedAtIso - slot.startIso
+ *    (can be negative if the real transition was earlier than predicted)
+ *
+ * 3. Apply delta to the matched slot AND every subsequent slot uniformly.
+ *    Slots before the matched slot are untouched.
+ *
+ * 4. Mark the matched slot as isResynced = true for visual decoration.
+ *
+ * This ensures:
+ * - The schedule never ends after a resync (Issue #3).
+ * - All future cycles shift together, preserving master durations (Issue #1).
+ * - Community priority > Growatt because the delta is reapplied on every
+ *   master update (Issue #2 priority rule).
+ */
+function applyCommunityDelta(
+  offsetSlots: ShiftedScheduleSlot[],
+  resync: ResyncPoint,
+): ShiftedScheduleSlot[] {
+  const syncMs = new Date(resync.syncedAtIso).getTime();
+  const syncState = resync.syncedState;
+  const LOOKAHEAD_MS = 90 * 60_000; // look 90 min ahead/behind for the slot
+
+  // Find the best matching slot index
+  let matchIdx = -1;
+
+  // First pass: find slot that actually contains the sync time
+  for (let i = 0; i < offsetSlots.length; i++) {
+    const s = offsetSlots[i];
+    if (s.state !== syncState) continue;
+    const sMs = new Date(s.startIso).getTime();
+    const eMs = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    if (syncMs >= sMs - LOOKAHEAD_MS && syncMs < eMs + LOOKAHEAD_MS) {
+      matchIdx = i;
+      break;
+    }
+  }
+
+  // Second pass: if not found, use the first future slot with the right state
+  if (matchIdx === -1) {
+    const nowMs = Date.now();
+    for (let i = 0; i < offsetSlots.length; i++) {
+      if (offsetSlots[i].state !== syncState) continue;
+      const sMs = new Date(offsetSlots[i].startIso).getTime();
+      if (sMs >= nowMs - LOOKAHEAD_MS) {
+        matchIdx = i;
+        break;
+      }
+    }
+  }
+
+  // No match — return unchanged (community sync can't be applied safely)
+  if (matchIdx === -1) return offsetSlots;
+
+  const matchedSlotStartMs = new Date(offsetSlots[matchIdx].startIso).getTime();
+  const deltaMs = syncMs - matchedSlotStartMs;
+
+  return offsetSlots.map((slot, idx) => {
+    if (idx < matchIdx) return slot; // earlier slots unchanged
+
+    const newStartIso = shiftMs(slot.startIso, deltaMs);
+    const newEndIso = slot.endIso ? shiftMs(slot.endIso, deltaMs) : null;
+    return {
+      ...slot,
+      startIso: newStartIso,
+      endIso: newEndIso,
+      startFormatted: fmtYemenTime(newStartIso),
+      endFormatted: newEndIso ? fmtYemenTime(newEndIso) : null,
+      shiftedStartFormatted: fmtYemenTime(newStartIso),
+      shiftedEndFormatted: newEndIso ? fmtYemenTime(newEndIso) : null,
+      isResynced: idx === matchIdx,
+    };
+  });
+}
+
+// ── Step 4: Determine next transition from effective schedule ─────────────────
+function deriveNextTransition(
+  effectiveSlots: ShiftedScheduleSlot[],
+  currentState: 'ON' | 'OFF',
+  prediction: Prediction,
+  offsetMinutes: number,
+): ShiftedTransition | null {
+  const nowMs = Date.now();
+  const oppositeState: 'ON' | 'OFF' = currentState === 'ON' ? 'OFF' : 'ON';
+
+  for (const slot of effectiveSlots) {
+    if (slot.state !== oppositeState) continue;
+    const slotMs = new Date(slot.startIso).getTime();
+    if (slotMs <= nowMs) continue; // already past
+
+    const minFromNow = (slotMs - nowMs) / 60_000;
+
+    // Spread: half of the original prediction uncertainty, minimum 10 min
+    let halfSpread = 15;
+    if (prediction.nextTransition) {
+      halfSpread = Math.max(
+        10,
+        (prediction.nextTransition.maxFromNowMin - prediction.nextTransition.minFromNowMin) / 2,
+      );
+    }
+
+    const minMin = Math.max(0, minFromNow - halfSpread);
+    const maxMin = Math.max(0, minFromNow + halfSpread);
+
+    const earliestIso = shiftMs(slot.startIso, -halfSpread * 60_000);
+    const latestIso = shiftMs(slot.startIso, halfSpread * 60_000);
+
+    return {
+      type: oppositeState === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
+      rangeLabel: `${fmtYemenTime(earliestIso)} → ${fmtYemenTime(latestIso)}`,
+      minFromNowMin: minMin,
+      maxFromNowMin: maxMin,
+      waitLabel: `${fmtWait(minMin)} → ${fmtWait(maxMin)}`,
+    };
+  }
+
+  return null;
+}
+
+// ── Step 5: Determine current state from effective schedule ───────────────────
+function deriveCurrentState(
+  effectiveSlots: ShiftedScheduleSlot[],
+  masterCurrentState: 'ON' | 'OFF',
+  resyncPoint: ResyncPoint | null,
+): { state: 'ON' | 'OFF'; label: string } {
+  // If there's an active resync, the current state IS the resynced state
+  if (resyncPoint) {
+    const syncedAtMs = new Date(resyncPoint.syncedAtIso).getTime();
+    const elapsedMin = (Date.now() - syncedAtMs) / 60_000;
+    const elapsedLabel =
+      elapsedMin < 60
+        ? `${Math.round(elapsedMin)}m`
+        : `${Math.floor(elapsedMin / 60)}h ${Math.round(elapsedMin % 60)}m`;
+    return {
+      state: resyncPoint.syncedState,
+      label: `${elapsedLabel} (community synced)`,
+    };
+  }
+
+  // Otherwise derive from the effective schedule
+  const nowMs = Date.now();
+  for (let i = effectiveSlots.length - 1; i >= 0; i--) {
+    const slot = effectiveSlots[i];
+    const startMs = new Date(slot.startIso).getTime();
+    if (startMs <= nowMs) {
+      const elapsedMin = (nowMs - startMs) / 60_000;
+      const label =
+        elapsedMin < 60
+          ? `${Math.round(elapsedMin)}m`
+          : `${Math.floor(elapsedMin / 60)}h ${Math.round(elapsedMin % 60)}m`;
+      return { state: slot.state, label };
+    }
+  }
+
+  // Fallback to master prediction
+  return { state: masterCurrentState, label: '' };
+}
+
+// ── Full pipeline ─────────────────────────────────────────────────────────────
 
 export function applyOffsetToPrediction(
   prediction: Prediction,
   offsetMinutes: number,
+  resyncPoint?: ResyncPoint | null,
 ): UserPrediction {
-  let nextTransition: ShiftedTransition | null = null;
-  if (prediction.nextTransition && !prediction.isUnstable) {
-    const nt = prediction.nextTransition;
-    const shiftedEarliest = shiftIsoByMinutes(nt.earliestTime, offsetMinutes);
-    const shiftedLatest = shiftIsoByMinutes(nt.latestTime, offsetMinutes);
-    const shiftedRangeLabel = `${fmtYemenTime(shiftedEarliest)} → ${fmtYemenTime(shiftedLatest)}`;
-    const shiftedMin = nt.minFromNowMin + offsetMinutes;
-    const shiftedMax = nt.maxFromNowMin + offsetMinutes;
-    nextTransition = {
-      type: nt.type,
-      rangeLabel: shiftedRangeLabel,
-      minFromNowMin: Math.max(0, shiftedMin),
-      maxFromNowMin: Math.max(0, shiftedMax),
-      waitLabel: `${fmtWait(shiftedMin)} → ${fmtWait(shiftedMax)}`,
-    };
+  const offsetMs = offsetMinutes * 60_000;
+
+  // Step 1: Extend master schedule to 48h
+  const extended = extendScheduleTo48h(prediction.daySchedule ?? [], prediction);
+
+  // Step 2: Shift all slots by user offset
+  let effectiveSlots = applyOffsetToSlots(extended, offsetMs);
+
+  // Step 3: Apply community sync delta (if active)
+  const hasResync = !!resyncPoint;
+  if (resyncPoint) {
+    effectiveSlots = applyCommunityDelta(effectiveSlots, resyncPoint);
   }
 
-  const daySchedule: ShiftedScheduleSlot[] = (prediction.daySchedule ?? []).map((slot) => {
-    const shiftedStart = shiftIsoByMinutes(slot.startIso, offsetMinutes);
-    const shiftedEnd = slot.endIso ? shiftIsoByMinutes(slot.endIso, offsetMinutes) : null;
-    return {
-      ...slot,
-      shiftedStartFormatted: fmtYemenTime(shiftedStart),
-      shiftedEndFormatted: shiftedEnd ? fmtYemenTime(shiftedEnd) : null,
-    };
-  });
+  // Step 4: Derive current state
+  const { state: currentState, label: currentStateDurationLabel } =
+    deriveCurrentState(effectiveSlots, prediction.currentState, resyncPoint ?? null);
+
+  // Step 5: Derive next transition from effective schedule
+  const nextTransition = prediction.isUnstable
+    ? null
+    : deriveNextTransition(effectiveSlots, currentState, prediction, offsetMinutes);
 
   return {
     nextTransition,
@@ -131,150 +399,49 @@ export function applyOffsetToPrediction(
     isUnstable: prediction.isUnstable,
     stabilityScore: prediction.stabilityScore,
     stabilityLabel: prediction.stabilityLabel,
-    currentState: prediction.currentState,
-    currentStateDurationLabel: prediction.currentStateDurationLabel,
-    daySchedule,
+    currentState,
+    currentStateDurationLabel,
+    daySchedule: effectiveSlots,
     reasoning: prediction.reasoning,
     learningMode: prediction.learningMode ?? 'prior_only',
     computedAt: prediction.computedAt ?? null,
     offsetMinutes,
     crisisMode: prediction.apppe?.crisisMode ?? false,
     crisisReason: prediction.apppe?.crisisReason ?? null,
-    isResynced: false,
-    resyncedAtIso: null,
+    isResynced: hasResync,
+    resyncedAtIso: resyncPoint?.syncedAtIso ?? null,
   };
 }
 
-// ── Resync overlay transform ──────────────────────────────────────────────────
-/**
- * Applies a community resync point on top of the offset-adjusted prediction.
- *
- * Logic:
- * 1. The resynced state is now the "current state".
- * 2. Find the next slot in the day schedule whose state is OPPOSITE to
- *    the resynced state — that is the next transition target.
- * 3. Build a countdown to that slot's (offset-adjusted) start time.
- * 4. Mark the current slot as "resynced" for visual distinction.
- */
-function applyResyncToPrediction(
-  base: UserPrediction,
-  resync: ResyncPoint,
-  offsetMinutes: number,
-  prediction: Prediction,
-): UserPrediction {
-  const resyncState = resync.syncedState; // 'ON' | 'OFF'
-  const resyncAtMs = new Date(resync.syncedAtIso).getTime();
-  const nowMs = Date.now();
-  const elapsedMin = (nowMs - resyncAtMs) / 60000;
-
-  // Mark day-schedule: find which slot contains the resync point and mark it
-  const daySchedule = base.daySchedule.map((slot) => {
-    const slotStartMs = new Date(
-      shiftIsoByMinutes(slot.startIso, offsetMinutes),
-    ).getTime();
-    const slotEndMs = slot.endIso
-      ? new Date(shiftIsoByMinutes(slot.endIso, offsetMinutes)).getTime()
-      : Infinity;
-
-    const containsResync =
-      resyncAtMs >= slotStartMs && resyncAtMs < slotEndMs && slot.state === resyncState;
-
-    return { ...slot, isResynced: containsResync };
-  });
-
-  // Find the next slot whose state differs from resynced state
-  // Search from the resync point forward in the schedule
-  let nextTransition: ShiftedTransition | null = null;
-  const oppositeState = resyncState === 'ON' ? 'OFF' : 'ON';
-
-  for (const slot of daySchedule) {
-    if (slot.state !== oppositeState) continue;
-    const slotStartMs = new Date(
-      shiftIsoByMinutes(slot.startIso, offsetMinutes),
-    ).getTime();
-    // Must be after the resync point
-    if (slotStartMs <= resyncAtMs) continue;
-
-    const minFromNow = (slotStartMs - nowMs) / 60000;
-    // Build a narrow range using the slot's expected start ± half the
-    // original uncertainty range from the master prediction
-    let halfSpreadMin = 15; // default fallback
-    if (base.nextTransition) {
-      halfSpreadMin = Math.max(
-        5,
-        (base.nextTransition.maxFromNowMin - base.nextTransition.minFromNowMin) / 2,
-      );
-    }
-
-    const minMin = Math.max(0, minFromNow - halfSpreadMin);
-    const maxMin = Math.max(0, minFromNow + halfSpreadMin);
-
-    const shiftedSlotStart = shiftIsoByMinutes(slot.startIso, offsetMinutes);
-    const shiftedEarliest = shiftIsoByMinutes(
-      slot.startIso,
-      offsetMinutes - halfSpreadMin,
-    );
-    const shiftedLatest = shiftIsoByMinutes(
-      slot.startIso,
-      offsetMinutes + halfSpreadMin,
-    );
-
-    nextTransition = {
-      type: oppositeState === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
-      rangeLabel: `${fmtYemenTime(shiftedEarliest)} → ${fmtYemenTime(shiftedLatest)}`,
-      minFromNowMin: minMin,
-      maxFromNowMin: maxMin,
-      waitLabel: `${fmtWait(minMin)} → ${fmtWait(maxMin)}`,
-    };
-    break;
-  }
-
-  // Fallback: use the base next transition if no schedule slot found
-  if (!nextTransition) {
-    nextTransition = base.nextTransition;
-  }
-
-  // Duration label for resynced state
-  const elapsedLabel =
-    elapsedMin < 60
-      ? `${Math.round(elapsedMin)}m`
-      : `${Math.floor(elapsedMin / 60)}h ${Math.round(elapsedMin % 60)}m`;
-
-  return {
-    ...base,
-    currentState: resyncState,
-    currentStateDurationLabel: `${elapsedLabel} (community synced)`,
-    nextTransition,
-    daySchedule,
-    isResynced: true,
-    resyncedAtIso: resync.syncedAtIso,
-  };
-}
-
-// ── Hook ─────────────────────────────────────────────────────────────────────
+// ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useUserPredictions(
   offsetMinutes: number,
   resyncPoint?: ResyncPoint | null,
 ) {
   const [rawPrediction, setRawPrediction] = useState<Prediction | null>(null);
-  const [computedAt, setComputedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
+
     supabase
       .from('utility_predictions')
       .select('*')
       .eq('id', 1)
       .maybeSingle()
       .then(({ data, error }) => {
+        if (cancelled) return;
         if (error) console.error('[useUserPredictions] fetch error:', error.message);
-        if (data) {
-          setRawPrediction(data.prediction as Prediction);
-          setComputedAt(data.computed_at);
-        }
+        if (data?.prediction) setRawPrediction(data.prediction as Prediction);
         setLoading(false);
       });
+
+    // Timeout fallback — don't hang forever
+    const timeout = setTimeout(() => {
+      if (cancelled) return;
+      setLoading(false);
+    }, 8000);
 
     const channel = supabase
       .channel(`user_predictions_live_${Math.random().toString(36).slice(2)}`)
@@ -284,30 +451,20 @@ export function useUserPredictions(
         table: 'utility_predictions',
       }, (payload) => {
         const row = payload.new as any;
-        if (row?.prediction) {
-          setRawPrediction(row.prediction as Prediction);
-          setComputedAt(row.computed_at);
-        }
+        if (row?.prediction) setRawPrediction(row.prediction as Prediction);
       })
       .subscribe();
 
-    return () => { supabase.removeChannel(channel); };
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+      supabase.removeChannel(channel);
+    };
   }, []);
 
-  let userPrediction: UserPrediction | null = null;
-  if (rawPrediction) {
-    const base = applyOffsetToPrediction(rawPrediction, offsetMinutes);
-    if (resyncPoint) {
-      userPrediction = applyResyncToPrediction(
-        base,
-        resyncPoint,
-        offsetMinutes,
-        rawPrediction,
-      );
-    } else {
-      userPrediction = base;
-    }
-  }
+  const userPrediction: UserPrediction | null = rawPrediction
+    ? applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint)
+    : null;
 
   return { userPrediction, rawPrediction, loading };
 }
