@@ -111,20 +111,20 @@ function getZoneFromIso(iso: string): string {
 }
 
 function fmtWait(min: number): string {
-  if (min <= 0) return 'soon';
+  if (min <= 0) return 'قريباً';
   const h = Math.floor(min / 60);
   const m = Math.round(min % 60);
-  if (h === 0) return `~${m}m`;
-  if (m === 0) return `~${h}h`;
-  return `~${h}h ${m}m`;
+  if (h === 0) return `~${m}د`;
+  if (m === 0) return `~${h}س`;
+  return `~${h}س ${m}د`;
 }
 
 function durationLabelFromMin(min: number): string {
   const h = Math.floor(min / 60);
   const m = Math.round(min % 60);
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
+  if (h === 0) return `${m}د`;
+  if (m === 0) return h === 1 ? 'ساعة' : `${h}س`;
+  return `${h}س ${m}د`;
 }
 
 // ── Step 1: Extend master schedule to 48 h ────────────────────────────────────
@@ -368,13 +368,16 @@ function deriveCurrentState(
   if (resyncPoint) {
     const syncedAtMs = new Date(resyncPoint.syncedAtIso).getTime();
     const elapsedMin = (Date.now() - syncedAtMs) / 60_000;
+    const elapsedMin2 = Math.round(elapsedMin);
+    const elapsedH = Math.floor(elapsedMin2 / 60);
+    const elapsedM = elapsedMin2 % 60;
     const elapsedLabel =
-      elapsedMin < 60
-        ? `${Math.round(elapsedMin)}m`
-        : `${Math.floor(elapsedMin / 60)}h ${Math.round(elapsedMin % 60)}m`;
+      elapsedH === 0 ? `${elapsedMin2}د`
+      : elapsedM === 0 ? `${elapsedH}س`
+      : `${elapsedH}س ${elapsedM}د`;
     return {
       state: resyncPoint.syncedState,
-      label: `${elapsedLabel} (community synced)`,
+      label: `${elapsedLabel} (مزامنة مجتمعية)`,
     };
   }
 
@@ -385,10 +388,11 @@ function deriveCurrentState(
     const startMs = new Date(slot.startIso).getTime();
     if (startMs <= nowMs) {
       const elapsedMin = (nowMs - startMs) / 60_000;
-      const label =
-        elapsedMin < 60
-          ? `${Math.round(elapsedMin)}m`
-          : `${Math.floor(elapsedMin / 60)}h ${Math.round(elapsedMin % 60)}m`;
+      const eH = Math.floor(elapsedMin / 60);
+      const eM = Math.round(elapsedMin % 60);
+      const label = eH === 0 ? `${Math.round(elapsedMin)}د`
+        : eM === 0 ? `${eH}س`
+        : `${eH}س ${eM}د`;
       return { state: slot.state, label };
     }
   }

@@ -119,12 +119,12 @@ function fmtYemenWithDate(d: Date): string {
 }
 
 function fmtMin(min: number): string {
-  if (min <= 0) return "0m";
+  if (min <= 0) return "0د";
   const h = Math.floor(min / 60);
   const m = Math.round(min % 60);
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
+  if (h === 0) return `${m}د`;
+  if (m === 0) return h === 1 ? "ساعة" : `${h}س`;
+  return `${h}س ${m}د`;
 }
 
 function daysBetween(isoA: string, isoB: string): number {
@@ -523,8 +523,8 @@ function buildNextTransition(
   const waitH = Math.floor(midMin / 60);
   const waitM = Math.round(midMin % 60);
   const waitLabel = waitH > 0
-    ? `~${waitH}h ${waitM > 0 ? waitM + "m" : ""}`.trim()
-    : `~${waitM}m`;
+    ? `~${waitH}س ${waitM > 0 ? waitM + "د" : ""}`.trim()
+    : `~${waitM}د`;
 
   return {
     type,

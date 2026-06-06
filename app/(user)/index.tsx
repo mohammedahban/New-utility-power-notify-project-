@@ -51,8 +51,8 @@ function useElapsedTime(sinceIso: string | null): string {
       const totalMin = Math.floor(diffMs / 60000);
       const h = Math.floor(totalMin / 60);
       const m = totalMin % 60;
-      if (h === 0) setLabel(`${m} د`);
-      else if (m === 0) setLabel(h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h} ساعات`);
+      if (h === 0) setLabel(`${m}د`);
+      else if (m === 0) setLabel(h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h}س`);
       else setLabel(`${h}س ${m}د`);
     };
     update();
