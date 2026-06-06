@@ -1,0 +1,204 @@
+// poll-growatt Edge Function
+// Polls Growatt storage API every 5 minutes.
+// Sends push notifications ONLY to admin tokens (is_admin = true).
+// Auto-triggers analyze-patterns after detecting a state change.
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { corsHeaders } from "../_shared/cors.ts";
+
+const GROWATT_TOKEN = Deno.env.get("GROWATT_TOKEN")!;
+const INVERTER_SN   = Deno.env.get("GROWATT_INVERTER_SN")!;
+const PAC_INPUT_THRESHOLD = 50;
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  // ── 1. Poll Growatt ────────────────────────────────────────────────────────
+  let json: any;
+  try {
+    const apiUrl = `http://openapi.growatt.com/v1/device/storage/storage_last_data?storage_sn=${INVERTER_SN}`;
+    console.log(`[poll-growatt] POST ${apiUrl}`);
+
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers: { token: GROWATT_TOKEN, "Content-Type": "application/x-www-form-urlencoded" },
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (!res.ok) {
+      console.error(`[poll-growatt] HTTP ${res.status}`);
+      return new Response(JSON.stringify({ ok: false, error: `HTTP ${res.status}` }), {
+        status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    json = await res.json();
+    console.log("[poll-growatt] Response:", JSON.stringify(json).slice(0, 400));
+  } catch (err) {
+    console.error("[poll-growatt] Fetch failed:", err);
+    return new Response(JSON.stringify({ ok: false, error: "Growatt fetch failed" }), {
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  if (json.error_code !== 0) {
+    console.error("[poll-growatt] API error:", json.error_code, json.error_msg);
+    return new Response(JSON.stringify({ ok: false, error: json.error_msg }), {
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  const d = json.data;
+
+  // ── 2. Handle inverter offline ─────────────────────────────────────────────
+  if (!d || typeof d !== "object") {
+    console.warn("[poll-growatt] Inverter offline — empty data");
+    await supabase.from("inverter_state").upsert({ id: 1, last_polled: new Date().toISOString(), inverter_offline: true });
+    return new Response(JSON.stringify({ ok: true, note: "inverter_offline" }), {
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  // ── 3. Extract fields ──────────────────────────────────────────────────────
+  const pAcInput: number = parseFloat(String(d.pAcInPut ?? d.pacInPut ?? d.pac_input ?? "0")) || 0;
+  const sysOut: number   = parseFloat(String(d.sysOut ?? d.pac ?? d.outPutPower1 ?? "0")) || 0;
+  const ppvTotal: number = (parseFloat(String(d.ppv ?? "0")) || 0) + (parseFloat(String(d.ppv2 ?? "0")) || 0);
+
+  let statusText = "";
+  if (d.statusText) {
+    statusText = d.statusText;
+  } else if (pAcInput > PAC_INPUT_THRESHOLD) {
+    statusText = "AC charge and Bypass";
+  } else if (ppvTotal > 50) {
+    statusText = "PV charge and Bypass";
+  } else {
+    statusText = "Discharge";
+  }
+
+  const utilityIsOn: boolean = pAcInput > PAC_INPUT_THRESHOLD;
+  const now = new Date().toISOString();
+
+  console.log(`[poll-growatt] pAcInput=${pAcInput}W sysOut=${sysOut}W utilityOn=${utilityIsOn}`);
+
+  // ── 4. Read previous state ─────────────────────────────────────────────────
+  const { data: prevState, error: prevErr } = await supabase
+    .from("inverter_state")
+    .select("*")
+    .eq("id", 1)
+    .maybeSingle();
+
+  if (prevErr) console.error("[poll-growatt] Prev state error:", prevErr.message);
+
+  const previouslyOn: boolean = prevState?.utility_on ?? utilityIsOn;
+  const stateChanged = prevState !== null && !prevState.inverter_offline && utilityIsOn !== previouslyOn;
+
+  // ── 5. Handle state change ─────────────────────────────────────────────────
+  if (stateChanged) {
+    const eventType = utilityIsOn ? "UTILITY_ON" : "UTILITY_OFF";
+    console.log(`[poll-growatt] Transition: ${eventType}`);
+
+    await supabase.from("power_events").insert({
+      event_type: eventType,
+      occurred_at: now,
+      vac: pAcInput,
+      pac_to_user: sysOut,
+      status_text: statusText,
+    });
+
+    // ── Send push ONLY to admin tokens ──────────────────────────────────────
+    const { data: adminTokens } = await supabase
+      .from("push_tokens")
+      .select("token")
+      .eq("is_admin", true);
+
+    if (adminTokens && adminTokens.length > 0) {
+      const localTime = new Date(now).toLocaleString("en-US", {
+        timeZone: "Asia/Aden",
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+
+      const isOn = eventType === "UTILITY_ON";
+
+      const messages = adminTokens.map(({ token }: { token: string }) => ({
+        to: token,
+        title: isOn ? "\u26a1 GRID IS BACK ON" : "\ud83d\udd34 GRID WENT OFF",
+        body: isOn
+          ? `Grid restored at ${localTime} \u2014 Input: ${pAcInput.toFixed(0)}W`
+          : `Grid lost at ${localTime} \u2014 Running on solar/battery`,
+        sound: "default",
+        channelId: "grid-monitor",
+        priority: "high",
+        ttl: 60,
+        data: {
+          eventType,
+          occurred_at: now,
+          pac_input: pAcInput,
+          pac_to_user: sysOut,
+          play_sound: true,
+          is_on: isOn,
+          is_admin_alert: true,
+        },
+      }));
+
+      try {
+        const pushRes = await fetch("https://exp.host/--/api/v2/push/send", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+          },
+          body: JSON.stringify(messages),
+        });
+        const pushJson = await pushRes.json();
+        console.log("[poll-growatt] Push sent to", adminTokens.length, "admin token(s):", JSON.stringify(pushJson).slice(0, 200));
+      } catch (err) {
+        console.error("[poll-growatt] Push failed:", err);
+      }
+    } else {
+      console.log("[poll-growatt] No admin push tokens registered — skipping notification");
+    }
+
+    // ── Auto-trigger analyze-patterns ───────────────────────────────────────
+    console.log("[poll-growatt] Triggering analyze-patterns after state change");
+    try {
+      const analyzeUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/analyze-patterns`;
+      await fetch(analyzeUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+        },
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(30000),
+      });
+      console.log("[poll-growatt] analyze-patterns triggered successfully");
+    } catch (err) {
+      console.error("[poll-growatt] analyze-patterns trigger failed:", err);
+    }
+  }
+
+  // ── 6. Upsert live state ───────────────────────────────────────────────────
+  await supabase.from("inverter_state").upsert({
+    id: 1,
+    vac: pAcInput,
+    pac_to_user: sysOut,
+    status_text: statusText,
+    utility_on: utilityIsOn,
+    last_polled: now,
+    inverter_offline: false,
+  });
+
+  return new Response(
+    JSON.stringify({ ok: true, utilityIsOn, pAcInput, sysOut, ppvTotal, status: statusText, stateChanged }),
+    { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+  );
+});
