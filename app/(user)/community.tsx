@@ -603,7 +603,10 @@ const frStyles = StyleSheet.create({
 });
 
 // ── History Card ──────────────────────────────────────────────────────────────
-function HistoryCard({ entry }: { entry: any }) {
+function HistoryCard({ entry, onReporterPress }: {
+  entry: any;
+  onReporterPress?: (reporterId: string) => void;
+}) {
   const isOn = entry.reported_state === 'UTILITY_ON';
   const color = isOn ? T.success : T.danger;
   const effectiveTime = new Date(entry.effective_transition_at).toLocaleString('ar-SA', {
@@ -623,7 +626,17 @@ function HistoryCard({ entry }: { entry: any }) {
         </View>
         <Text style={hcStyles.time}>الوقت الفعلي: {effectiveTime} (اليمن)</Text>
         <Text style={hcStyles.reporter}>
-          {AR.reportedByLabel}: <Text style={{ color: T.textSecondary }}>{entry.reporter_username ?? 'مجهول'}</Text>
+          {AR.reportedByLabel}:{' '}
+          {entry.reporter_id && onReporterPress ? (
+            <Text
+              style={{ color: T.accent, fontWeight: '700' }}
+              onPress={() => onReporterPress(entry.reporter_id)}
+            >
+              {entry.reporter_username ?? 'مجهول'}
+            </Text>
+          ) : (
+            <Text style={{ color: T.textSecondary }}>{entry.reporter_username ?? 'مجهول'}</Text>
+          )}
           {'  '}· أُكّد في {confirmedTime}
         </Text>
       </View>
@@ -962,7 +975,12 @@ export default function CommunityScreen() {
           ListHeaderComponent={() => (
             <Text style={styles.sectionLabel}>سجل مزامنتك — آخر {history.length} أحداث</Text>
           )}
-          renderItem={({ item }) => <HistoryCard entry={item} />}
+          renderItem={({ item }) => (
+            <HistoryCard
+              entry={item}
+              onReporterPress={item.reporter_id ? (rid) => router.push(`/(user)/reporter/${rid}` as any) : undefined}
+            />
+          )}
           ListEmptyComponent={() => (
             <View style={styles.emptyBox}>
               <Text style={{ fontSize: 48, marginBottom: 14 }}>📋</Text>

@@ -10,7 +10,7 @@
  *     + ATC Decision Layer
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { supabase } from '../lib/supabase';
 import { Prediction, ScheduleSlot } from './usePredictions';
 import { ResyncPoint } from '../contexts/ResyncContext';
@@ -545,6 +545,10 @@ export function useUserPredictions(
   const [rawPrediction, setRawPrediction] = useState<Prediction | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Stable startIso anchor — only reset when the utility state actually flips.
+  // Prevents prediction DB refreshes from resetting the "منذ" elapsed counter.
+  const stableStartRef = useRef<{ state: 'ON' | 'OFF'; startIso: string | null } | null>(null);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -585,7 +589,28 @@ export function useUserPredictions(
   }, []);
 
   const userPrediction: UserPrediction | null = rawPrediction
-    ? applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null)
+    ? (() => {
+        const pred = applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null);
+
+        // ── Stabilize currentStateStartIso ────────────────────────────────────
+        // Only update the anchor when the actual utility state changes (ON↔OFF).
+        // If the state is the same as before, reuse the original startIso so
+        // the "منذ" elapsed timer and schedule slot start time don't jump every
+        // time the DB prediction refreshes.
+        if (
+          stableStartRef.current &&
+          stableStartRef.current.state === pred.currentState
+        ) {
+          pred.currentStateStartIso = stableStartRef.current.startIso;
+        } else {
+          stableStartRef.current = {
+            state: pred.currentState,
+            startIso: pred.currentStateStartIso,
+          };
+        }
+
+        return pred;
+      })()
     : null;
 
   return { userPrediction, rawPrediction, loading };
