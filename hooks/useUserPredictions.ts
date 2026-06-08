@@ -615,12 +615,12 @@ export function useUserPredictions(
     };
   }, []);
 
-  const userPrediction: UserPrediction | null = rawPrediction
-    ? (() => {
   // Reset start anchor when offset changes so new slot times are adopted
   // immediately after the user submits a report that shifts their offset.
   // Also trigger a fresh DB fetch so the schedule UI reflects the latest
   // prediction row without waiting for the next real-time event or foreground resume.
+  // IMPORTANT: This useEffect must be at the top level of the hook — never inside
+  // a conditional or IIFE — to satisfy React's Rules of Hooks.
   useEffect(() => {
     if (prevOffsetRef.current !== offsetMinutes) {
       prevOffsetRef.current  = offsetMinutes;
@@ -629,6 +629,8 @@ export function useUserPredictions(
     }
   }, [offsetMinutes]);
 
+  const userPrediction: UserPrediction | null = rawPrediction
+    ? (() => {
         const pred = applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null);
 
         // ── Stabilize currentStateStartIso ────────────────────────────────────
