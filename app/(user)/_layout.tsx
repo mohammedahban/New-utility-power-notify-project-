@@ -243,7 +243,6 @@ export default function UserLayout() {
             headerStyle: { backgroundColor: '#060d1a' },
             headerTintColor: '#38bdf8',
             headerTitleStyle: { fontWeight: '700', fontSize: 17, color: '#f1f5f9' },
-            tabBarButton: () => null,
           }}
         />
       </Tabs>
