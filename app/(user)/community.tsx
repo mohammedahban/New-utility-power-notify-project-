@@ -745,10 +745,24 @@ export default function CommunityScreen() {
     if (error) {
       Alert.alert(AR.error, error);
     } else if (response === 'yes' && yesResult) {
+      // Fetch reporter reliability to surface in community sync meta
+      let reporterReliability: number | null = null;
+      if (notif.reporter_id) {
+        try {
+          const { data } = await supabase
+            .from('user_reliability')
+            .select('reliability_score')
+            .eq('user_id', notif.reporter_id)
+            .maybeSingle();
+          if (data) reporterReliability = Math.round(data.reliability_score ?? 50);
+        } catch (_) {}
+      }
       await applyResync({
         syncedState: yesResult.reportedState === 'UTILITY_ON' ? 'ON' : 'OFF',
         syncedAtIso: yesResult.effectiveTransitionAt,
         appliedAtIso: new Date().toISOString(),
+        reporterName: yesResult.reporterName ?? notif.reporter_username ?? null,
+        reporterReliability,
       });
       Alert.alert(AR.scheduleUpdated, AR.scheduleUpdatedBody);
     }

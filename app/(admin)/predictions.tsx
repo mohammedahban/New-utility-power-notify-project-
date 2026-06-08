@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, ActivityIndicator,
   TouchableOpacity, RefreshControl,
@@ -7,6 +7,92 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { usePredictions, Prediction, PatternStats } from '../../hooks/usePredictions';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
+import { applyOffsetToPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
+
+// ── ATC System-Wide Indicator ─────────────────────────────────────────────────
+function ATCSystemIndicator({ prediction }: { prediction: Prediction | null }) {
+  const [userCount, setUserCount] = useState<number>(0);
+  const [avgOffset, setAvgOffset] = useState<number>(0);
+
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase
+        .from('user_offsets')
+        .select('offset_minutes');
+      if (data && data.length > 0) {
+        setUserCount(data.length);
+        const avg = data.reduce((s: number, r: any) => s + (r.offset_minutes ?? 0), 0) / data.length;
+        setAvgOffset(Math.round(avg));
+      }
+    })();
+  }, []);
+
+  if (!prediction) return null;
+
+  // Simulate ATC state for "neutral offset" user (most common case)
+  const samplePrediction = applyOffsetToPrediction(prediction, 0, null);
+  const sampleNeg = applyOffsetToPrediction(prediction, -45, null);
+  const samplePos = applyOffsetToPrediction(prediction, 45, null);
+
+  const modeColors: Record<ScheduleStateMode, string> = {
+    NORMAL: '#22c55e',
+    PREDICTION_RANGE: '#38bdf8',
+    UNCERTAIN_ZONE: '#f59e0b',
+    COMMUNITY_SYNCED: '#a78bfa',
+    WAITING_FOR_GROWATT: '#3b82f6',
+  };
+  const modeIcons: Record<ScheduleStateMode, string> = {
+    NORMAL: '✅',
+    PREDICTION_RANGE: '🔮',
+    UNCERTAIN_ZONE: '⚠️',
+    COMMUNITY_SYNCED: '👥',
+    WAITING_FOR_GROWATT: '⏳',
+  };
+
+  const rows: { label: string; mode: ScheduleStateMode; overrun: number }[] = [
+    { label: 'فارق صفري (0د)', mode: samplePrediction.atc.mode, overrun: samplePrediction.atc.overrunMinutes },
+    { label: 'فارق سالب (-45د)', mode: sampleNeg.atc.mode, overrun: sampleNeg.atc.overrunMinutes },
+    { label: 'فارق موجب (+45د)', mode: samplePos.atc.mode, overrun: samplePos.atc.overrunMinutes },
+  ];
+
+  return (
+    <View style={atcSysStyles.card}>
+      <View style={atcSysStyles.header}>
+        <Text style={atcSysStyles.subtitle}>{userCount} مستخدم · متوسط الفارق {avgOffset > 0 ? '+' : ''}{avgOffset}د</Text>
+        <Text style={atcSysStyles.title}>🎛️ ATC — حالة النظام</Text>
+      </View>
+      {rows.map((r, i) => (
+        <View key={i} style={atcSysStyles.row}>
+          <View style={atcSysStyles.right}>
+            {r.overrun > 0 && (
+              <Text style={atcSysStyles.overrun}>تجاوز: {Math.round(r.overrun)}د</Text>
+            )}
+            <View style={[atcSysStyles.modeBadge, { borderColor: modeColors[r.mode] + '55', backgroundColor: modeColors[r.mode] + '18' }]}>
+              <Text style={[atcSysStyles.modeText, { color: modeColors[r.mode] }]}>
+                {modeIcons[r.mode]} {r.mode}
+              </Text>
+            </View>
+          </View>
+          <Text style={atcSysStyles.label}>{r.label}</Text>
+        </View>
+      ))}
+      <Text style={atcSysStyles.note}>المحاكاة بناءً على التوقعات الحالية. الحالة الفعلية تعتمد على فارق كل مستخدم.</Text>
+    </View>
+  );
+}
+const atcSysStyles = StyleSheet.create({
+  card: { backgroundColor: '#1e293b', borderRadius: 16, padding: 16, marginBottom: 12, borderRightWidth: 3, borderRightColor: '#a78bfa' },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  title: { color: '#94a3b8', fontSize: 11, fontWeight: '700', letterSpacing: 1 },
+  subtitle: { color: '#475569', fontSize: 10 },
+  row: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#0f172a' },
+  label: { color: '#64748b', fontSize: 12 },
+  right: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
+  modeBadge: { borderRadius: 8, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 4 },
+  modeText: { fontSize: 11, fontWeight: '700' },
+  overrun: { color: '#f59e0b', fontSize: 10, fontWeight: '600' },
+  note: { color: '#334155', fontSize: 10, textAlign: 'right', marginTop: 10, lineHeight: 15 },
+});
 
 function ConfidenceMeter({ pct, label }: { pct: number; label: string }) {
   const color = pct >= 88 ? '#22c55e' : pct >= 72 ? '#38bdf8' : pct >= 52 ? '#f59e0b' : '#ef4444';
@@ -399,6 +485,8 @@ export default function AdminPredictions() {
       </Card>
 
       {prediction.apppe && <ProfileBlendCard apppe={prediction.apppe} />}
+
+      <ATCSystemIndicator prediction={prediction} />
 
       <LearningProgressCard prediction={prediction} />
 

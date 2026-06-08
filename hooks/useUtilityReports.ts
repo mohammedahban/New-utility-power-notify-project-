@@ -168,10 +168,24 @@ export function useUtilityReports() {
     // Build the self-resync point:
     //   syncedState = ON if UTILITY_ON reported, OFF otherwise
     //   syncedAtIso = estimated_transition_at (when the event actually happened)
+    //   reporterName / reporterReliability — fetch from user_profiles & user_reliability
+    let selfReporterName: string | null = null;
+    let selfReporterReliability: number | null = null;
+    try {
+      const [{ data: profData }, { data: relData }] = await Promise.all([
+        supabase.from('user_profiles').select('username').eq('id', user.id).maybeSingle(),
+        supabase.from('user_reliability').select('reliability_score').eq('user_id', user.id).maybeSingle(),
+      ]);
+      selfReporterName = profData?.username ?? null;
+      selfReporterReliability = relData ? Math.round(relData.reliability_score ?? 50) : null;
+    } catch (_) {}
+
     const selfResync: ResyncPoint = {
       syncedState: reportedState === 'UTILITY_ON' ? 'ON' : 'OFF',
       syncedAtIso: estimatedTransitionAt,
       appliedAtIso: new Date(nowMs).toISOString(),
+      reporterName: selfReporterName ?? 'أنت',
+      reporterReliability: selfReporterReliability,
     };
 
     // Also persist to resync_history for the reporter themselves

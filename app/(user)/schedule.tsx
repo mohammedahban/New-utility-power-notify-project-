@@ -4,7 +4,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { useUserPredictions, ShiftedScheduleSlot } from '../../hooks/useUserPredictions';
+import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { AR } from '../../constants/arabic';
@@ -29,11 +29,13 @@ function parseFormattedTime(label: string): number | null {
   } catch { return null; }
 }
 
-function ScheduleBlock({ slot, index, resyncEvents, isActive }: {
+function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding }: {
   slot: ShiftedScheduleSlot;
   index: number;
   resyncEvents: any[];
   isActive?: boolean;
+  atcMode?: ScheduleStateMode;
+  isHolding?: boolean;
 }) {
   const isOn = slot.state === 'ON';
   const color = isOn ? T.success : T.danger;
@@ -65,6 +67,21 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive }: {
               <Text style={sbStyles.resyncBadgeText}>👥 مزامنة مجتمعية</Text>
             </View>
           )}
+          {/* ATC hold badge — only on the active slot when schedule is being held */}
+          {isActive && isHolding && atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && (() => {
+            const atcCfg: Record<string, { label: string; bg: string; border: string; color: string }> = {
+              UNCERTAIN_ZONE:      { label: '⚠ بانتظار تأكيد', bg: '#1a0e00', border: '#f59e0b66', color: '#f59e0b' },
+              WAITING_FOR_GROWATT: { label: '⏳ بانتظار Growatt', bg: '#001020', border: '#38bdf866', color: '#38bdf8' },
+              PREDICTION_RANGE:   { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
+            };
+            const cfg = atcCfg[atcMode];
+            if (!cfg) return null;
+            return (
+              <View style={[sbStyles.atcBadge, { backgroundColor: cfg.bg, borderColor: cfg.border }]}>
+                <Text style={[sbStyles.atcBadgeText, { color: cfg.color }]}>{cfg.label}</Text>
+              </View>
+            );
+          })()}
           <View style={[sbStyles.zoneBadge, { backgroundColor: isOn ? T.success + '18' : T.danger + '18' }]}>
             <Text style={[sbStyles.zoneText, { color }]}>{zoneAr}</Text>
           </View>
@@ -143,6 +160,8 @@ const sbStyles = StyleSheet.create({
   resyncBadgeText: { color: '#38bdf8', fontSize: 9, fontWeight: '700' },
   resyncInfo: { marginTop: 8, backgroundColor: '#001a2e', borderRadius: 8, padding: 8, borderWidth: 1, borderColor: '#38bdf822' },
   resyncInfoText: { color: '#38bdf8', fontSize: 11, lineHeight: 16, textAlign: 'right' },
+  atcBadge: { borderRadius: 8, paddingHorizontal: 9, paddingVertical: 4, borderWidth: 1, marginTop: 2 },
+  atcBadgeText: { fontSize: 10, fontWeight: '700' },
 });
 
 export default function ScheduleScreen() {
@@ -253,7 +272,13 @@ export default function ScheduleScreen() {
             const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
             const isActive = nowMs >= slotStartMs && nowMs < slotEndMs;
             return (
-              <ScheduleBlock key={i} slot={slot} index={i} resyncEvents={resyncHistory} isActive={isActive} />
+            <ScheduleBlock
+              key={i} slot={slot} index={i}
+              resyncEvents={resyncHistory}
+              isActive={isActive}
+              atcMode={userPrediction?.atc?.mode}
+              isHolding={userPrediction?.isHoldingState}
+            />
             );
           })}
           <View style={styles.endDot} />

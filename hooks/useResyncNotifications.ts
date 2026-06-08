@@ -51,6 +51,8 @@ export interface YesResyncResult {
   effectiveTransitionAt: string;
   /** The utility state that became active */
   reportedState: 'UTILITY_ON' | 'UTILITY_OFF';
+  /** Reporter display name for community sync meta */
+  reporterName: string | null;
 }
 
 export function useResyncNotifications() {
@@ -233,6 +235,7 @@ export function useResyncNotifications() {
       yesResult = {
         effectiveTransitionAt,
         reportedState: notif.reported_state,
+        reporterName: notif.reporter_username ?? null,
       };
 
       await fetchHistory();

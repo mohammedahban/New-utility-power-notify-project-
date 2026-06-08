@@ -30,6 +30,8 @@ export default function UserSettings() {
   const [usernameSuccess, setUsernameSuccess] = useState(false);
 
   const [deletingAccount, setDeletingAccount] = useState(false);
+  const [atcDebugMode, setAtcDebugMode] = useState<string | null>(null);
+  const [atcDebugOffset, setAtcDebugOffset] = useState(0);
 
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [loadingPrefs, setLoadingPrefs] = useState(true);
@@ -346,6 +348,80 @@ export default function UserSettings() {
           </TouchableOpacity>
         </View>
 
+        {/* ATC Debug Panel — only in development */}
+        {__DEV__ && (
+          <>
+            <Text style={styles.sectionLabel}>🛠 ATC — وضع الاختبار</Text>
+            <View style={styles.card}>
+              <Text style={[styles.rowTitle, { marginBottom: 12 }]}>محاكاة حالة ATC</Text>
+              <Text style={[styles.rowSub, { marginBottom: 14 }]}>
+                اختر حالة ATC للتحقق من عرض واجهة المستخدم دون الانتظار لبيانات Growatt الحقيقية.
+              </Text>
+
+              {/* Offset selector */}
+              <Text style={[styles.fieldLabel, { marginBottom: 6 }]}>الفارق الزمني المُحاكى</Text>
+              <View style={{ flexDirection: 'row-reverse', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+                {([-60, -30, 0, 30, 60] as number[]).map(v => (
+                  <TouchableOpacity
+                    key={v}
+                    style={[debugStyles.offsetBtn, atcDebugOffset === v && debugStyles.offsetBtnActive]}
+                    onPress={() => setAtcDebugOffset(v)}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[debugStyles.offsetBtnText, atcDebugOffset === v && { color: T.accent }]}>
+                      {v > 0 ? `+${v}` : v}د
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Mode selector */}
+              <Text style={[styles.fieldLabel, { marginBottom: 6 }]}>حالة ATC</Text>
+              <View style={{ gap: 8 }}>
+                {(['NORMAL', 'PREDICTION_RANGE', 'UNCERTAIN_ZONE', 'WAITING_FOR_GROWATT', 'COMMUNITY_SYNCED'] as const).map(mode => {
+                  const modeColors = {
+                    NORMAL: '#22c55e',
+                    PREDICTION_RANGE: '#38bdf8',
+                    UNCERTAIN_ZONE: '#f59e0b',
+                    COMMUNITY_SYNCED: '#a78bfa',
+                    WAITING_FOR_GROWATT: '#3b82f6',
+                  };
+                  const color = modeColors[mode];
+                  const isActive = atcDebugMode === mode;
+                  return (
+                    <TouchableOpacity
+                      key={mode}
+                      style={[debugStyles.modeBtn, { borderColor: color + (isActive ? 'cc' : '33'), backgroundColor: isActive ? color + '20' : T.elevated }]}
+                      onPress={() => setAtcDebugMode(isActive ? null : mode)}
+                      activeOpacity={0.8}
+                    >
+                      <View style={[debugStyles.modeDot, { backgroundColor: isActive ? color : T.textMuted }]} />
+                      <Text style={[debugStyles.modeText, { color: isActive ? color : T.textSecondary }]}>{mode}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              {atcDebugMode && (
+                <View style={debugStyles.resultBox}>
+                  <Text style={debugStyles.resultTitle}>معاينة الحالة</Text>
+                  <Text style={debugStyles.resultBody}>
+                    الوضع: <Text style={{ color: T.accent, fontWeight: '800' }}>{atcDebugMode}</Text>{' '}
+                    الفارق: <Text style={{ color: T.warning, fontWeight: '700' }}>{atcDebugOffset > 0 ? '+' : ''}{atcDebugOffset}د</Text>
+                  </Text>
+                  <Text style={debugStyles.resultNote}>
+                    {atcDebugMode === 'NORMAL' ? '✅ الحالة طبيعية — لا يوجد تأخير أو تجاوز للنطاق.' : ''}
+                    {atcDebugMode === 'PREDICTION_RANGE' ? '🔮 النظام في نطاق التوقع — التغيير محتمل لكنه لم يُؤكَّد بعد.' : ''}
+                    {atcDebugMode === 'UNCERTAIN_ZONE' ? '⚠ تجاوز النطاق المتوقع — بانتظار تأكيد مجتمعي أو من Growatt.' : ''}
+                    {atcDebugMode === 'WAITING_FOR_GROWATT' ? '⏳ بانتظار Growatt — الفارق الموجب يعني أن Growatt تغيّر أولاً.' : ''}
+                    {atcDebugMode === 'COMMUNITY_SYNCED' ? '👥 حالة مُزامَنة من المجتمع — الجدول يعتمد على بلاغ مجتمعي.' : ''}
+                  </Text>
+                </View>
+              )}
+            </View>
+          </>
+        )}
+
         <Text style={styles.footer}>{AR.footer}</Text>
       </ScrollView>
     </KeyboardAvoidingView>
@@ -407,4 +483,17 @@ const styles = StyleSheet.create({
   signOutBtn: { backgroundColor: '#1a0808', borderRadius: 14, paddingVertical: 15, alignItems: 'center', borderWidth: 1, borderColor: T.danger + '44', marginTop: 4, marginBottom: 16 },
   signOutText: { color: T.danger, fontWeight: '700', fontSize: 15 },
   footer: { color: T.textMuted, fontSize: 11, textAlign: 'center', lineHeight: 18, marginBottom: 16, opacity: 0.6 },
+});
+
+const debugStyles = StyleSheet.create({
+  offsetBtn: { backgroundColor: T.elevated, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
+  offsetBtnActive: { borderColor: T.accent, backgroundColor: '#001a2e' },
+  offsetBtnText: { color: T.textMuted, fontSize: 13, fontWeight: '600' },
+  modeBtn: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, borderWidth: 1 },
+  modeDot: { width: 8, height: 8, borderRadius: 4 },
+  modeText: { fontSize: 13, fontWeight: '600' },
+  resultBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 14, marginTop: 14, borderWidth: 1, borderColor: T.border },
+  resultTitle: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 8, textAlign: 'right' },
+  resultBody: { color: T.textSecondary, fontSize: 13, textAlign: 'right', marginBottom: 8 },
+  resultNote: { color: T.textMuted, fontSize: 11, lineHeight: 18, textAlign: 'right' },
 });
