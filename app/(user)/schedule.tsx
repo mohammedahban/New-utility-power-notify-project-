@@ -7,6 +7,7 @@ import { useUserOffset } from '../../hooks/useUserOffset';
 import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
+import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { AR } from '../../constants/arabic';
 
 const T = {
@@ -174,6 +175,8 @@ export default function ScheduleScreen() {
   const { resyncPoint } = useResync();
   const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
+  // Persistent anchor — provides the real start time for the active slot
+  const { anchor } = useStateAnchor();
 
   /**
    * Stable slot time maps.
@@ -334,13 +337,19 @@ export default function ScheduleScreen() {
             const stableEnd = stableEndMapRef.current[slotKey];
 
             return (
-            <ScheduleBlock
+          <ScheduleBlock
               key={i} slot={slot} index={i}
               resyncEvents={resyncHistory}
               isActive={isActive}
               atcMode={userPrediction?.atc?.mode}
               isHolding={userPrediction?.isHoldingState}
-              stableStartFormatted={stableStart}
+              // For the active slot, prefer the persistent anchor start time
+              // so the displayed start never shifts on prediction refreshes.
+              stableStartFormatted={
+                isActive && anchor && anchor.state === slot.state
+                  ? new Date(anchor.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
+                  : stableStart
+              }
               stableEndFormatted={stableEnd}
             />
             );

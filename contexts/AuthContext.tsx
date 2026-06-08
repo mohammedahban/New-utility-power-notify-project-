@@ -45,11 +45,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   useEffect(() => {
-    // Initial session recovery
-    supabase.auth.getSession().then(({ data: { session: s } }) => {
+    // Track whether the initial getSession has completed so we never
+    // call setLoading(false) before we know if a session exists.
+    let initialCheckDone = false;
+
+    // Initial session recovery — keep loading=true until profile is fetched
+    supabase.auth.getSession().then(async ({ data: { session: s } }) => {
       setSession(s);
       setUser(s?.user ?? null);
-      if (s?.user) fetchProfile(s.user.id);
+      if (s?.user) {
+        // Fetch profile before clearing loading so AuthGate never sees
+        // session=truthy but profile=null as a transient state.
+        await fetchProfile(s.user.id);
+      }
+      initialCheckDone = true;
       setLoading(false);
     });
 
@@ -62,11 +71,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else {
         setProfile(null);
       }
-      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
-        setLoading(false);
-      }
-      if (event === 'SIGNED_OUT') {
-        setLoading(false);
+      // Only clear loading after the initial check is done to avoid
+      // a race where onAuthStateChange fires before getSession resolves.
+      if (initialCheckDone) {
+        if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'SIGNED_OUT') {
+          setLoading(false);
+        }
       }
     });
 

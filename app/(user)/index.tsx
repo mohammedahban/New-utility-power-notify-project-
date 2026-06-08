@@ -12,6 +12,7 @@ import { useUserPredictions, UserPrediction, ScheduleStateMode } from '../../hoo
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { useResync } from '../../contexts/ResyncContext';
+import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 
@@ -23,22 +24,13 @@ const T = {
 };
 
 // ── Stable elapsed timer ───────────────────────────────────────────────────────
-// Uses a ref-stored anchor time so prediction refreshes don't reset the counter.
-function useStableElapsed(startIsoInput: string | null, isOn: boolean): string {
-  // We keep a ref to the "real" anchor time per ON/OFF state.
-  // Only reset when the state actually changes, not on every prediction refresh.
-  const anchorRef = useRef<{ iso: string; state: boolean } | null>(null);
+// Driven by useStateAnchor — completely independent of prediction refreshes.
+function useElapsedFromIso(startIso: string | null): string {
   const [label, setLabel] = useState('');
-
   useEffect(() => {
-    if (!startIsoInput) { anchorRef.current = null; setLabel(''); return; }
-    // Only update anchor when state changes or anchor is unset
-    if (!anchorRef.current || anchorRef.current.state !== isOn) {
-      anchorRef.current = { iso: startIsoInput, state: isOn };
-    }
+    if (!startIso) { setLabel(''); return; }
     const update = () => {
-      if (!anchorRef.current) return;
-      const diff = Date.now() - new Date(anchorRef.current.iso).getTime();
+      const diff = Date.now() - new Date(startIso).getTime();
       const totalMin = Math.floor(diff / 60000);
       if (totalMin < 1) { setLabel('للتو'); return; }
       const h = Math.floor(totalMin / 60);
@@ -48,10 +40,9 @@ function useStableElapsed(startIsoInput: string | null, isOn: boolean): string {
       else setLabel(`${h} س و ${m} د`);
     };
     update();
-    const id = setInterval(update, 60000); // update every 1 min only
+    const id = setInterval(update, 60000);
     return () => clearInterval(id);
-  }, [startIsoInput, isOn]);
-
+  }, [startIso]);
   return label;
 }
 
@@ -77,14 +68,17 @@ function fmtTimeAr(iso: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1: Personal Utility Status Hero Card
 // ─────────────────────────────────────────────────────────────────────────────
-function PersonalStatusCard({ prediction }: { prediction: UserPrediction | null }) {
+function PersonalStatusCard({ prediction, anchorStartIso }: {
+  prediction: UserPrediction | null;
+  anchorStartIso: string | null;
+}) {
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
   const isOn = prediction?.currentState === 'ON';
   const color = isOn ? T.success : T.danger;
 
-  // Stable elapsed — won't reset on prediction refresh
-  const elapsed = useStableElapsed(prediction?.currentStateStartIso ?? null, isOn);
+  // Elapsed driven by the persistent anchor — never resets on prediction refresh
+  const elapsed = useElapsedFromIso(anchorStartIso);
 
   // Remaining time (only when NOT holding)
   const currentSlot = (() => {
@@ -125,6 +119,8 @@ function PersonalStatusCard({ prediction }: { prediction: UserPrediction | null 
     const meta = prediction?.communitySyncMeta;
     const reporterName = meta?.reporterName ?? 'مجهول';
     const reporterRel = meta?.reporterReliability;
+    // For community sync, elapsed since the sync point itself
+    const syncElapsed = useElapsedFromIso(meta?.syncedAtIso ?? null);
     return (
       <View style={[psStyles.card, { borderColor: color + '50' }]}>
         <Text style={psStyles.cardTitle}>⚡ حالتي الكهربائية</Text>
@@ -155,7 +151,7 @@ function PersonalStatusCard({ prediction }: { prediction: UserPrediction | null 
             </View>
             {meta?.syncedAtIso && (
               <Text style={psStyles.communityBannerTime}>
-                تم تأكيد هذه الحالة منذ: {elapsed || 'للتو'}
+                تم تأكيد هذه الحالة منذ: {syncElapsed || 'للتو'}
               </Text>
             )}
           </View>
@@ -521,7 +517,10 @@ const utStyles = StyleSheet.create({
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 3: Today's Timeline
 // ─────────────────────────────────────────────────────────────────────────────
-function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
+function TodayTimeline({ prediction, anchorStartIso }: {
+  prediction: UserPrediction | null;
+  anchorStartIso: string | null;
+}) {
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
   const lastComputedAtRef   = useRef<string | null>(null);
@@ -613,8 +612,12 @@ function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
                   {isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}
                 </Text>
               </View>
+              {/* Active slot: show anchor start time instead of prediction-derived time */}
               <Text style={tlStyles.timeText}>
-                {startF}{endF ? ` → ${endF}` : ' → …'}
+                {isActive && anchorStartIso
+                  ? new Date(anchorStartIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
+                  : startF
+                }{endF ? ` → ${endF}` : ' → …'}
               </Text>
               {slot.durationLabel && (
                 <Text style={[tlStyles.durText, { color: color + 'aa' }]}>{slot.durationLabel}</Text>
@@ -857,6 +860,15 @@ export default function Home() {
   const { score: myScore } = useMyReliability(profile?.id);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Persistent anchor — source of truth for current state start time.
+  // Independent of prediction refreshes; survives DB re-analysis every 15 min.
+  const { anchor } = useStateAnchor();
+  // Use anchor's startIso when anchor state matches prediction state;
+  // fall back to prediction's own startIso otherwise.
+  const anchorStartIso = anchor && userPrediction && anchor.state === userPrediction.currentState
+    ? anchor.startIso
+    : userPrediction?.currentStateStartIso ?? null;
+
   // Stabilize next-transition range so it never jumps during DB refreshes
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
   const stablePrediction = userPrediction
@@ -923,14 +935,14 @@ export default function Home() {
       ) : null}
 
       <ParticipationNudge userId={profile?.id} />
-      <PersonalStatusCard prediction={stablePrediction} />
+      <PersonalStatusCard prediction={stablePrediction} anchorStartIso={anchorStartIso} />
       <UpcomingTransitionCard prediction={stablePrediction} />
 
       {stablePrediction && (
         <StabilityBar score={stablePrediction.stabilityScore} label={stablePrediction.stabilityLabel} />
       )}
 
-      <TodayTimeline prediction={stablePrediction} />
+      <TodayTimeline prediction={stablePrediction} anchorStartIso={anchorStartIso} />
       <CommunityActivity
         pendingAlerts={pendingCount}
         onViewAll={() => router.push('/(user)/community')}
