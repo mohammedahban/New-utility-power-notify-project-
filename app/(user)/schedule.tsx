@@ -29,7 +29,7 @@ function parseFormattedTime(label: string): number | null {
   } catch { return null; }
 }
 
-function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted }: {
+function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted, stableEndFormatted }: {
   slot: ShiftedScheduleSlot;
   index: number;
   resyncEvents: any[];
