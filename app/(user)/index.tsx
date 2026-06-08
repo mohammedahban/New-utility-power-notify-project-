@@ -761,6 +761,44 @@ const sbStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// STABLE RANGE REF — prevents UpcomingTransitionCard range times from shifting
+// on DB prediction refreshes. Keyed by "nextState|roundedRangeStartMin".
+// ─────────────────────────────────────────────────────────────────────────────
+function useStableNextTransition(
+  nt: UserPrediction['nextTransition'] | null | undefined,
+) {
+  const ref = useRef<{
+    key: string;
+    rangeStartIso: string;
+    rangeEndIso: string;
+    rangeLabel: string;
+  } | null>(null);
+
+  if (!nt) { ref.current = null; return nt ?? null; }
+
+  // Build a key that changes only when the *target* transition genuinely shifts
+  // (different transition type, or start time drifts by more than 5 min).
+  const roundedStart = Math.round(new Date(nt.rangeStartIso).getTime() / (5 * 60_000));
+  const key = `${nt.type}|${roundedStart}`;
+
+  if (!ref.current || ref.current.key !== key) {
+    ref.current = {
+      key,
+      rangeStartIso: nt.rangeStartIso,
+      rangeEndIso: nt.rangeEndIso,
+      rangeLabel: nt.rangeLabel,
+    };
+  }
+
+  return {
+    ...nt,
+    rangeStartIso: ref.current.rangeStartIso,
+    rangeEndIso: ref.current.rangeEndIso,
+    rangeLabel: ref.current.rangeLabel,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MAIN HOME SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
 export default function Home() {
@@ -773,6 +811,12 @@ export default function Home() {
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
   const [refreshing, setRefreshing] = useState(false);
+
+  // Stabilize next-transition range so it never jumps during DB refreshes
+  const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
+  const stablePrediction = userPrediction
+    ? { ...userPrediction, nextTransition: stableNextTransition }
+    : null;
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -834,14 +878,14 @@ export default function Home() {
       ) : null}
 
       <ParticipationNudge userId={profile?.id} />
-      <PersonalStatusCard prediction={userPrediction} />
-      <UpcomingTransitionCard prediction={userPrediction} />
+      <PersonalStatusCard prediction={stablePrediction} />
+      <UpcomingTransitionCard prediction={stablePrediction} />
 
-      {userPrediction && (
-        <StabilityBar score={userPrediction.stabilityScore} label={userPrediction.stabilityLabel} />
+      {stablePrediction && (
+        <StabilityBar score={stablePrediction.stabilityScore} label={stablePrediction.stabilityLabel} />
       )}
 
-      <TodayTimeline prediction={userPrediction} />
+      <TodayTimeline prediction={stablePrediction} />
       <CommunityActivity
         pendingAlerts={pendingCount}
         onViewAll={() => router.push('/(user)/community')}

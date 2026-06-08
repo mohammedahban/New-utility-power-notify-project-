@@ -2,21 +2,22 @@ import React, { useState, useCallback } from 'react';
 import { Tabs } from 'expo-router';
 import {
   View, Text, TouchableOpacity, StyleSheet, Modal,
-  ActivityIndicator, Alert, Platform,
+  ActivityIndicator, Alert, Platform, ScrollView,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useUtilityReports, TimeOption, ReportedState } from '../../hooks/useUtilityReports';
+import { useUserOffset } from '../../hooks/useUserOffset';
 import { useResync } from '../../contexts/ResyncContext';
 import { AR } from '../../constants/arabic';
 
-const TIME_OPTS: { key: TimeOption; label: string }[] = [
-  { key: 'now', label: AR.timeNow },
-  { key: '5min', label: AR.time5min },
-  { key: '10min', label: AR.time10min },
-  { key: '15min', label: AR.time15min },
-  { key: '20min', label: AR.time20min },
+const TIME_OPTS: { key: TimeOption; label: string; minutesAgo: number }[] = [
+  { key: 'now',   label: AR.timeNow,   minutesAgo: 0  },
+  { key: '5min',  label: AR.time5min,  minutesAgo: 5  },
+  { key: '10min', label: AR.time10min, minutesAgo: 10 },
+  { key: '15min', label: AR.time15min, minutesAgo: 15 },
+  { key: '20min', label: AR.time20min, minutesAgo: 20 },
 ];
 
 function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDown, cooldownLabel }: {
@@ -39,6 +40,11 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={grmStyles.overlay}>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={{ justifyContent: 'flex-end', flexGrow: 1 }}
+          keyboardShouldPersistTaps="handled"
+        >
         <View style={grmStyles.sheet}>
           <View style={grmStyles.handle} />
           <Text style={grmStyles.title}>{AR.reportUtilityTransition}</Text>
@@ -81,6 +87,13 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
             ))}
           </View>
 
+          {/* Offset calibration hint */}
+          <View style={grmStyles.calibHint}>
+            <Text style={grmStyles.calibHintText}>
+              💡 سيُحدَّث فارقك الزمني تلقائياً بناءً على هذا البلاغ
+            </Text>
+          </View>
+
           {isCoolingDown ? (
             <View style={grmStyles.cooldownBox}>
               <Text style={grmStyles.cooldownText}>⏳ {AR.cooldownText.replace('{label}', cooldownLabel ?? '')}</Text>
@@ -102,13 +115,14 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
             <Text style={grmStyles.cancelText}>{AR.cancel}</Text>
           </TouchableOpacity>
         </View>
+        </ScrollView>
       </View>
     </Modal>
   );
 }
 
 const grmStyles = StyleSheet.create({
-  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
+  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)' },
   sheet: { backgroundColor: '#0f172a', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40 },
   handle: { width: 40, height: 4, backgroundColor: '#334155', borderRadius: 2, alignSelf: 'center', marginBottom: 20 },
   title: { color: '#f1f5f9', fontSize: 20, fontWeight: '800', marginBottom: 6, textAlign: 'right' },
@@ -128,6 +142,8 @@ const grmStyles = StyleSheet.create({
   submitText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   cooldownBox: { backgroundColor: '#1e293b', borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginBottom: 10, borderWidth: 1, borderColor: '#334155' },
   cooldownText: { color: '#94a3b8', fontSize: 14, fontWeight: '600', textAlign: 'center' },
+  calibHint: { backgroundColor: '#001a2e', borderRadius: 10, padding: 12, marginBottom: 16, borderWidth: 1, borderColor: '#38bdf833' },
+  calibHintText: { color: '#94a3b8', fontSize: 12, textAlign: 'right', lineHeight: 18 },
   cancelBtn: { paddingVertical: 12, alignItems: 'center' },
   cancelText: { color: '#64748b', fontSize: 14 },
 });
@@ -137,6 +153,7 @@ export default function UserLayout() {
   const { pendingCount } = useResyncNotifications();
   const { submitting, submitReport, isCoolingDown, cooldownLabel } = useUtilityReports();
   const { applyResync } = useResync();
+  const { calibrate } = useUserOffset();
   const [reportModalVisible, setReportModalVisible] = useState(false);
 
   const handleReport = useCallback(async (state: ReportedState, time: TimeOption) => {
@@ -144,11 +161,29 @@ export default function UserLayout() {
     setReportModalVisible(false);
     if (error) {
       Alert.alert(AR.error, error);
-    } else {
-      if (selfResync) await applyResync(selfResync);
-      Alert.alert(AR.reportShared, AR.reportSharedBody);
+      return;
     }
-  }, [submitReport, applyResync]);
+    // Auto-apply community resync (existing behaviour)
+    if (selfResync) await applyResync(selfResync);
+
+    // Auto-calibrate offset from this report in the background.
+    // We derive the event time by subtracting minutesAgo from now.
+    const opt = TIME_OPTS.find(o => o.key === time);
+    const minutesAgo = opt?.minutesAgo ?? 0;
+    const eventMs = Date.now() - minutesAgo * 60_000;
+    const eventDate = new Date(eventMs + 3 * 60 * 60 * 1000); // shift to Yemen local
+    const eventType = state === 'UTILITY_ON' ? 'UTILITY_ON' : 'UTILITY_OFF';
+    // Fire calibration silently — we pass Yemen local hour/minute directly
+    calibrate(eventType as any, eventDate.getUTCHours(), Math.floor(eventDate.getUTCMinutes() / 5) * 5)
+      .then(({ offsetMinutes, error: calibErr }) => {
+        if (!calibErr) {
+          console.log(`[AutoCalibrate] new offset: ${offsetMinutes} min`);
+        }
+      })
+      .catch(() => {/* silent */});
+
+    Alert.alert(AR.reportShared, AR.reportSharedBody);
+  }, [submitReport, applyResync, calibrate]);
 
   const fabBottom = insets.bottom + 80;
 
@@ -215,14 +250,6 @@ export default function UserLayout() {
             tabBarIcon: ({ color, size }) => <Ionicons name="people" size={size} color={color} />,
             tabBarBadge: pendingCount > 0 ? pendingCount : undefined,
             tabBarBadgeStyle: { backgroundColor: '#ef4444', fontSize: 10 },
-          }}
-        />
-        <Tabs.Screen
-          name="calibrate"
-          options={{
-            title: 'فارقي',
-            headerTitle: AR.calibrateTitle,
-            tabBarIcon: ({ color, size }) => <Ionicons name="compass" size={size} color={color} />,
           }}
         />
         <Tabs.Screen
