@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, ActivityIndicator,
 } from 'react-native';
@@ -29,17 +29,19 @@ function parseFormattedTime(label: string): number | null {
   } catch { return null; }
 }
 
-function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding }: {
+function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted }: {
   slot: ShiftedScheduleSlot;
   index: number;
   resyncEvents: any[];
   isActive?: boolean;
   atcMode?: ScheduleStateMode;
   isHolding?: boolean;
+  /** Locked start time string — prevents display shifting on prediction refresh */
+  stableStartFormatted?: string;
 }) {
   const isOn = slot.state === 'ON';
   const color = isOn ? T.success : T.danger;
-  const startTime = slot.shiftedStartFormatted ?? slot.startFormatted;
+  const startTime = stableStartFormatted ?? slot.shiftedStartFormatted ?? slot.startFormatted;
   const endTime = slot.shiftedEndFormatted ?? slot.endFormatted;
   const zoneAr = (AR as any)[slot.zone] ?? slot.zone;
 
@@ -171,6 +173,16 @@ export default function ScheduleScreen() {
   const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
 
+  /**
+   * Stable slot start-time map.
+   * Key: "<state>|<originalStartIso>" — a slot identity that doesn't change across
+   * prediction refreshes as long as the underlying schedule hasn't shifted.
+   * Value: the formatted start time string locked at first observation.
+   * This prevents the displayed start time from jumping every time
+   * the DB prediction refreshes and recomputes slot boundaries.
+   */
+  const stableStartMapRef = useRef<Record<string, string>>({});
+
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();
 
@@ -271,6 +283,17 @@ export default function ScheduleScreen() {
             const slotStartMs = new Date(slot.startIso).getTime();
             const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
             const isActive = nowMs >= slotStartMs && nowMs < slotEndMs;
+
+            // Build a stable identity key for this slot.
+            // We use the slot's state + a rounded start minute to tolerate tiny
+            // sub-minute drifts while still detecting genuine schedule shifts.
+            const slotKey = `${slot.state}|${Math.round(slotStartMs / 60_000)}`;
+            const currentFormatted = slot.shiftedStartFormatted ?? slot.startFormatted;
+            if (!stableStartMapRef.current[slotKey] && currentFormatted) {
+              stableStartMapRef.current[slotKey] = currentFormatted;
+            }
+            const stableStart = stableStartMapRef.current[slotKey];
+
             return (
             <ScheduleBlock
               key={i} slot={slot} index={i}
@@ -278,6 +301,7 @@ export default function ScheduleScreen() {
               isActive={isActive}
               atcMode={userPrediction?.atc?.mode}
               isHolding={userPrediction?.isHoldingState}
+              stableStartFormatted={stableStart}
             />
             );
           })}
