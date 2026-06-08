@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
@@ -7,7 +8,7 @@ import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { useUserPredictions, UserPrediction } from '../../hooks/useUserPredictions';
+import { useUserPredictions, UserPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { useResync } from '../../contexts/ResyncContext';
@@ -69,28 +70,85 @@ function confLabel(pct: number): { text: string; color: string; emoji: string } 
   return { text: 'ثقة منخفضة', color: T.danger, emoji: '🔴' };
 }
 
+// ── ATC status badge ─────────────────────────────────────────────────────────
+function ATCBadge({ mode, statusLine, isOn }: {
+  mode: ScheduleStateMode;
+  statusLine: string | null;
+  isOn: boolean;
+}) {
+  if (mode === 'NORMAL' || mode === 'COMMUNITY_SYNCED') return null;
+
+  const configs: Record<Exclude<ScheduleStateMode, 'NORMAL' | 'COMMUNITY_SYNCED'>, {
+    icon: string; bg: string; border: string; textColor: string;
+  }> = {
+    PREDICTION_RANGE: { icon: '🔮', bg: '#0a1a2e', border: T.accent + '55', textColor: T.accent },
+    UNCERTAIN_ZONE:   { icon: '⚠', bg: '#1a0e00', border: T.warning + '55', textColor: T.warning },
+    WAITING_FOR_GROWATT: { icon: '⏳', bg: '#0a1a2e', border: T.accent + '44', textColor: T.accent },
+  };
+  const cfg = configs[mode as Exclude<ScheduleStateMode, 'NORMAL' | 'COMMUNITY_SYNCED'>];
+  if (!cfg) return null;
+
+  return (
+    <View style={[atcStyles.badge, { backgroundColor: cfg.bg, borderColor: cfg.border }]}>
+      <Text style={[atcStyles.badgeLine, { color: cfg.textColor }]}>
+        {cfg.icon}  {statusLine ?? mode}
+      </Text>
+      {(mode === 'UNCERTAIN_ZONE' || mode === 'WAITING_FOR_GROWATT') && (
+        <Text style={atcStyles.subLine}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن</Text>
+      )}
+    </View>
+  );
+}
+
+const atcStyles = StyleSheet.create({
+  badge: { borderRadius: 12, padding: 12, marginTop: 12, borderWidth: 1 },
+  badgeLine: { fontSize: 13, fontWeight: '700', textAlign: 'right' },
+  subLine: { color: T.accent, fontSize: 11, marginTop: 5, textAlign: 'right' },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1: Personal Utility Status Hero Card
 // ─────────────────────────────────────────────────────────────────────────────
 function PersonalStatusCard({ prediction }: { prediction: UserPrediction | null }) {
-  // Find the current slot (now falls between startIso and endIso)
-  const currentSlot = prediction?.daySchedule?.find(s => {
-    const start = new Date(s.startIso).getTime();
-    const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-    return Date.now() >= start && Date.now() < end;
-  }) ?? null;
+  const atcMode = prediction?.atc?.mode ?? 'NORMAL';
+  const isHolding = prediction?.isHoldingState ?? false;
 
-  const isOn = currentSlot ? currentSlot.state === 'ON' : (prediction?.currentState === 'ON');
+  // When ATC is holding, find the last slot that started (not necessarily still active)
+  // Otherwise find the slot that contains now
+  const currentSlot = (() => {
+    const slots = prediction?.daySchedule ?? [];
+    const nowMs = Date.now();
+    if (isHolding) {
+      // Return the last slot whose startIso <= now (the held state)
+      let best = null;
+      for (const s of slots) {
+        if (new Date(s.startIso).getTime() <= nowMs) best = s;
+        else break;
+      }
+      return best;
+    }
+    return slots.find(s => {
+      const start = new Date(s.startIso).getTime();
+      const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+      return nowMs >= start && nowMs < end;
+    }) ?? null;
+  })();
+
+  const isOn = prediction?.currentState === 'ON';
   const color = isOn ? T.success : T.danger;
-  const icon = isOn ? '⚡' : '🔴';
-  const statusText = isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية';
+  const icon = atcMode === 'COMMUNITY_SYNCED' ? '🔄' : isOn ? '⚡' : '🔴';
+  const statusText = atcMode === 'COMMUNITY_SYNCED'
+    ? 'تمت مزامنة الحالة عبر المجتمع'
+    : isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية';
 
   // Elapsed since current slot started
   const slotStartIso = currentSlot?.startIso ?? null;
   const elapsed = useElapsed(slotStartIso);
 
-  // Remaining time for current slot
-  const slotEndIso = currentSlot?.endIso ?? null;
+  // Remaining time: only show when ATC is NOT holding
+  const slotEndIso = !isHolding ? (currentSlot?.endIso ?? null) : null;
   const remainMinutes = slotEndIso
     ? Math.max(0, (new Date(slotEndIso).getTime() - Date.now()) / 60000)
     : null;
@@ -137,6 +195,9 @@ function PersonalStatusCard({ prediction }: { prediction: UserPrediction | null 
           </View>
         ) : null}
       </View>
+
+      {/* ATC state badge */}
+      <ATCBadge mode={atcMode} statusLine={prediction?.atc?.statusLine ?? null} isOn={isOn} />
 
       {/* Typical durations row */}
       {(prediction?.expectedOnDurationLabel || prediction?.expectedOffDurationLabel) && (
@@ -189,6 +250,8 @@ const psStyles = StyleSheet.create({
   durChipValue: { fontSize: 12, fontWeight: '800', textAlign: 'right' },
   syncBadge: { marginTop: 10, backgroundColor: '#001a2e', borderRadius: 10, padding: 10, borderWidth: 1, borderColor: '#38bdf844' },
   syncText: { color: '#38bdf8', fontSize: 11, fontWeight: '600', textAlign: 'right' },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,6 +259,8 @@ const psStyles = StyleSheet.create({
 // ─────────────────────────────────────────────────────────────────────────────
 function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
+  const atcMode = prediction?.atc?.mode ?? 'NORMAL';
+  const isHolding = prediction?.isHoldingState ?? false;
   const midMin = nt ? (nt.minFromNowMin + nt.maxFromNowMin) / 2 : null;
   const { h, m, s, total } = useCountdownSec(midMin);
   const maxSec = midMin ? midMin * 60 : 1;
@@ -207,6 +272,64 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   }, [progress]);
 
   if (!prediction) return null;
+
+  // ATC holding state — show appropriate message instead of normal card
+  if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
+    const isCurrentOn = prediction.currentState === 'ON';
+    const holdColor = isCurrentOn ? T.success : T.danger;
+    const modeConfigs = {
+      UNCERTAIN_ZONE: {
+        icon: '⚠️',
+        title: 'استمرار غير معتاد',
+        body: 'لا يزال التغيير متوقعاً — النمط الحالي ممتد بشكل غير معتاد',
+        borderColor: T.warning + '44',
+        iconColor: T.warning,
+      },
+      WAITING_FOR_GROWATT: {
+        icon: '⏳',
+        title: 'بانتظار تأكيد الحساس الرئيسي',
+        body: 'تم تجاوز نطاق التوقع. بانتظار تأكيد بلاغ مجتمعي أو تحديث حساس Growatt',
+        borderColor: T.accent + '44',
+        iconColor: T.accent,
+      },
+      PREDICTION_RANGE: {
+        icon: '🔮',
+        title: 'نطاق التوقع نشط',
+        body: 'التغيير محتمل خلال هذا النطاق. بانتظار تأكيد.',
+        borderColor: T.accent + '33',
+        iconColor: T.accent,
+      },
+    };
+    const cfg = modeConfigs[atcMode as keyof typeof modeConfigs] ?? modeConfigs.UNCERTAIN_ZONE;
+
+    return (
+      <View style={[utStyles.card, { borderColor: cfg.borderColor }]}>
+        <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+        <View style={utStyles.unstableBox}>
+          <Text style={utStyles.unstableIcon}>{cfg.icon}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={[utStyles.unstableTitle, { color: cfg.iconColor }]}>{cfg.title}</Text>
+            <Text style={utStyles.unstableBody}>{cfg.body}</Text>
+          </View>
+        </View>
+        {prediction.atc.communityElevated && (
+          <View style={utStyles.communityPriorityBox}>
+            <Text style={utStyles.communityPriorityText}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — شارك بملاحظاتك لمساعدة المجتمع</Text>
+          </View>
+        )}
+        {nt && (
+          <View style={[utStyles.mainBox, { borderColor: holdColor + '25', marginTop: 12 }]}>
+            <Text style={[utStyles.transitionLabel, { color: holdColor }]}>
+              {nt.type === 'UTILITY_ON' ? '🟢 توقع تشغيل الكهرباء' : '🔴 توقع انقطاع الكهرباء'}
+            </Text>
+            <Text style={[utStyles.rangeText, { color: holdColor, fontSize: 18 }]}>
+              {nt.rangeLabel.replace('→', 'إلى')}
+            </Text>
+          </View>
+        )}
+      </View>
+    );
+  }
 
   if (prediction.isUnstable || !nt) {
     return (
@@ -340,6 +463,8 @@ const utStyles = StyleSheet.create({
   unstableBody: { color: T.textMuted, fontSize: 12, lineHeight: 18, textAlign: 'right' },
   delayBox: { backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: '#92400e' },
   delayText: { color: '#f59e0b', fontSize: 12, textAlign: 'right' },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +564,8 @@ const tlStyles = StyleSheet.create({
   syncChipText: { fontSize: 10 },
   timeText: { color: T.textSecondary, fontSize: 13, fontWeight: '600', textAlign: 'right', marginBottom: 2 },
   durText: { fontSize: 11, fontWeight: '600', textAlign: 'right' },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -566,6 +693,8 @@ const caStyles = StyleSheet.create({
   timeAgo: { color: T.textMuted, fontSize: 10 },
   yesCount: { color: T.success, fontSize: 10, fontWeight: '600' },
   emptyText: { color: T.textMuted, fontSize: 12, textAlign: 'center', paddingVertical: 8 },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -616,6 +745,8 @@ const pnStyles = StyleSheet.create({
   body: { color: T.textSecondary, fontSize: 12, lineHeight: 20, textAlign: 'right' },
   dismissBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   dismissText: { color: T.textMuted, fontSize: 12 },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -651,6 +782,8 @@ const sbStyles = StyleSheet.create({
   score: { fontSize: 12, fontWeight: '700' },
   track: { height: 5, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden' },
   fill: { height: 5, borderRadius: 3 },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -776,4 +909,6 @@ const styles = StyleSheet.create({
   crisisIconWrap: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#451a03', alignItems: 'center', justifyContent: 'center' },
   crisisTitle: { color: '#f59e0b', fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
   crisisBody: { color: '#fbbf24', fontSize: 12, lineHeight: 19, textAlign: 'right' },
+  communityPriorityBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPriorityText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });

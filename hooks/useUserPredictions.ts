@@ -43,6 +43,34 @@ import { ResyncPoint } from '../contexts/ResyncContext';
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+// ── ATC types ────────────────────────────────────────────────────────────────
+
+/**
+ * ATC Schedule State Mode
+ *
+ * NORMAL              — Cycle is operating within expected parameters
+ * PREDICTION_RANGE    — Now is inside the predicted transition window (transition likely)
+ * UNCERTAIN_ZONE      — Prediction window ended, real transition not yet confirmed
+ * COMMUNITY_SYNCED    — Cycle was started/confirmed via community report
+ * WAITING_FOR_GROWATT — Waiting for Growatt sensor to confirm transition (positive offset)
+ */
+export type ScheduleStateMode =
+  | 'NORMAL'
+  | 'PREDICTION_RANGE'
+  | 'UNCERTAIN_ZONE'
+  | 'COMMUNITY_SYNCED'
+  | 'WAITING_FOR_GROWATT';
+
+export interface ATCState {
+  mode: ScheduleStateMode;
+  /** How many minutes the current cycle has exceeded the expected max duration (≥0) */
+  overrunMinutes: number;
+  /** True when community reports should carry elevated priority */
+  communityElevated: boolean;
+  /** User-visible status line (Arabic) */
+  statusLine: string | null;
+}
+
 export interface ShiftedTransition {
   type: 'UTILITY_ON' | 'UTILITY_OFF';
   rangeLabel: string;
@@ -59,6 +87,8 @@ export interface ShiftedScheduleSlot extends ScheduleSlot {
 }
 
 export interface UserPrediction {
+  /** ATC: describes the current decision-layer state */
+  atc: ATCState;
   nextTransition: ShiftedTransition | null;
   expectedOffDurationLabel: string | null;
   expectedOnDurationLabel: string | null;
@@ -78,6 +108,8 @@ export interface UserPrediction {
   crisisReason: string | null;
   isResynced: boolean;
   resyncedAtIso: string | null;
+  /** True when we are holding the current state (not blindly transitioning) because ATC hasn't approved */
+  isHoldingState: boolean;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -314,6 +346,148 @@ function applyCommunityDelta(
   });
 }
 
+// ── ATC Decision Engine ───────────────────────────────────────────────────────
+/**
+ * Determines whether the schedule should hold its current state or proceed
+ * to the next slot, and which ATC mode applies.
+ *
+ * Rules:
+ * 1. Community Sync always wins — mode = COMMUNITY_SYNCED, no hold
+ * 2. Inside prediction range → PREDICTION_RANGE (no transition yet)
+ * 3. Past prediction range end:
+ *    - Negative offset (< 0):  enter UNCERTAIN_ZONE immediately
+ *    - Positive offset (> 0):  enter WAITING_FOR_GROWATT
+ *    - Neutral offset (= 0):   15-min grace period, then UNCERTAIN_ZONE
+ * 4. Before prediction range → NORMAL
+ */
+function computeATCState(
+  effectiveSlots: ShiftedScheduleSlot[],
+  offsetMinutes: number,
+  resyncPoint: ResyncPoint | null,
+  prediction: Prediction,
+): ATCState {
+  const nowMs = Date.now();
+
+  // ── Community Sync shortcut ────────────────────────────────────────────────
+  if (resyncPoint) {
+    return {
+      mode: 'COMMUNITY_SYNCED',
+      overrunMinutes: 0,
+      communityElevated: false,
+      statusLine: null,
+    };
+  }
+
+  // ── Find the active (current) slot ────────────────────────────────────────
+  let activeSlot: ShiftedScheduleSlot | null = null;
+  for (const slot of effectiveSlots) {
+    const start = new Date(slot.startIso).getTime();
+    const end = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
+    if (nowMs >= start && nowMs < end) {
+      activeSlot = slot;
+      break;
+    }
+  }
+
+  if (!activeSlot || !activeSlot.endIso) {
+    // No active slot or open-ended → normal
+    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null };
+  }
+
+  const slotEndMs = new Date(activeSlot.endIso).getTime();
+  const expectedMaxMin = prediction.isUnstable ? 0 : (() => {
+    // Use the prediction's expected max duration for the next transition
+    // as a proxy for the end of the "safe" window
+    if (prediction.nextTransition) {
+      return prediction.nextTransition.maxFromNowMin;
+    }
+    return 0;
+  })();
+
+  // Build a nominal "range" around the slot end.
+  // We define the range as ±halfSpread around the predicted slot end.
+  const halfSpreadMs = 15 * 60_000; // default 15 minutes
+  const rangeStartMs = slotEndMs - halfSpreadMs;
+  const rangeEndMs   = slotEndMs + halfSpreadMs;
+  const overrunMs = Math.max(0, nowMs - rangeEndMs);
+  const overrunMin = overrunMs / 60_000;
+
+  // ── Before range start → NORMAL ───────────────────────────────────────────
+  if (nowMs < rangeStartMs) {
+    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null };
+  }
+
+  // ── Inside range → PREDICTION_RANGE ───────────────────────────────────────
+  if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) {
+    return {
+      mode: 'PREDICTION_RANGE',
+      overrunMinutes: 0,
+      communityElevated: false,
+      statusLine: 'نطاق التوقع نشط — التغيير محتمل',
+    };
+  }
+
+  // ── Past range end — decide based on offset ────────────────────────────────
+  const GRACE_PERIOD_MS = 15 * 60_000; // 15 minutes grace for neutral offset
+
+  if (offsetMinutes < 0) {
+    // Negative offset: enter UNCERTAIN_ZONE immediately after range ends
+    return {
+      mode: 'UNCERTAIN_ZONE',
+      overrunMinutes: overrunMin,
+      communityElevated: true,
+      statusLine: 'استمرار غير معتاد — بانتظار تأكيد تغير الحالة',
+    };
+  }
+
+  if (offsetMinutes > 0) {
+    // Positive offset: Growatt already transitioned — wait for Growatt confirmation
+    return {
+      mode: 'WAITING_FOR_GROWATT',
+      overrunMinutes: overrunMin,
+      communityElevated: true,
+      statusLine: 'بانتظار تأكيد الحساس الرئيسي أو بلاغ مجتمعي',
+    };
+  }
+
+  // Neutral offset (= 0): 15-min grace, then UNCERTAIN_ZONE
+  if (overrunMs <= GRACE_PERIOD_MS) {
+    return {
+      mode: 'PREDICTION_RANGE',  // still in extended grace window
+      overrunMinutes: overrunMin,
+      communityElevated: false,
+      statusLine: 'تأخر غير معتاد — لا يزال التشغيل مستمراً خارج النطاق المتوقع',
+    };
+  }
+
+  return {
+    mode: 'UNCERTAIN_ZONE',
+    overrunMinutes: overrunMin,
+    communityElevated: true,
+    statusLine: 'النمط الحالي ممتد بشكل غير معتاد — بانتظار تأكيد تغير الحالة',
+  };
+}
+
+/**
+ * ATC Hold Decision
+ *
+ * Returns true when the schedule should NOT automatically advance to the
+ * next slot. The current state is "held" until an external signal arrives
+ * (Community Sync, Growatt update, or user report).
+ *
+ * ATC holds when:
+ * - mode is UNCERTAIN_ZONE
+ * - mode is WAITING_FOR_GROWATT
+ * - mode is PREDICTION_RANGE (transition not yet confirmed)
+ *
+ * ATC does NOT hold when:
+ * - mode is NORMAL
+ * - mode is COMMUNITY_SYNCED (community already handled it)
+ */
+function atcShouldHold(mode: ScheduleStateMode): boolean {
+  return mode === 'UNCERTAIN_ZONE' || mode === 'WAITING_FOR_GROWATT' || mode === 'PREDICTION_RANGE';
+}
+
 // ── Step 4: Determine next transition from effective schedule ─────────────────
 function deriveNextTransition(
   effectiveSlots: ShiftedScheduleSlot[],
@@ -358,7 +532,7 @@ function deriveNextTransition(
   return null;
 }
 
-// ── Step 5: Determine current state from effective schedule ───────────────────
+// ── Step 5: Determine current state from effective schedule (legacy, unused) ──
 function deriveCurrentState(
   effectiveSlots: ShiftedScheduleSlot[],
   masterCurrentState: 'ON' | 'OFF',
@@ -403,6 +577,74 @@ function deriveCurrentState(
 
 // ── Full pipeline ─────────────────────────────────────────────────────────────
 
+/**
+ * ATC-aware current state derivation
+ *
+ * When ATC is holding the current state (UNCERTAIN_ZONE, WAITING_FOR_GROWATT,
+ * PREDICTION_RANGE), we do NOT advance to the next slot even if its startIso
+ * has passed. Instead we remain in the previous slot's state.
+ */
+function deriveCurrentStateATC(
+  effectiveSlots: ShiftedScheduleSlot[],
+  atcMode: ScheduleStateMode,
+  masterCurrentState: 'ON' | 'OFF',
+  resyncPoint: ResyncPoint | null,
+): { state: 'ON' | 'OFF'; label: string } {
+  if (resyncPoint) {
+    const syncedAtMs = new Date(resyncPoint.syncedAtIso).getTime();
+    const elapsedMin = Math.round((Date.now() - syncedAtMs) / 60_000);
+    const eH = Math.floor(elapsedMin / 60);
+    const eM = elapsedMin % 60;
+    const elapsedLabel = eH === 0 ? `${elapsedMin}د`
+      : eM === 0 ? `${eH}س`
+      : `${eH}س ${eM}د`;
+    return { state: resyncPoint.syncedState, label: `${elapsedLabel} (مزامنة مجتمعية)` };
+  }
+
+  const nowMs = Date.now();
+  const holding = atcShouldHold(atcMode);
+
+  if (holding) {
+    // ATC hold: find the last slot that started before now
+    // and return it regardless of whether its endIso has passed
+    let bestSlot: ShiftedScheduleSlot | null = null;
+    for (const slot of effectiveSlots) {
+      const startMs = new Date(slot.startIso).getTime();
+      if (startMs <= nowMs) {
+        bestSlot = slot;
+      } else {
+        break;
+      }
+    }
+    if (bestSlot) {
+      const elapsedMin = Math.round((nowMs - new Date(bestSlot.startIso).getTime()) / 60_000);
+      const eH = Math.floor(elapsedMin / 60);
+      const eM = elapsedMin % 60;
+      const label = eH === 0 ? `${Math.round(elapsedMin)}د`
+        : eM === 0 ? `${eH}س`
+        : `${eH}س ${eM}د`;
+      return { state: bestSlot.state, label };
+    }
+  }
+
+  // Normal (no hold): return the slot that contains now
+  for (let i = effectiveSlots.length - 1; i >= 0; i--) {
+    const slot = effectiveSlots[i];
+    const startMs = new Date(slot.startIso).getTime();
+    if (startMs <= nowMs) {
+      const elapsedMin = (nowMs - startMs) / 60_000;
+      const eH = Math.floor(elapsedMin / 60);
+      const eM = Math.round(elapsedMin % 60);
+      const label = eH === 0 ? `${Math.round(elapsedMin)}د`
+        : eM === 0 ? `${eH}س`
+        : `${eH}س ${eM}د`;
+      return { state: slot.state, label };
+    }
+  }
+
+  return { state: masterCurrentState, label: '' };
+}
+
 export function applyOffsetToPrediction(
   prediction: Prediction,
   offsetMinutes: number,
@@ -422,14 +664,20 @@ export function applyOffsetToPrediction(
     effectiveSlots = applyCommunityDelta(effectiveSlots, resyncPoint);
   }
 
-  // Step 4: Derive current state
-  const { state: currentState, label: currentStateDurationLabel } =
-    deriveCurrentState(effectiveSlots, prediction.currentState, resyncPoint ?? null);
+  // Step 4: Compute ATC state (before deriving current state)
+  const atcState = computeATCState(effectiveSlots, offsetMinutes, resyncPoint ?? null, prediction);
 
-  // Step 5: Derive next transition from effective schedule
+  // Step 5: Derive ATC-aware current state
+  const { state: currentState, label: currentStateDurationLabel } =
+    deriveCurrentStateATC(effectiveSlots, atcState.mode, prediction.currentState, resyncPoint ?? null);
+
+  // Step 6: Derive next transition from effective schedule
+  // When ATC is holding, next transition comes from the NEXT slot after the currently-held slot
   const nextTransition = prediction.isUnstable
     ? null
     : deriveNextTransition(effectiveSlots, currentState, prediction, offsetMinutes);
+
+  const isHolding = atcShouldHold(atcState.mode);
 
   return {
     nextTransition,
@@ -451,6 +699,8 @@ export function applyOffsetToPrediction(
     crisisReason: prediction.apppe?.crisisReason ?? null,
     isResynced: hasResync,
     resyncedAtIso: resyncPoint?.syncedAtIso ?? null,
+    atc: atcState,
+    isHoldingState: isHolding,
   };
 }
 

@@ -510,6 +510,18 @@ export const AR = {
   sunday: 'الأحد',
   scheduleUpdated: 'تم تحديث الجدول',
   scheduleUpdatedBody: 'تم إعادة مزامنة جدولك الشخصي بناءً على هذا البلاغ المجتمعي.',
+
+  // ── ATC — Adaptive Transition Controller ─────────────────────────────────
+  atcUnusualContinuation: 'استمرار غير معتاد',
+  atcWaitingConfirmation: 'بانتظار تأكيد تغير الحالة',
+  atcWaitingGrowatt: 'بانتظار تأكيد الحساس الرئيسي',
+  atcCommunitySynced: '🔄 تمت مزامنة الحالة عبر المجتمع',
+  atcGraceWarning: 'تأخر غير معتاد',
+  atcGraceBody: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع',
+  atcUncertainBody: 'لا يزال التغيير متوقعاً — النمط الحالي ممتد بشكل غير معتاد',
+  atcWaitingGrowattBody: 'بانتظار تأكيد الحساس الرئيسي أو بلاغ مجتمعي',
+  atcInPredictionRange: 'نطاق التوقع نشط — التغيير محتمل',
+  atcCommunityHighPriority: '👥 بلاغات المجتمع ذات أولوية مرتفعة الآن',
 };
 
 /** Format duration in Arabic */
