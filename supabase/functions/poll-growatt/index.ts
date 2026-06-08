@@ -1,7 +1,8 @@
 // poll-growatt Edge Function
-// Polls Growatt storage API every 5 minutes.
+// Polls Growatt storage API.
+// IMPORTANT: Set cron schedule to "*/5 * * * *" (every 5 minutes) in Supabase dashboard.
 // Sends push notifications ONLY to admin tokens (is_admin = true).
-// Auto-triggers analyze-patterns after detecting a state change.
+// Auto-triggers analyze-patterns IMMEDIATELY after detecting a state change.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
@@ -60,7 +61,9 @@ Deno.serve(async (req) => {
   // ── 2. Handle inverter offline ─────────────────────────────────────────────
   if (!d || typeof d !== "object") {
     console.warn("[poll-growatt] Inverter offline — empty data");
-    await supabase.from("inverter_state").upsert({ id: 1, last_polled: new Date().toISOString(), inverter_offline: true });
+    await supabase.from("inverter_state").upsert({
+      id: 1, last_polled: new Date().toISOString(), inverter_offline: true,
+    });
     return new Response(JSON.stringify({ ok: true, note: "inverter_offline" }), {
       status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
@@ -102,8 +105,10 @@ Deno.serve(async (req) => {
   // ── 5. Handle state change ─────────────────────────────────────────────────
   if (stateChanged) {
     const eventType = utilityIsOn ? "UTILITY_ON" : "UTILITY_OFF";
+    const isOn = utilityIsOn;
     console.log(`[poll-growatt] Transition: ${eventType}`);
 
+    // Insert power event
     await supabase.from("power_events").insert({
       event_type: eventType,
       occurred_at: now,
@@ -112,28 +117,27 @@ Deno.serve(async (req) => {
       status_text: statusText,
     });
 
-    // ── Send push ONLY to admin tokens ──────────────────────────────────────
+    // ── Send push to admin tokens ───────────────────────────────────────────
     const { data: adminTokens } = await supabase
       .from("push_tokens")
       .select("token")
       .eq("is_admin", true);
 
     if (adminTokens && adminTokens.length > 0) {
-      const localTime = new Date(now).toLocaleString("en-US", {
+      const localTimeAr = new Date(now).toLocaleString("ar-SA", {
         timeZone: "Asia/Aden",
-        dateStyle: "medium",
-        timeStyle: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
       });
-
-      const isOn = eventType === "UTILITY_ON";
 
       const messages = adminTokens.map(({ token }: { token: string }) => ({
         to: token,
-        title: isOn ? "\u26a1 GRID IS BACK ON" : "\ud83d\udd34 GRID WENT OFF",
+        title: isOn ? "⚡ الكهرباء اشتغلت" : "🔴 الكهرباء طفت",
         body: isOn
-          ? `Grid restored at ${localTime} \u2014 Input: ${pAcInput.toFixed(0)}W`
-          : `Grid lost at ${localTime} \u2014 Running on solar/battery`,
-        sound: "default",
+          ? `عادت الكهرباء الساعة ${localTimeAr} — قدرة الشبكة: ${pAcInput.toFixed(0)}W`
+          : `انقطعت الكهرباء الساعة ${localTimeAr} — يعمل على الطاقة الشمسية/البطارية`,
+        sound: "alarm.wav",
         channelId: "grid-monitor",
         priority: "high",
         ttl: 60,
@@ -164,11 +168,11 @@ Deno.serve(async (req) => {
         console.error("[poll-growatt] Push failed:", err);
       }
     } else {
-      console.log("[poll-growatt] No admin push tokens registered — skipping notification");
+      console.log("[poll-growatt] No admin push tokens registered — skipping admin notification");
     }
 
-    // ── Auto-trigger analyze-patterns ───────────────────────────────────────
-    console.log("[poll-growatt] Triggering analyze-patterns after state change");
+    // ── Auto-trigger analyze-patterns immediately ───────────────────────────
+    console.log("[poll-growatt] Triggering analyze-patterns after state change...");
     try {
       const analyzeUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/analyze-patterns`;
       await fetch(analyzeUrl, {

@@ -672,13 +672,33 @@ export default function CommunityScreen() {
   const requestLocation = useCallback(async () => {
     setLocationStatus('requesting');
     try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') { setLocationStatus('denied'); return; }
-      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      // First check permission status without prompting
+      const { status: current } = await Location.getForegroundPermissionsAsync();
+      let finalStatus = current;
+
+      if (current !== 'granted') {
+        // Request foreground location permission
+        const { status: requested } = await Location.requestForegroundPermissionsAsync();
+        finalStatus = requested;
+      }
+
+      if (finalStatus !== 'granted') {
+        setLocationStatus('denied');
+        return;
+      }
+
+      const loc = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+        timeInterval: 5000,
+        distanceInterval: 0,
+      });
       setMyLat(loc.coords.latitude);
       setMyLon(loc.coords.longitude);
       setLocationStatus('granted');
-    } catch { setLocationStatus('denied'); }
+    } catch (err) {
+      console.warn('[Community] Location error:', err);
+      setLocationStatus('denied');
+    }
   }, []);
 
   const handleSaveLocation = useCallback(async () => {

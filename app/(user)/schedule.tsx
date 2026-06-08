@@ -152,7 +152,20 @@ export default function ScheduleScreen() {
   const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
 
-  const slots = userPrediction?.daySchedule ?? [];
+  const allSlots = userPrediction?.daySchedule ?? [];
+  const nowMs = Date.now();
+
+  // Find the first slot where now falls inside it (user-offset-adjusted schedule)
+  const activeIdx = allSlots.findIndex(s => {
+    const start = new Date(s.startIso).getTime();
+    const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    return nowMs >= start && nowMs < end;
+  });
+
+  // Start display from the active (current) slot, not slot[0]
+  const startIdx = activeIdx >= 0 ? activeIdx
+    : allSlots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
+  const slots = startIdx > 0 ? allSlots.slice(startIdx) : allSlots;
 
   if (loading) {
     return (
@@ -236,7 +249,6 @@ export default function ScheduleScreen() {
         <View style={styles.timeline}>
           <Text style={styles.sectionLabel}>{AR.scheduleTitle}</Text>
           {slots.map((slot, i) => {
-            const nowMs = Date.now();
             const slotStartMs = new Date(slot.startIso).getTime();
             const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
             const isActive = nowMs >= slotStartMs && nowMs < slotEndMs;

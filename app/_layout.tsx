@@ -18,13 +18,15 @@ function AuthGate() {
   const router = useRouter();
   const segments = useSegments();
   const [onboardingChecked, setOnboardingChecked] = useState(false);
+  const [hasNavigated, setHasNavigated] = useState(false);
 
   useEffect(() => {
     AsyncStorage.getItem(ONBOARDING_KEY).then((val) => {
+      setOnboardingChecked(true);
       if (!val) {
         router.replace('/onboarding');
+        setHasNavigated(true);
       }
-      setOnboardingChecked(true);
     });
   }, []);
 
@@ -43,6 +45,7 @@ function AuthGate() {
       return;
     }
 
+    // Wait for profile to load before routing
     if (!profile) return;
 
     if (profile.role === 'admin') {
@@ -52,7 +55,8 @@ function AuthGate() {
     }
   }, [session, profile, loading, segments, onboardingChecked]);
 
-  if (loading || !onboardingChecked) {
+  // Show loading only during initial auth check, not indefinitely
+  if (loading && !onboardingChecked) {
     return (
       <View style={{ flex: 1, backgroundColor: '#060d1a', alignItems: 'center', justifyContent: 'center' }}>
         <ActivityIndicator size="large" color="#38bdf8" />
