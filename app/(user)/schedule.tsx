@@ -179,9 +179,19 @@ export default function ScheduleScreen() {
    * Stable slot time maps.
    * Key: "<state>|<roundedStartMin>" — slot identity stable across prediction refreshes.
    * Values locked at first observation to prevent display drift on DB refreshes.
+   * Both maps are cleared when computedAt changes so a genuine schedule
+   * recomputation always adopts fresh times.
    */
-  const stableStartMapRef = useRef<Record<string, string>>({});
-  const stableEndMapRef   = useRef<Record<string, string>>({});
+  const stableStartMapRef   = useRef<Record<string, string>>({});
+  const stableEndMapRef     = useRef<Record<string, string>>({});
+  const lastComputedAtRef   = useRef<string | null>(null);
+
+  const computedAt = userPrediction?.computedAt ?? null;
+  if (computedAt && computedAt !== lastComputedAtRef.current) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+    lastComputedAtRef.current = computedAt;
+  }
 
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();

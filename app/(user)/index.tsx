@@ -522,8 +522,18 @@ const utStyles = StyleSheet.create({
 // SECTION 3: Today's Timeline
 // ─────────────────────────────────────────────────────────────────────────────
 function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
-  const stableStartMapRef = useRef<Record<string, string>>({});
-  const stableEndMapRef   = useRef<Record<string, string>>({});
+  const stableStartMapRef   = useRef<Record<string, string>>({});
+  const stableEndMapRef     = useRef<Record<string, string>>({});
+  const lastComputedAtRef   = useRef<string | null>(null);
+
+  // Clear locks when a new prediction computation arrives so fresh times are adopted
+  const computedAt = prediction?.computedAt ?? null;
+  if (computedAt && computedAt !== lastComputedAtRef.current) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+    lastComputedAtRef.current = computedAt;
+  }
+
   const slots = prediction?.daySchedule ?? [];
   const nowMs = Date.now();
   const activeIdx = slots.findIndex(s => {
