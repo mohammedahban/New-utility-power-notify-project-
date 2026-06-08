@@ -549,9 +549,25 @@ export function useUserPredictions(
   // Prevents prediction DB refreshes from resetting the "منذ" elapsed counter.
   const stableStartRef = useRef<{ state: 'ON' | 'OFF'; startIso: string | null } | null>(null);
 
+  // Fetch (or re-fetch) the latest prediction row from Supabase.
+  // Extracted so it can be called both on mount and on AppState foreground resume.
+  const fetchPrediction = () => {
+    supabase
+      .from('utility_predictions')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (error) console.error('[useUserPredictions] fetch error:', error.message);
+        if (data?.prediction) setRawPrediction(data.prediction as Prediction);
+        setLoading(false);
+      });
+  };
+
   useEffect(() => {
     let cancelled = false;
 
+    // Initial fetch
     supabase
       .from('utility_predictions')
       .select('*')
@@ -569,6 +585,14 @@ export function useUserPredictions(
       setLoading(false);
     }, 8000);
 
+    // Re-fetch every time the app returns to foreground so the schedule is
+    // always fresh after the user switches back from another app.
+    const { AppState } = require('react-native') as typeof import('react-native');
+    const handleAppState = (nextState: string) => {
+      if (nextState === 'active') fetchPrediction();
+    };
+    const appStateSub = AppState.addEventListener('change', handleAppState);
+
     const channel = supabase
       .channel(`user_predictions_live_${Math.random().toString(36).slice(2)}`)
       .on('postgres_changes', {
@@ -584,6 +608,7 @@ export function useUserPredictions(
     return () => {
       cancelled = true;
       clearTimeout(timeout);
+      appStateSub.remove();
       supabase.removeChannel(channel);
     };
   }, []);

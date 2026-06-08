@@ -181,17 +181,28 @@ export default function ScheduleScreen() {
    * Values locked at first observation to prevent display drift on DB refreshes.
    * Both maps are cleared when computedAt changes so a genuine schedule
    * recomputation always adopts fresh times.
+   * Also cleared when offset_minutes changes so new offset times are adopted
+   * immediately after the user submits a report.
    */
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
   const lastComputedAtRef   = useRef<string | null>(null);
+  const lastOffsetRef       = useRef<number | null>(null);
 
-  const computedAt = userPrediction?.computedAt ?? null;
+  const computedAt    = userPrediction?.computedAt ?? null;
+  const currentOffset = offset?.offset_minutes ?? 0;
+
   if (computedAt && computedAt !== lastComputedAtRef.current) {
     stableStartMapRef.current = {};
     stableEndMapRef.current   = {};
     lastComputedAtRef.current = computedAt;
   }
+
+  if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+  }
+  lastOffsetRef.current = currentOffset;
 
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();

@@ -525,14 +525,24 @@ function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
   const lastComputedAtRef   = useRef<string | null>(null);
+  const lastOffsetRef       = useRef<number | null>(null);
 
   // Clear locks when a new prediction computation arrives so fresh times are adopted
-  const computedAt = prediction?.computedAt ?? null;
+  const computedAt    = prediction?.computedAt ?? null;
+  const currentOffset = prediction?.offsetMinutes ?? 0;
+
   if (computedAt && computedAt !== lastComputedAtRef.current) {
     stableStartMapRef.current = {};
     stableEndMapRef.current   = {};
     lastComputedAtRef.current = computedAt;
   }
+
+  // Clear locks when offset changes so newly shifted times are adopted immediately
+  if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+  }
+  lastOffsetRef.current = currentOffset;
 
   const slots = prediction?.daySchedule ?? [];
   const nowMs = Date.now();
