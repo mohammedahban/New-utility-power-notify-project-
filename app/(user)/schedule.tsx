@@ -206,9 +206,11 @@ export default function ScheduleScreen() {
   }
   lastOffsetRef.current = currentOffset;
 
-  // Clear locks when the community resync point changes so community-adjusted
-  // slot times are adopted immediately after a new report is applied.
-  if (lastResyncRef.current !== currentResyncIso) {
+  // Clear locks when the community resync point changes (new report applied)
+  // OR when resync expires and resyncPoint becomes null — ensuring slot times
+  // revert cleanly to pure offset-based values in both cases.
+  const resyncChanged = lastResyncRef.current !== currentResyncIso;
+  if (resyncChanged) {
     stableStartMapRef.current = {};
     stableEndMapRef.current   = {};
     lastResyncRef.current     = currentResyncIso;
