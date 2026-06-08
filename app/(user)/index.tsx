@@ -526,10 +526,12 @@ function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
   const stableEndMapRef     = useRef<Record<string, string>>({});
   const lastComputedAtRef   = useRef<string | null>(null);
   const lastOffsetRef       = useRef<number | null>(null);
+  const lastResyncRef       = useRef<string | null>(null);
 
   // Clear locks when a new prediction computation arrives so fresh times are adopted
-  const computedAt    = prediction?.computedAt ?? null;
-  const currentOffset = prediction?.offsetMinutes ?? 0;
+  const computedAt       = prediction?.computedAt ?? null;
+  const currentOffset    = prediction?.offsetMinutes ?? 0;
+  const currentResyncIso = prediction?.resyncedAtIso ?? null;
 
   if (computedAt && computedAt !== lastComputedAtRef.current) {
     stableStartMapRef.current = {};
@@ -543,6 +545,14 @@ function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
     stableEndMapRef.current   = {};
   }
   lastOffsetRef.current = currentOffset;
+
+  // Clear locks when the community resync point changes so community-adjusted
+  // slot times are adopted immediately after a new report is applied.
+  if (lastResyncRef.current !== currentResyncIso) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+    lastResyncRef.current     = currentResyncIso;
+  }
 
   const slots = prediction?.daySchedule ?? [];
   const nowMs = Date.now();

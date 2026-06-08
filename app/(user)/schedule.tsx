@@ -188,9 +188,11 @@ export default function ScheduleScreen() {
   const stableEndMapRef     = useRef<Record<string, string>>({});
   const lastComputedAtRef   = useRef<string | null>(null);
   const lastOffsetRef       = useRef<number | null>(null);
+  const lastResyncRef       = useRef<string | null>(null);
 
-  const computedAt    = userPrediction?.computedAt ?? null;
-  const currentOffset = offset?.offset_minutes ?? 0;
+  const computedAt      = userPrediction?.computedAt ?? null;
+  const currentOffset   = offset?.offset_minutes ?? 0;
+  const currentResyncIso = resyncPoint?.syncedAtIso ?? null;
 
   if (computedAt && computedAt !== lastComputedAtRef.current) {
     stableStartMapRef.current = {};
@@ -203,6 +205,14 @@ export default function ScheduleScreen() {
     stableEndMapRef.current   = {};
   }
   lastOffsetRef.current = currentOffset;
+
+  // Clear locks when the community resync point changes so community-adjusted
+  // slot times are adopted immediately after a new report is applied.
+  if (lastResyncRef.current !== currentResyncIso) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+    lastResyncRef.current     = currentResyncIso;
+  }
 
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();

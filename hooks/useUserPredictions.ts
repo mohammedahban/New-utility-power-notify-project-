@@ -545,9 +545,11 @@ export function useUserPredictions(
   const [rawPrediction, setRawPrediction] = useState<Prediction | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Stable startIso anchor — only reset when the utility state actually flips.
+  // Stable startIso anchor — only reset when the utility state actually flips
+  // OR when offsetMinutes changes (new report shifted the schedule).
   // Prevents prediction DB refreshes from resetting the "منذ" elapsed counter.
   const stableStartRef = useRef<{ state: 'ON' | 'OFF'; startIso: string | null } | null>(null);
+  const prevOffsetRef  = useRef<number>(offsetMinutes);
 
   // Fetch (or re-fetch) the latest prediction row from Supabase.
   // Extracted so it can be called both on mount and on AppState foreground resume.
@@ -615,6 +617,13 @@ export function useUserPredictions(
 
   const userPrediction: UserPrediction | null = rawPrediction
     ? (() => {
+        // Reset start anchor when offset changes so new slot times are adopted
+        // immediately after the user submits a report that shifts their offset.
+        if (prevOffsetRef.current !== offsetMinutes) {
+          prevOffsetRef.current  = offsetMinutes;
+          stableStartRef.current = null;
+        }
+
         const pred = applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null);
 
         // ── Stabilize currentStateStartIso ────────────────────────────────────
