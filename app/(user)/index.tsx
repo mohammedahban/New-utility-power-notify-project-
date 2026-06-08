@@ -523,6 +523,7 @@ const utStyles = StyleSheet.create({
 // ─────────────────────────────────────────────────────────────────────────────
 function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
   const stableStartMapRef = useRef<Record<string, string>>({});
+  const stableEndMapRef   = useRef<Record<string, string>>({});
   const slots = prediction?.daySchedule ?? [];
   const nowMs = Date.now();
   const activeIdx = slots.findIndex(s => {
@@ -548,7 +549,12 @@ function TodayTimeline({ prediction }: { prediction: UserPrediction | null }) {
           stableStartMapRef.current[slotKey] = currentStartF;
         }
         const startF = stableStartMapRef.current[slotKey] ?? currentStartF;
-        const endF = slot.shiftedEndFormatted ?? slot.endFormatted;
+
+        const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
+        if (!stableEndMapRef.current[slotKey] && currentEndF) {
+          stableEndMapRef.current[slotKey] = currentEndF;
+        }
+        const endF = stableEndMapRef.current[slotKey] ?? currentEndF;
         const isFuture = new Date(slot.startIso).getTime() > nowMs;
         return (
           <View key={i} style={[tlStyles.row, i < displaySlots.length - 1 && tlStyles.rowBorder]}>

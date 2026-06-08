@@ -38,11 +38,13 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
   isHolding?: boolean;
   /** Locked start time string — prevents display shifting on prediction refresh */
   stableStartFormatted?: string;
+  /** Locked end time string — prevents end-time drift on prediction refresh */
+  stableEndFormatted?: string;
 }) {
   const isOn = slot.state === 'ON';
   const color = isOn ? T.success : T.danger;
   const startTime = stableStartFormatted ?? slot.shiftedStartFormatted ?? slot.startFormatted;
-  const endTime = slot.shiftedEndFormatted ?? slot.endFormatted;
+  const endTime = stableEndFormatted ?? slot.shiftedEndFormatted ?? slot.endFormatted;
   const zoneAr = (AR as any)[slot.zone] ?? slot.zone;
 
   const slotStartMs = startTime ? parseFormattedTime(startTime) : null;
@@ -174,14 +176,12 @@ export default function ScheduleScreen() {
   const { history: resyncHistory } = useResyncNotifications();
 
   /**
-   * Stable slot start-time map.
-   * Key: "<state>|<originalStartIso>" — a slot identity that doesn't change across
-   * prediction refreshes as long as the underlying schedule hasn't shifted.
-   * Value: the formatted start time string locked at first observation.
-   * This prevents the displayed start time from jumping every time
-   * the DB prediction refreshes and recomputes slot boundaries.
+   * Stable slot time maps.
+   * Key: "<state>|<roundedStartMin>" — slot identity stable across prediction refreshes.
+   * Values locked at first observation to prevent display drift on DB refreshes.
    */
   const stableStartMapRef = useRef<Record<string, string>>({});
+  const stableEndMapRef   = useRef<Record<string, string>>({});
 
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();
@@ -294,6 +294,12 @@ export default function ScheduleScreen() {
             }
             const stableStart = stableStartMapRef.current[slotKey];
 
+            const currentEndFormatted = slot.shiftedEndFormatted ?? slot.endFormatted;
+            if (!stableEndMapRef.current[slotKey] && currentEndFormatted) {
+              stableEndMapRef.current[slotKey] = currentEndFormatted;
+            }
+            const stableEnd = stableEndMapRef.current[slotKey];
+
             return (
             <ScheduleBlock
               key={i} slot={slot} index={i}
@@ -302,6 +308,7 @@ export default function ScheduleScreen() {
               atcMode={userPrediction?.atc?.mode}
               isHolding={userPrediction?.isHoldingState}
               stableStartFormatted={stableStart}
+              stableEndFormatted={stableEnd}
             />
             );
           })}
