@@ -607,8 +607,9 @@ const tlStyles = StyleSheet.create({
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 4: Community Activity
 // ─────────────────────────────────────────────────────────────────────────────
-function CommunityActivity({ pendingAlerts, onViewAll, userId }: {
+function CommunityActivity({ pendingAlerts, onViewAll, userId, onReporterPress }: {
   pendingAlerts: number; onViewAll: () => void; userId?: string;
+  onReporterPress?: (reporterId: string) => void;
 }) {
   const [recentReports, setRecentReports] = useState<any[]>([]);
   useEffect(() => {
@@ -660,7 +661,9 @@ function CommunityActivity({ pendingAlerts, onViewAll, userId }: {
             </View>
             <View style={caStyles.reportLeft}>
               <Text style={[caStyles.reportState, { color }]}>{isOn ? '⚡ اشتغلت الكهرباء' : '🔴 طفت الكهرباء'}</Text>
-              <Text style={caStyles.reportUser}>أفاد {r.username}</Text>
+              <TouchableOpacity onPress={() => onReporterPress?.(r.reporter_id)} activeOpacity={0.7} disabled={!onReporterPress}>
+                <Text style={caStyles.reportUser}>أفاد <Text style={{ color: T.accent, fontWeight: '700' }}>{r.username}</Text></Text>
+              </TouchableOpacity>
             </View>
           </View>
         );
@@ -843,6 +846,7 @@ export default function Home() {
         pendingAlerts={pendingCount}
         onViewAll={() => router.push('/(user)/community')}
         userId={profile?.id}
+        onReporterPress={(rid) => router.push(`/(user)/reporter/${rid}` as any)}
       />
     </ScrollView>
   );

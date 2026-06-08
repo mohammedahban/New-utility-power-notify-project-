@@ -233,6 +233,19 @@ export default function UserLayout() {
             tabBarIcon: ({ color, size }) => <Ionicons name="person-circle-outline" size={size} color={color} />,
           }}
         />
+        {/* Hidden screens — not shown in tab bar */}
+        <Tabs.Screen
+          name="reporter/[id]"
+          options={{
+            href: null,
+            headerShown: true,
+            headerTitle: 'الملف الشخصي',
+            headerStyle: { backgroundColor: '#060d1a' },
+            headerTintColor: '#38bdf8',
+            headerTitleStyle: { fontWeight: '700', fontSize: 17, color: '#f1f5f9' },
+            tabBarButton: () => null,
+          }}
+        />
       </Tabs>
     </View>
   );

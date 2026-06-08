@@ -5,6 +5,7 @@ import {
   Animated,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useRouter } from 'expo-router';
 import * as Location from 'expo-location';
 import { useNearbyUsers } from '../../hooks/useNearbyUsers';
 import { useFollows } from '../../hooks/useFollows';
@@ -134,9 +135,10 @@ const rmStyles = StyleSheet.create({
 });
 
 // ── Notification Card ─────────────────────────────────────────────────────────
-function NotifCard({ notif, onRespond }: {
+function NotifCard({ notif, onRespond, onReporterPress }: {
   notif: any;
   onRespond: (notif: any, response: 'yes' | 'no' | 'ignore') => void;
+  onReporterPress?: (reporterId: string) => void;
 }) {
   const isExpired = new Date(notif.expires_at) < new Date();
   const stateLabel = notif.reported_state === 'UTILITY_ON' ? AR.electricityCameOn : AR.electricityWentOff;
@@ -173,7 +175,9 @@ function NotifCard({ notif, onRespond }: {
       <View style={ncStyles.header}>
         <Text style={ncStyles.expiry}>⏱ {expiresMin} {AR.minutesLeft}</Text>
         <Text style={ncStyles.reporterLine}>
-          {stateEmoji} <Text style={{ color: T.textPrimary, fontWeight: '700' }}>{notif.reporter_username ?? 'شخص ما'}</Text>
+          {stateEmoji} <TouchableOpacity onPress={() => onReporterPress?.(notif.reporter_id)} activeOpacity={0.7} disabled={!onReporterPress}>
+            <Text style={[ncStyles.reporterLine, { color: T.accent, fontWeight: '700' }]}>{notif.reporter_username ?? 'شخص ما'}</Text>
+          </TouchableOpacity>
           {' '}{AR.reportedBy} {stateLabel}
         </Text>
       </View>
@@ -643,6 +647,7 @@ const hcStyles = StyleSheet.create({
 export default function CommunityScreen() {
   const insets = useSafeAreaInsets();
   const { user } = useAuth();
+  const router = useRouter();
   const [tab, setTab] = useState<Tab>('nearby');
   const [myLat, setMyLat] = useState<number | null>(null);
   const [myLon, setMyLon] = useState<number | null>(null);
@@ -934,7 +939,7 @@ export default function CommunityScreen() {
               {AR.communityAlerts} — {pendingCount > 0 ? `${pendingCount} ${AR.awaitingResponse}` : AR.allCaughtUp}
             </Text>
           )}
-          renderItem={({ item }) => <NotifCard notif={item} onRespond={handleRespond} />}
+          renderItem={({ item }) => <NotifCard notif={item} onRespond={handleRespond} onReporterPress={(rid) => router.push(`/(user)/reporter/${rid}` as any)} />}
           ListEmptyComponent={() => (
             notifLoading ? null : (
               <View style={styles.emptyBox}>
