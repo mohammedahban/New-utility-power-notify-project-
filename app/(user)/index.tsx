@@ -80,6 +80,10 @@ function PersonalStatusCard({ prediction, anchorStartIso }: {
   // Elapsed driven by the persistent anchor — never resets on prediction refresh
   const elapsed = useElapsedFromIso(anchorStartIso);
 
+  // Community sync elapsed — called unconditionally to satisfy Rules of Hooks
+  const meta = prediction?.communitySyncMeta;
+  const syncElapsed = useElapsedFromIso(meta?.syncedAtIso ?? null);
+
   // Remaining time (only when NOT holding)
   const currentSlot = (() => {
     const slots = prediction?.daySchedule ?? [];
@@ -116,11 +120,8 @@ function PersonalStatusCard({ prediction, anchorStartIso }: {
 
   // COMMUNITY_SYNCED: show rich reporter card
   if (atcMode === 'COMMUNITY_SYNCED') {
-    const meta = prediction?.communitySyncMeta;
     const reporterName = meta?.reporterName ?? 'مجهول';
     const reporterRel = meta?.reporterReliability;
-    // For community sync, elapsed since the sync point itself
-    const syncElapsed = useElapsedFromIso(meta?.syncedAtIso ?? null);
     return (
       <View style={[psStyles.card, { borderColor: color + '50' }]}>
         <Text style={psStyles.cardTitle}>⚡ حالتي الكهربائية</Text>
