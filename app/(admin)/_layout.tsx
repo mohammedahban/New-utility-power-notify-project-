@@ -48,6 +48,8 @@ export default function AdminLayout() {
         }}
       />
       <Stack.Screen name="conflicts" options={{ title: AR.conflictsTitle }} />
+      <Stack.Screen name="accuracy" options={{ title: 'دقة التوقعات' }} />
+      <Stack.Screen name="offset-analytics" options={{ title: 'تحليل الفوارق الزمنية' }} />
     </Stack>
   );
 }

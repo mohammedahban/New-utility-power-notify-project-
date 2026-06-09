@@ -188,6 +188,52 @@ Deno.serve(async (req) => {
     } catch (err) {
       console.error("[poll-growatt] analyze-patterns trigger failed:", err);
     }
+
+    // ── Log prediction accuracy (read-only analytics — never affects predictions) ──
+    try {
+      const MAX_ALLOWED_ERROR_MIN = 150; // 100% error at 150 min
+      const { data: latestPred } = await supabase
+        .from("utility_predictions")
+        .select("prediction, computed_at")
+        .eq("id", 1)
+        .maybeSingle();
+
+      if (latestPred?.prediction) {
+        const pred = latestPred.prediction as any;
+        const slots: any[] = pred.slots ?? pred.schedule ?? [];
+        const eventType = utilityIsOn ? "UTILITY_ON" : "UTILITY_OFF";
+        const targetState = utilityIsOn ? "ON" : "OFF";
+
+        // Find the slot whose predicted transition matches the actual event
+        const matchingSlot = slots.find((s: any) => s.state === targetState);
+        if (matchingSlot) {
+          const predictedIso: string = matchingSlot.startIso ?? matchingSlot.start_iso ?? matchingSlot.shiftedStartIso;
+          if (predictedIso) {
+            const predictedMs = new Date(predictedIso).getTime();
+            const actualMs = new Date(now).getTime();
+            const errorMin = Math.abs((actualMs - predictedMs) / 60_000);
+            const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
+            const confidence = typeof matchingSlot.confidence === "number" ? matchingSlot.confidence : null;
+
+            await supabase.from("prediction_accuracy_logs").insert({
+              predicted_event_time: predictedIso,
+              actual_event_time: now,
+              predicted_state: eventType,
+              actual_state: eventType,
+              error_minutes: Math.round(errorMin * 100) / 100,
+              accuracy_score: Math.round(accuracyScore * 100) / 100,
+              confidence_score: confidence,
+              prediction_generated_at: latestPred.computed_at ?? null,
+              slot_id: matchingSlot.slotId ?? matchingSlot.slot_id ?? null,
+            });
+            console.log(`[poll-growatt] Accuracy logged: error=${errorMin.toFixed(1)}min score=${accuracyScore.toFixed(1)}%`);
+          }
+        }
+      }
+    } catch (accErr) {
+      // Analytics failure must never break the main polling loop
+      console.error("[poll-growatt] Accuracy log failed (non-fatal):", accErr);
+    }
   }
 
   // ── 6. Upsert live state ───────────────────────────────────────────────────

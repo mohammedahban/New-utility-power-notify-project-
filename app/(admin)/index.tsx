@@ -255,6 +255,31 @@ export default function AdminDashboard() {
 
       <ResyncTimeline conflictsCount={conflictsCount} onViewConflicts={() => router.push('/(admin)/conflicts')} />
 
+      {/* Analytics Hub */}
+      <View style={styles.analyticsSection}>
+        <Text style={styles.sectionTitle}>📈  مركز التحليلات المتقدمة</Text>
+        <View style={styles.analyticsRow}>
+          <TouchableOpacity
+            style={[styles.analyticsCard, { borderColor: '#22c55e44' }]}
+            onPress={() => router.push('/(admin)/accuracy')}
+            activeOpacity={0.75}
+          >
+            <Text style={styles.analyticsIcon}>🎯</Text>
+            <Text style={[styles.analyticsTitle, { color: '#22c55e' }]}>دقة التوقعات</Text>
+            <Text style={styles.analyticsSub}>قياس مدى دقة APPPE‏مقارنةً بأحداث Growatt الفعلية</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.analyticsCard, { borderColor: '#38bdf844' }]}
+            onPress={() => router.push('/(admin)/offset-analytics')}
+            activeOpacity={0.75}
+          >
+            <Text style={styles.analyticsIcon}>📊</Text>
+            <Text style={[styles.analyticsTitle, { color: '#38bdf8' }]}>الفوارق الزمنية</Text>
+            <Text style={styles.analyticsSub}>توزيع فوارق المستخدمين والتجمعات الجغرافية</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
       <View style={styles.navRow}>
         <TouchableOpacity style={[styles.navBtn, { flex: 1 }]} onPress={() => router.push('/(admin)/settings')} activeOpacity={0.75}>
           <Text style={styles.navBtnText}>{AR.settingsNav}</Text>
@@ -289,6 +314,12 @@ const styles = StyleSheet.create({
   emptyIcon: { fontSize: 36, marginBottom: 10 },
   emptyTitle: { color: '#94a3b8', fontSize: 16, fontWeight: '700', marginBottom: 8, textAlign: 'center' },
   emptyText: { color: '#475569', fontSize: 13, textAlign: 'center', lineHeight: 20 },
+  analyticsSection: { marginTop: 20 },
+  analyticsRow: { flexDirection: 'row-reverse', gap: 10, marginTop: 10 },
+  analyticsCard: { flex: 1, backgroundColor: '#1e293b', borderRadius: 16, padding: 16, borderWidth: 1, gap: 6 },
+  analyticsIcon: { fontSize: 24 },
+  analyticsTitle: { fontSize: 13, fontWeight: '800', textAlign: 'right' },
+  analyticsSub: { color: '#64748b', fontSize: 11, lineHeight: 16, textAlign: 'right' },
   navRow: { marginTop: 20, flexDirection: 'row-reverse', gap: 8 },
   navBtn: { backgroundColor: '#1e293b', padding: 16, borderRadius: 14, alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
   navBtnAccent: { borderColor: '#4c1d95', backgroundColor: '#1a1035' },
