@@ -185,10 +185,15 @@ serve(async (req) => {
       to: t.token,
       title: `${stateEmoji} بلاغ من ${reporterName}`,
       body: `أفاد ${reporterName} أن ${stateAr} (${timeAr}) — هل هذا صحيح في موقعك؟`,
-      data: { type: 'community_resync', reportId },
-      priority: 'high',
-      sound: 'default',
-      channelId: 'community-alerts',
+      // Highest delivery priority so the 30-minute window is never missed
+      priority: "high",
+      _displayInForeground: true,
+      sound: "default",
+      channelId: "community-alerts",
+      // Keep alive for 20 minutes (validation window duration)
+      ttl: 1200,
+      badge: 1,
+      data: { type: "community_resync", reportId },
     }));
 
     if (pushMessages.length > 0) {

@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useCallback } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, ActivityIndicator,
   TouchableOpacity, RefreshControl,
@@ -8,6 +8,89 @@ import { usePredictions, Prediction, PatternStats } from '../../hooks/usePredict
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 import { applyOffsetToPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
+
+// ── Latest Accuracy Pill ──────────────────────────────────────────────────────
+interface LatestAccuracyEntry {
+  accuracy_score: number;
+  error_minutes: number;
+  predicted_state: string;
+  created_at: string;
+}
+
+function useLatestAccuracy() {
+  const [entry, setEntry] = useState<LatestAccuracyEntry | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetch = useCallback(async () => {
+    try {
+      const { data } = await supabase
+        .from('prediction_accuracy_logs')
+        .select('accuracy_score, error_minutes, predicted_state, created_at')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      setEntry(data as LatestAccuracyEntry | null);
+    } catch { /* non-fatal */ }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { fetch(); }, [fetch]);
+  return { entry, loading, refetch: fetch };
+}
+
+function LatestAccuracyPill({ onPress }: { onPress?: () => void }) {
+  const { entry, loading } = useLatestAccuracy();
+
+  if (loading) {
+    return (
+      <View style={lapStyles.pill}>
+        <ActivityIndicator size="small" color="#64748b" />
+      </View>
+    );
+  }
+
+  if (!entry) return null;
+
+  const score = Math.round(entry.accuracy_score);
+  const errorMin = Math.round(entry.error_minutes);
+  const color = score >= 85 ? '#22c55e' : score >= 65 ? '#f59e0b' : '#ef4444';
+  const isOn = entry.predicted_state === 'UTILITY_ON';
+  const stateIcon = isOn ? '⚡' : '🔴';
+  const timeAgo = Math.round((Date.now() - new Date(entry.created_at).getTime()) / 60_000);
+  const timeLabel = timeAgo < 60 ? `${timeAgo}د` : `${Math.round(timeAgo / 60)}س`;
+
+  return (
+    <TouchableOpacity
+      style={[lapStyles.pill, { borderColor: color + '55', backgroundColor: color + '12' }]}
+      onPress={onPress}
+      activeOpacity={0.8}
+    >
+      <Text style={lapStyles.sub}>آخر دقة · {timeLabel} مضت</Text>
+      <View style={lapStyles.row}>
+        <Text style={lapStyles.error}>{errorMin}د خطأ</Text>
+        <Text style={lapStyles.sep}>·</Text>
+        <Text style={lapStyles.state}>{stateIcon}</Text>
+        <Text style={[lapStyles.score, { color }]}>{score}%</Text>
+        <Text style={lapStyles.label}>دقة التوقع</Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+const lapStyles = StyleSheet.create({
+  pill: {
+    borderRadius: 14, borderWidth: 1, borderColor: '#334155',
+    paddingHorizontal: 14, paddingVertical: 10, marginBottom: 12,
+    backgroundColor: '#1e293b',
+  },
+  row: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6 },
+  label: { color: '#64748b', fontSize: 11, fontWeight: '700', letterSpacing: 0.8, flex: 1, textAlign: 'right' },
+  score: { fontSize: 18, fontWeight: '900' },
+  state: { fontSize: 14 },
+  sep: { color: '#334155', fontSize: 12 },
+  error: { color: '#64748b', fontSize: 11, fontWeight: '600' },
+  sub: { color: '#475569', fontSize: 10, textAlign: 'right', marginBottom: 4 },
+});
 
 // ── ATC System-Wide Indicator ─────────────────────────────────────────────────
 function ATCSystemIndicator({ prediction }: { prediction: Prediction | null }) {
@@ -409,6 +492,7 @@ export default function AdminPredictions() {
     return <View style={styles.centered}><ActivityIndicator size="large" color="#38bdf8" /><Text style={styles.loadingText}>{AR.analyzingPatterns}</Text></View>;
   }
 
+
   const showAutoRefreshBanner = autoRefreshing && !refreshing;
 
   if (!prediction) {
@@ -441,6 +525,9 @@ export default function AdminPredictions() {
           <ActivityIndicator size="small" color="#38bdf8" style={{ marginLeft: 8 }} />
         </View>
       )}
+
+      <LatestAccuracyPill />
+
       <View style={[styles.stateBar, { borderColor: isOn ? '#22c55e' : '#ef4444' }]}>
         <Text style={styles.stateBarLabel}>{AR.currentState}</Text>
         <Text style={[styles.stateBarValue, { color: isOn ? '#22c55e' : '#ef4444' }]}>{isOn ? '⚡ ' + AR.gridOn : '🔴 ' + AR.gridOff}</Text>

@@ -139,8 +139,12 @@ Deno.serve(async (req) => {
           : `انقطعت الكهرباء الساعة ${localTimeAr} — يعمل على الطاقة الشمسية/البطارية`,
         sound: "alarm.wav",
         channelId: "grid-monitor",
+        // Highest delivery priority on both Android (FCM high) and iOS (APNs priority 10)
         priority: "high",
-        ttl: 60,
+        _displayInForeground: true,
+        // Keep notification alive for 10 minutes in case device is briefly offline
+        ttl: 600,
+        badge: 1,
         data: {
           eventType,
           occurred_at: now,

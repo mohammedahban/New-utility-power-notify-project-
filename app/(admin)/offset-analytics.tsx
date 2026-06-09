@@ -2,12 +2,14 @@
  * Offset Analytics Center — Admin Analytics Module 2
  * Read-only aggregation. Never modifies offset calculation logic.
  */
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, TouchableOpacity,
-  ActivityIndicator, RefreshControl,
+  ActivityIndicator, RefreshControl, Platform, Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system';
 import { supabase } from '../../lib/supabase';
 
 const T = {
@@ -25,12 +27,11 @@ interface OffsetUser {
 }
 
 interface BucketEntry {
-  bucket: number; // e.g. -120, -90, ..., +120
+  bucket: number;
   count: number;
   pct: number;
 }
 
-// Round to nearest 30-minute bucket
 function toBucket(min: number): number {
   return Math.round(min / 30) * 30;
 }
@@ -52,6 +53,48 @@ function clusterColor(bucket: number): string {
   if (bucket > 45) return '#a78bfa';
   return '#22c55e';
 }
+
+// ── Export helper ────────────────────────────────────────────────────────────
+async function exportOffsetCSV(distribution: BucketEntry[]) {
+  try {
+    const header = 'bucket_minutes,count,pct\n';
+    const rows = distribution.map(e => `${e.bucket},${e.count},${e.pct}`).join('\n');
+    const csv = header + rows;
+
+    if (Platform.OS === 'web') {
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `offset_distribution_${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      return;
+    }
+
+    const filename = `offset_distribution_${new Date().toISOString().slice(0, 10)}.csv`;
+    const fileUri = (FileSystem.cacheDirectory ?? '') + filename;
+    await FileSystem.writeAsStringAsync(fileUri, csv, { encoding: FileSystem.EncodingType.UTF8 });
+
+    const canShare = await Sharing.isAvailableAsync();
+    if (canShare) {
+      await Sharing.shareAsync(fileUri, {
+        mimeType: 'text/csv',
+        dialogTitle: 'تصدير توزيع الفوارق الزمنية',
+        UTI: 'public.comma-separated-values-text',
+      });
+    } else {
+      Alert.alert('التصدير غير متاح', 'المشاركة غير مدعومة على هذا الجهاز.');
+    }
+  } catch (err) {
+    console.error('[offset-export] error:', err);
+    Alert.alert('خطأ في التصدير', 'فشل تصدير البيانات. يرجى المحاولة مجدداً.');
+  }
+}
+
+// ── Sub-components ───────────────────────────────────────────────────────────
 
 function DistributionBar({ entry, maxCount }: { entry: BucketEntry; maxCount: number }) {
   const color = clusterColor(entry.bucket);
@@ -98,8 +141,8 @@ function ClusterCard({ label, users, color }: { label: string; users: OffsetUser
           <Text style={ccStyles.statLabel}>متوسط الفارق</Text>
         </View>
         <View style={ccStyles.stat}>
-          <Text style={ccStyles.statVal}>{Math.round((users.length / users.length) * 100)}%</Text>
-          <Text style={ccStyles.statLabel}>من الكتلة</Text>
+          <Text style={ccStyles.statVal}>{users.length}</Text>
+          <Text style={ccStyles.statLabel}>عدد المستخدمين</Text>
         </View>
       </View>
     </View>
@@ -119,11 +162,8 @@ const ccStyles = StyleSheet.create({
 
 function StabilityCard({ users }: { users: OffsetUser[] }) {
   const now = Date.now();
-  const stable = users.filter(u => now - new Date(u.updated_at).getTime() > 7 * 86400000);
-  const moderate = users.filter(u => {
-    const age = now - new Date(u.updated_at).getTime();
-    return age >= 2 * 86400000 && age <= 7 * 86400000;
-  });
+  const stable   = users.filter(u => now - new Date(u.updated_at).getTime() > 7 * 86400000);
+  const moderate = users.filter(u => { const a = now - new Date(u.updated_at).getTime(); return a >= 2 * 86400000 && a <= 7 * 86400000; });
   const unstable = users.filter(u => now - new Date(u.updated_at).getTime() < 2 * 86400000);
   const total = users.length || 1;
   return (
@@ -132,9 +172,9 @@ function StabilityCard({ users }: { users: OffsetUser[] }) {
       <Text style={stabStyles.sub}>يقيس عدد أيام ثبات الفارق</Text>
       <View style={stabStyles.row}>
         {[
-          { label: 'مستقر', count: stable.length, color: T.success, desc: '> 7 أيام' },
-          { label: 'متوسط', count: moderate.length, color: T.warning, desc: '2–7 أيام' },
-          { label: 'متغيّر', count: unstable.length, color: T.danger, desc: '< يومان' },
+          { label: 'مستقر',  count: stable.length,   color: T.success, desc: '> 7 أيام'  },
+          { label: 'متوسط',  count: moderate.length, color: T.warning, desc: '2–7 أيام'  },
+          { label: 'متغيّر', count: unstable.length, color: T.danger,  desc: '< يومان'  },
         ].map(s => (
           <View key={s.label} style={stabStyles.cell}>
             <Text style={[stabStyles.val, { color: s.color }]}>{s.count}</Text>
@@ -178,7 +218,6 @@ function SmartRecommendations({ distribution, users }: { distribution: BucketEnt
     recs.push(`أكثر من نصف المستخدمين في النطاق المحايد — أنماط APPPE الحالية تتوافق جيداً مع الأغلبية.`);
   }
   if (recs.length === 0) recs.push('التوزيع الزمني متوازن. لا توجد توصيات فورية.');
-
   return (
     <View style={recStyles.card}>
       <Text style={recStyles.title}>💡 توصيات ذكية</Text>
@@ -199,17 +238,19 @@ const recStyles = StyleSheet.create({
   text: { color: '#94a3b8', fontSize: 13, flex: 1, lineHeight: 19, textAlign: 'right' },
 });
 
+// ── Screen ───────────────────────────────────────────────────────────────────
+
 export default function OffsetAnalyticsScreen() {
   const insets = useSafeAreaInsets();
-  const [users, setUsers] = useState<OffsetUser[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [users, setUsers]         = useState<OffsetUser[]>([]);
+  const [loading, setLoading]     = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [computedAt, setComputedAt] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      // Fetch all user offsets
       const { data: offsets, error } = await supabase
         .from('user_offsets')
         .select('user_id, offset_minutes, updated_at')
@@ -217,14 +258,9 @@ export default function OffsetAnalyticsScreen() {
       if (error) { console.error('[offset-analytics] error:', error.message); setLoading(false); return; }
 
       const rows = (offsets ?? []) as OffsetUser[];
-
-      // Enrich with usernames
       const uids = rows.map(r => r.user_id);
       if (uids.length > 0) {
-        const { data: profiles } = await supabase
-          .from('user_profiles')
-          .select('id, username')
-          .in('id', uids);
+        const { data: profiles } = await supabase.from('user_profiles').select('id, username').in('id', uids);
         const nameMap: Record<string, string | null> = {};
         for (const p of profiles ?? []) nameMap[p.id] = p.username;
         setUsers(rows.map(r => ({ ...r, username: nameMap[r.user_id] ?? null })));
@@ -244,24 +280,32 @@ export default function OffsetAnalyticsScreen() {
     setRefreshing(false);
   }, [fetchData]);
 
-  // Build distribution
-  const distribution: BucketEntry[] = [];
-  const bucketMap: Record<number, number> = {};
-  for (const u of users) {
-    const b = toBucket(u.offset_minutes);
-    bucketMap[b] = (bucketMap[b] ?? 0) + 1;
-  }
-  const allBuckets = Object.keys(bucketMap).map(Number).sort((a, b) => a - b);
-  for (const b of allBuckets) {
-    distribution.push({ bucket: b, count: bucketMap[b], pct: Math.round((bucketMap[b] / Math.max(users.length, 1)) * 100) });
-  }
-  const maxCount = Math.max(...distribution.map(d => d.count), 1);
-  const mostCommon = distribution.reduce((a, b) => a.count >= b.count ? a : b, distribution[0]);
+  // Build distribution (memoized so export callback is stable)
+  const distribution = useMemo<BucketEntry[]>(() => {
+    const bucketMap: Record<number, number> = {};
+    for (const u of users) {
+      const b = toBucket(u.offset_minutes);
+      bucketMap[b] = (bucketMap[b] ?? 0) + 1;
+    }
+    const allBuckets = Object.keys(bucketMap).map(Number).sort((a, b) => a - b);
+    return allBuckets.map(b => ({
+      bucket: b,
+      count: bucketMap[b],
+      pct: Math.round((bucketMap[b] / Math.max(users.length, 1)) * 100),
+    }));
+  }, [users]);
 
-  // Cluster users
-  const earlyUsers = users.filter(u => u.offset_minutes < -45);
+  const maxCount    = Math.max(...distribution.map(d => d.count), 1);
+  const mostCommon  = distribution.reduce<BucketEntry | null>((a, b) => !a || b.count > a.count ? b : a, null);
+  const earlyUsers  = users.filter(u => u.offset_minutes < -45);
   const neutralUsers = users.filter(u => Math.abs(u.offset_minutes) <= 45);
-  const lateUsers = users.filter(u => u.offset_minutes > 45);
+  const lateUsers   = users.filter(u => u.offset_minutes > 45);
+
+  const handleExport = useCallback(async () => {
+    setExporting(true);
+    await exportOffsetCSV(distribution);
+    setExporting(false);
+  }, [distribution]);
 
   return (
     <ScrollView
@@ -283,6 +327,19 @@ export default function OffsetAnalyticsScreen() {
         </View>
       ) : (
         <>
+          {/* Export CSV */}
+          <TouchableOpacity
+            style={styles.exportBtn}
+            onPress={handleExport}
+            disabled={exporting}
+            activeOpacity={0.8}
+          >
+            {exporting
+              ? <ActivityIndicator size="small" color={T.accent} />
+              : <Text style={styles.exportBtnText}>📤  تصدير CSV  ·  {distribution.length} صف</Text>
+            }
+          </TouchableOpacity>
+
           {/* Summary pills */}
           <View style={styles.pillsRow}>
             <View style={styles.pill}>
@@ -297,7 +354,9 @@ export default function OffsetAnalyticsScreen() {
             </View>
             <View style={styles.pill}>
               <Text style={styles.pillVal}>
-                {users.length > 0 ? fmtOffset(Math.round(users.reduce((s, u) => s + u.offset_minutes, 0) / users.length)) : '0'}
+                {users.length > 0
+                  ? fmtOffset(Math.round(users.reduce((s, u) => s + u.offset_minutes, 0) / users.length))
+                  : '0'}
               </Text>
               <Text style={styles.pillLabel}>متوسط الفوارق</Text>
             </View>
@@ -328,16 +387,19 @@ export default function OffsetAnalyticsScreen() {
             </View>
           </View>
 
-          {/* Most common offset highlight */}
+          {/* Most common offset */}
           {mostCommon && (
             <View style={styles.highlightCard}>
-              <View style={styles.highlightLeft}>
+              <View>
                 <Text style={styles.highlightVal}>{fmtOffset(mostCommon.bucket)}</Text>
                 <Text style={styles.highlightSub}>الفارق الأكثر شيوعاً</Text>
               </View>
-              <View style={styles.highlightRight}>
+              <View style={{ alignItems: 'flex-start', gap: 6 }}>
                 <Text style={styles.highlightCount}>{mostCommon.count} مستخدم</Text>
-                <View style={[styles.clusterChip, { backgroundColor: clusterColor(mostCommon.bucket) + '22', borderColor: clusterColor(mostCommon.bucket) + '55' }]}>
+                <View style={[styles.clusterChip, {
+                  backgroundColor: clusterColor(mostCommon.bucket) + '22',
+                  borderColor:     clusterColor(mostCommon.bucket) + '55',
+                }]}>
                   <Text style={[styles.clusterChipText, { color: clusterColor(mostCommon.bucket) }]}>
                     {clusterLabel(mostCommon.bucket)}
                   </Text>
@@ -346,11 +408,11 @@ export default function OffsetAnalyticsScreen() {
             </View>
           )}
 
-          {/* Cluster breakdown */}
+          {/* Clusters */}
           <View style={styles.clustersRow}>
-            <ClusterCard label="مبكرون" users={earlyUsers} color={T.accent} />
+            <ClusterCard label="مبكرون"  users={earlyUsers}   color={T.accent}  />
             <ClusterCard label="محايدون" users={neutralUsers} color={T.success} />
-            <ClusterCard label="متأخرون" users={lateUsers} color="#a78bfa" />
+            <ClusterCard label="متأخرون" users={lateUsers}    color="#a78bfa"   />
           </View>
 
           <StabilityCard users={users} />
@@ -360,7 +422,7 @@ export default function OffsetAnalyticsScreen() {
           <View style={styles.card}>
             <Text style={styles.cardTitle}>قائمة المستخدمين ({users.length})</Text>
             {users.slice(0, 40).map((u, i) => {
-              const color = clusterColor(u.offset_minutes);
+              const color   = clusterColor(u.offset_minutes);
               const daysAgo = Math.floor((Date.now() - new Date(u.updated_at).getTime()) / 86400000);
               return (
                 <View key={u.user_id} style={[styles.userRow, i > 0 && { borderTopWidth: 1, borderTopColor: T.elevated }]}>
@@ -378,7 +440,9 @@ export default function OffsetAnalyticsScreen() {
 
           {computedAt && (
             <Text style={styles.computedAt}>
-              حُسب في {new Date(computedAt).toLocaleString('ar-SA', { timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short' })} (اليمن)
+              حُسب في {new Date(computedAt).toLocaleString('ar-SA', {
+                timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short',
+              })} (اليمن)
             </Text>
           )}
         </>
@@ -390,6 +454,12 @@ export default function OffsetAnalyticsScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: T.bg },
   content: { paddingHorizontal: 16, paddingTop: 12 },
+  exportBtn: {
+    flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center',
+    backgroundColor: '#001a2e', borderRadius: 14, paddingVertical: 13, paddingHorizontal: 18,
+    marginBottom: 14, borderWidth: 1.5, borderColor: T.accent + '55', gap: 8, minHeight: 48,
+  },
+  exportBtnText: { color: T.accent, fontSize: 14, fontWeight: '700' },
   card: { backgroundColor: T.surface, borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: T.border },
   cardHeader: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
   cardTitle: { color: '#64748b', fontSize: 11, fontWeight: '700', letterSpacing: 1, textAlign: 'right' },
@@ -402,11 +472,13 @@ const styles = StyleSheet.create({
   legendItem: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5 },
   legendDot: { width: 8, height: 8, borderRadius: 4 },
   legendText: { color: '#64748b', fontSize: 10 },
-  highlightCard: { backgroundColor: '#001a2e', borderRadius: 16, padding: 16, marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: T.accent + '44' },
-  highlightLeft: {},
+  highlightCard: {
+    backgroundColor: '#001a2e', borderRadius: 16, padding: 16, marginBottom: 14,
+    flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between',
+    borderWidth: 1, borderColor: T.accent + '44',
+  },
   highlightVal: { color: T.accent, fontSize: 32, fontWeight: '900', textAlign: 'right' },
   highlightSub: { color: '#64748b', fontSize: 11, textAlign: 'right' },
-  highlightRight: { alignItems: 'flex-start', gap: 6 },
   highlightCount: { color: '#94a3b8', fontSize: 16, fontWeight: '700' },
   clusterChip: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
   clusterChipText: { fontSize: 11, fontWeight: '700' },
