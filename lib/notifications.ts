@@ -41,32 +41,50 @@ Notifications.setNotificationHandler({
 });
 
 // ── Android Channel Setup ─────────────────────────────────────────────────────
+// Both channels are created eagerly at module load time (Android 8+ requires
+// channels to exist BEFORE a push arrives or the notification is silently dropped).
 async function ensureAndroidChannel() {
   if (Platform.OS !== 'android') return;
   await Notifications.setNotificationChannelAsync('grid-monitor', {
-    name: 'Grid Monitor Alerts',
-    description: 'Utility power ON/OFF alerts',
+    name: 'تنبيهات الكهرباء — Grid Monitor',
+    description: 'إشعارات فورية عند تغيّر حالة الكهرباء (تشغيل / انقطاع)',
+    // IMPORTANCE_HIGH (4) wakes screen + shows heads-up on Android 8+
+    // Use MAX (5) so the alarm sound is always audible
     importance: Notifications.AndroidImportance.MAX,
-    vibrationPattern: [0, 400, 200, 400],
+    vibrationPattern: [0, 400, 200, 400, 200, 400],
     lightColor: '#22c55e',
-    sound: 'alarm.wav',      // custom sound file (must match assets/sounds/alarm.wav)
+    enableLights: true,
     enableVibrate: true,
+    sound: 'alarm.wav',   // must match assets/sounds/alarm.wav
     showBadge: true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    bypassDnd: false,
   });
 }
 
 async function ensureCommunityAndroidChannel() {
   if (Platform.OS !== 'android') return;
   await Notifications.setNotificationChannelAsync('community-alerts', {
-    name: 'Community Grid Alerts',
-    description: 'Resync notifications from trusted nearby users',
+    name: 'تنبيهات المجتمع — Community Alerts',
+    description: 'إشعارات المزامنة المجتمعية من المستخدمين الموثوقين',
     importance: Notifications.AndroidImportance.HIGH,
-    vibrationPattern: [0, 250, 150, 250],
+    vibrationPattern: [0, 250, 150, 250, 150, 250],
     lightColor: '#38bdf8',
-    sound: 'default',
+    enableLights: true,
     enableVibrate: true,
+    sound: 'default',
     showBadge: true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    bypassDnd: false,
   });
+}
+
+// Create channels immediately at module load so they exist before any push arrives.
+// Safe to call multiple times — Android deduplicates by channel ID.
+if (Platform.OS === 'android') {
+  Promise.all([ensureAndroidChannel(), ensureCommunityAndroidChannel()]).catch(
+    (err) => console.warn('[notifications] Channel setup error:', err),
+  );
 }
 
 // ── Token Registration ────────────────────────────────────────────────────────
