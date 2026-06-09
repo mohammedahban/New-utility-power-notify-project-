@@ -118,21 +118,48 @@ serve(async (req) => {
     }
 
     // 4. Check current Growatt state for conflict detection
+    // Guard: only flag a conflict if the inverter reading is fresh (< 10 min old)
+    // to avoid false positives caused by stale sensor data.
     const { data: currentState } = await supabaseAdmin
       .from('inverter_state')
-      .select('utility_on, inverter_offline')
+      .select('utility_on, inverter_offline, last_polled')
       .eq('id', 1)
       .single();
 
     if (currentState && !currentState.inverter_offline) {
-      const growattState = currentState.utility_on ? 'UTILITY_ON' : 'UTILITY_OFF';
-      if (growattState !== reportedState) {
-        await supabaseAdmin.from('community_conflicts').insert({
-          report_id: reportId,
-          growatt_state: growattState,
-          reported_state: reportedState,
-        });
-        console.log(`Conflict recorded: Growatt=${growattState}, Reported=${reportedState}`);
+      const lastPolledMs = currentState.last_polled
+        ? Date.now() - new Date(currentState.last_polled).getTime()
+        : Infinity;
+      const isStale = lastPolledMs > 10 * 60 * 1000; // older than 10 minutes
+
+      if (!isStale) {
+        const growattState = currentState.utility_on ? 'UTILITY_ON' : 'UTILITY_OFF';
+        if (growattState !== reportedState) {
+          // Deduplicate: avoid inserting a conflict for the same report twice
+          const { count: existingCount } = await supabaseAdmin
+            .from('community_conflicts')
+            .select('id', { count: 'exact', head: true })
+            .eq('report_id', reportId);
+
+          if ((existingCount ?? 0) === 0) {
+            await supabaseAdmin.from('community_conflicts').insert({
+              report_id: reportId,
+              growatt_state: growattState,
+              reported_state: reportedState,
+            });
+            console.log(
+              `Conflict recorded: Growatt=${growattState}, Reported=${reportedState}, ` +
+              `staleness=${Math.round(lastPolledMs / 1000)}s`,
+            );
+          } else {
+            console.log(`Conflict for report ${reportId} already exists — skipping duplicate`);
+          }
+        }
+      } else {
+        console.log(
+          `Skipping conflict check: Growatt data is stale ` +
+          `(${Math.round(lastPolledMs / 60_000)} min old)`,
+        );
       }
     }
 

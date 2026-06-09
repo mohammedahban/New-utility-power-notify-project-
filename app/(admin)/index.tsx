@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet, RefreshControl,
 } from 'react-native';
@@ -12,7 +12,78 @@ import LiveBadge from '../../components/LiveBadge';
 import { usePredictions, Prediction } from '../../hooks/usePredictions';
 import { useAdminResyncHistory, useUnreviewedConflictsCount } from '../../hooks/useResyncHistory';
 import { AR } from '../../constants/arabic';
+import { supabase } from '../../lib/supabase';
 
+// ── Offset cluster alert ────────────────────────────────────────────────────
+interface ClusterAlert { bucket: number; count: number; }
+
+function useOffsetClusterAlert() {
+  const [alert, setAlert] = useState<ClusterAlert | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await supabase
+          .from('user_offsets')
+          .select('offset_minutes')
+          .order('offset_minutes');
+        if (cancelled || !data) return;
+
+        // Count by 30-min buckets
+        const buckets: Record<number, number> = {};
+        for (const row of data) {
+          const b = Math.round((row.offset_minutes as number) / 30) * 30;
+          buckets[b] = (buckets[b] ?? 0) + 1;
+        }
+        // Find the largest cluster
+        let topBucket = 0, topCount = 0;
+        for (const [b, c] of Object.entries(buckets)) {
+          if (c > topCount) { topCount = c; topBucket = Number(b); }
+        }
+        if (topCount >= 5) {
+          setAlert({ bucket: topBucket, count: topCount });
+        }
+      } catch { /* non-fatal */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  return alert;
+}
+
+function OffsetClusterBanner({ alert, onPress }: { alert: ClusterAlert; onPress: () => void }) {
+  const sign = alert.bucket > 0 ? '+' : '';
+  const bucketLabel = `${sign}${alert.bucket}د`;
+  return (
+    <TouchableOpacity style={ocStyles.banner} onPress={onPress} activeOpacity={0.82}>
+      <View style={ocStyles.right}>
+        <Text style={ocStyles.title}>📊 تجمّع زمني كبير</Text>
+        <Text style={ocStyles.body}>
+          {alert.count} مستخدم حول فارق{' '}
+          <Text style={ocStyles.highlight}>{bucketLabel}</Text>
+          {' — '}يُنصح بإنشاء كتلة حيّ خاصة
+        </Text>
+      </View>
+      <Text style={ocStyles.arrow}>›</Text>
+    </TouchableOpacity>
+  );
+}
+
+const ocStyles = StyleSheet.create({
+  banner: {
+    backgroundColor: '#001a2e', borderRadius: 14, padding: 14,
+    marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'center',
+    gap: 10, borderWidth: 1.5, borderColor: '#38bdf866',
+  },
+  right: { flex: 1 },
+  title: { color: '#38bdf8', fontSize: 10, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
+  body: { color: '#94a3b8', fontSize: 13, lineHeight: 19, textAlign: 'right' },
+  highlight: { color: '#38bdf8', fontWeight: '800' },
+  arrow: { color: '#38bdf8', fontSize: 20, fontWeight: '700' },
+});
+
+// ── Crisis banner ────────────────────────────────────────────────────────────
 function CrisisBanner({ reason }: { reason: string }) {
   return (
     <View style={crisisStyles.banner}>
@@ -193,6 +264,7 @@ export default function AdminDashboard() {
   const { events, loading: eventsLoading } = usePowerEvents(5);
   const { prediction } = usePredictions();
   const { count: conflictsCount } = useUnreviewedConflictsCount();
+  const clusterAlert = useOffsetClusterAlert();
   const [refreshing, setRefreshing] = React.useState(false);
 
   const onRefresh = React.useCallback(() => {
@@ -222,6 +294,13 @@ export default function AdminDashboard() {
 
       {prediction?.apppe?.crisisMode && prediction.apppe.crisisReason ? (
         <CrisisBanner reason={prediction.apppe.crisisReason} />
+      ) : null}
+
+      {clusterAlert ? (
+        <OffsetClusterBanner
+          alert={clusterAlert}
+          onPress={() => router.push('/(admin)/offset-analytics')}
+        />
       ) : null}
 
       <View style={styles.pillRow}>

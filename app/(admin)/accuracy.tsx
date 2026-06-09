@@ -107,6 +107,170 @@ const tStyles = StyleSheet.create({
   text: { fontSize: 12, fontWeight: '700' },
 });
 
+// ── 7-day Sparkline ────────────────────────────────────────────────────────
+
+interface DayPoint { label: string; avg: number; count: number; }
+
+function buildDailyPoints(logs: AccuracyLog[]): DayPoint[] {
+  const now = Date.now();
+  const points: DayPoint[] = [];
+  for (let d = 6; d >= 0; d--) {
+    const dayStart = now - (d + 1) * 86400000;
+    const dayEnd   = now - d * 86400000;
+    const dayLogs  = logs.filter(l => {
+      const t = new Date(l.created_at).getTime();
+      return t >= dayStart && t < dayEnd;
+    });
+    const avg = dayLogs.length === 0
+      ? 0
+      : dayLogs.reduce((s, l) => s + l.accuracy_score, 0) / dayLogs.length;
+    const date = new Date(dayStart + 43200000); // midday of that day
+    const label = date.toLocaleDateString('ar-SA', {
+      timeZone: 'Asia/Aden', month: 'short', day: 'numeric',
+    });
+    points.push({ label, avg: Math.round(avg), count: dayLogs.length });
+  }
+  return points;
+}
+
+function AccuracySparkline({ logs }: { logs: AccuracyLog[] }) {
+  const points = buildDailyPoints(logs);
+  const hasData = points.some(p => p.count > 0);
+  const CHART_W = 320;
+  const CHART_H = 80;
+  const PAD_X = 6;
+  const PAD_Y = 8;
+  const usableW = CHART_W - PAD_X * 2;
+  const usableH = CHART_H - PAD_Y * 2;
+
+  // Y: 0–100 accuracy range
+  const toX = (i: number) => PAD_X + (i / (points.length - 1)) * usableW;
+  const toY = (v: number) => PAD_Y + usableH - (v / 100) * usableH;
+
+  // Build SVG polyline points string
+  const linePoints = points
+    .map((p, i) => `${toX(i).toFixed(1)},${toY(p.avg).toFixed(1)}`)
+    .join(' ');
+
+  // Fill area path
+  const areaPath = points.length > 0
+    ? `M${toX(0).toFixed(1)},${(PAD_Y + usableH).toFixed(1)} ` +
+      points.map((p, i) => `L${toX(i).toFixed(1)},${toY(p.avg).toFixed(1)}`).join(' ') +
+      ` L${toX(points.length - 1).toFixed(1)},${(PAD_Y + usableH).toFixed(1)} Z`
+    : '';
+
+  // Reference lines at 70 and 90
+  const refLines = [70, 90];
+
+  return (
+    <View style={spStyles.card}>
+      <View style={spStyles.headerRow}>
+        <Text style={spStyles.badge}>{hasData ? `${points.filter(p => p.count > 0).length} يوم بيانات` : 'لا بيانات'}</Text>
+        <Text style={spStyles.title}>اتجاه الدقة — آخر 7 أيام</Text>
+      </View>
+
+      {!hasData ? (
+        <View style={spStyles.emptyArea}>
+          <Text style={spStyles.emptyText}>ستظهر هنا بعد تراكم بيانات كافية</Text>
+        </View>
+      ) : (
+        <View style={spStyles.chartWrap}>
+          {/* Y-axis reference lines rendered as Views */}
+          {refLines.map(ref => {
+            const yPct = (1 - ref / 100) * 100;
+            return (
+              <View
+                key={ref}
+                style={[spStyles.refLine, { top: `${yPct}%` as any }]}
+              >
+                <Text style={spStyles.refLabel}>{ref}%</Text>
+              </View>
+            );
+          })}
+
+          {/* Bars + dots for each day */}
+          {points.map((p, i) => {
+            const barH = p.count === 0 ? 0 : Math.max(4, (p.avg / 100) * (CHART_H - PAD_Y * 2));
+            const barColor = p.avg >= 85 ? T.success : p.avg >= 65 ? T.warning : T.danger;
+            const barOpacity = p.count === 0 ? 0.15 : 0.8;
+            return (
+              <View key={i} style={spStyles.barCol}>
+                <Text style={[spStyles.dotVal, { color: p.count === 0 ? T.textMuted : barColor }]}>
+                  {p.count === 0 ? '—' : `${p.avg}%`}
+                </Text>
+                <View style={spStyles.barTrack}>
+                  <View
+                    style={[
+                      spStyles.barFill,
+                      { height: barH, backgroundColor: barColor, opacity: barOpacity },
+                    ]}
+                  />
+                </View>
+                <Text style={spStyles.dayLabel}>{p.label}</Text>
+                {p.count > 0 && (
+                  <Text style={spStyles.countLabel}>{p.count}</Text>
+                )}
+              </View>
+            );
+          })}
+        </View>
+      )}
+
+      {/* Trend arrow */}
+      {hasData && (() => {
+        const withData = points.filter(p => p.count > 0);
+        if (withData.length < 2) return null;
+        const first = withData[0].avg;
+        const last  = withData[withData.length - 1].avg;
+        const delta = last - first;
+        const trendColor = delta > 3 ? T.success : delta < -3 ? T.danger : T.warning;
+        const trendIcon  = delta > 3 ? '↑' : delta < -3 ? '↓' : '→';
+        const trendLabel = delta > 3
+          ? `تحسّن ${Math.abs(Math.round(delta))}% خلال الأسبوع`
+          : delta < -3
+          ? `تراجع ${Math.abs(Math.round(delta))}% خلال الأسبوع`
+          : 'مستقر خلال الأسبوع';
+        return (
+          <View style={[spStyles.trendRow, { backgroundColor: trendColor + '15' }]}>
+            <Text style={[spStyles.trendText, { color: trendColor }]}>{trendIcon} {trendLabel}</Text>
+          </View>
+        );
+      })()}
+    </View>
+  );
+}
+
+const spStyles = StyleSheet.create({
+  card: {
+    backgroundColor: '#1e293b', borderRadius: 16, padding: 16, marginBottom: 14,
+    borderWidth: 1, borderColor: '#334155',
+  },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  title: { color: '#64748b', fontSize: 11, fontWeight: '700', letterSpacing: 1 },
+  badge: { color: '#475569', fontSize: 10 },
+  emptyArea: { height: 60, alignItems: 'center', justifyContent: 'center' },
+  emptyText: { color: '#475569', fontSize: 12 },
+  chartWrap: {
+    flexDirection: 'row-reverse', alignItems: 'flex-end',
+    height: 110, gap: 4, position: 'relative', paddingHorizontal: 4,
+  },
+  refLine: {
+    position: 'absolute', left: 0, right: 0, height: 1,
+    backgroundColor: '#334155', flexDirection: 'row-reverse', alignItems: 'center',
+  },
+  refLabel: { color: '#475569', fontSize: 8, position: 'absolute', right: 0, top: -8 },
+  barCol: { flex: 1, alignItems: 'center', justifyContent: 'flex-end', gap: 3 },
+  barTrack: { width: '80%', maxWidth: 28, height: 80, justifyContent: 'flex-end', backgroundColor: '#0f172a', borderRadius: 4, overflow: 'hidden' },
+  barFill: { width: '100%', borderRadius: 4 },
+  dotVal: { fontSize: 9, fontWeight: '800', textAlign: 'center' },
+  dayLabel: { color: '#475569', fontSize: 8, textAlign: 'center', marginTop: 2 },
+  countLabel: { color: '#334155', fontSize: 7, textAlign: 'center' },
+  trendRow: { marginTop: 12, borderRadius: 8, paddingVertical: 6, paddingHorizontal: 12, alignItems: 'center' },
+  trendText: { fontSize: 12, fontWeight: '700' },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 function InsightWidget({ logs }: { logs: AccuracyLog[] }) {
   if (logs.length < 3) return null;
   const onLogs = logs.filter(l => l.predicted_state === 'UTILITY_ON');
@@ -319,6 +483,8 @@ export default function AccuracyScreen() {
               );
             })}
           </View>
+
+          <AccuracySparkline logs={logs} />
 
           <InsightWidget logs={logs} />
 
