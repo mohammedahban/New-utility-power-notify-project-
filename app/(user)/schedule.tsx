@@ -1,6 +1,6 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
-  View, Text, ScrollView, StyleSheet, ActivityIndicator,
+  View, Text, ScrollView, StyleSheet, ActivityIndicator, Animated,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
@@ -173,7 +173,7 @@ const sbStyles = StyleSheet.create({
 
 export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
-  const { offset } = useUserOffset();
+  const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
   const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
@@ -276,12 +276,7 @@ export default function ScheduleScreen() {
           <Text style={styles.infoLabel}>الاستقرار</Text>
         </View>
         <View style={styles.infoDivider} />
-        <View style={styles.infoItem}>
-          <Text style={styles.infoValue}>
-            {offset ? `${offset.offset_minutes > 0 ? '+' : ''}${offset.offset_minutes}د` : '0د'}
-          </Text>
-          <Text style={styles.infoLabel}>الفارق</Text>
-        </View>
+        <DSDChip offsetMinutes={offset?.offset_minutes ?? 0} isPending={!!pendingDSD} />
       </View>
 
       {/* Legend */}
@@ -411,6 +406,50 @@ export default function ScheduleScreen() {
     </ScrollView>
   );
 }
+
+// ── DSD Chip — colored indicator for the 'الفارق' info bar cell ──────────────
+// Green  = positive DSD (user lags Growatt, safe to confirm quickly)
+// Orange = negative DSD (user leads Growatt, pending candidate path active)
+// Pulsing dot = pendingDSD candidate awaiting Growatt confirmation
+function DSDChip({ offsetMinutes, isPending }: { offsetMinutes: number; isPending: boolean }) {
+  const isNeg = offsetMinutes < 0;
+  const color = isNeg ? '#f97316' : offsetMinutes > 0 ? '#22c55e' : '#94a3b8';
+  const label = `${offsetMinutes > 0 ? '+' : ''}${offsetMinutes}د`;
+
+  // Pulsing animation for the pending dot
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    if (!isPending) { pulseAnim.setValue(1); return; }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 0.25, duration: 700, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [isPending]);
+
+  return (
+    <View style={[dsdStyles.wrap, { borderColor: color + '44', backgroundColor: color + '12' }]}>
+      {isPending && (
+        <Animated.View style={[dsdStyles.pendingDot, { opacity: pulseAnim, backgroundColor: color }]} />
+      )}
+      <Text style={[dsdStyles.value, { color }]}>{label}</Text>
+      <Text style={dsdStyles.label}>الفارق</Text>
+    </View>
+  );
+}
+
+const dsdStyles = StyleSheet.create({
+  wrap: {
+    flex: 1, alignItems: 'center', borderRadius: 10, paddingVertical: 8,
+    paddingHorizontal: 4, borderWidth: 1, gap: 2,
+  },
+  value: { fontSize: 15, fontWeight: '800' },
+  label: { color: '#64748b', fontSize: 8, fontWeight: '700', letterSpacing: 1, marginTop: 2 },
+  pendingDot: { width: 6, height: 6, borderRadius: 3, position: 'absolute', top: 5, left: 6 },
+});
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: T.bg },

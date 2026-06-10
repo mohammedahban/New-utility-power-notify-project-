@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
-  RefreshControl, ActivityIndicator, Animated,
+  RefreshControl, ActivityIndicator, Animated, Platform, Alert,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -122,6 +122,84 @@ const vwStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PENDING DSD CHIP
+// Shows when useUserOffset has stored a pending negative-DSD candidate waiting
+// for a matching Growatt power_events confirmation (spec §6.2 / §15).
+// ─────────────────────────────────────────────────────────────────────────────
+import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
+
+function PendingDSDChip({
+  pendingDSD,
+  onCancel,
+}: {
+  pendingDSD: PendingDSDCandidate | null;
+  onCancel: () => void;
+}) {
+  if (!pendingDSD) return null;
+
+  const ageMin = Math.round(
+    (Date.now() - new Date(pendingDSD.createdAtIso).getTime()) / 60_000,
+  );
+  const tentative = pendingDSD.tentativeDSD;
+  const eventLabel = pendingDSD.eventType === 'UTILITY_ON' ? 'تشغيل' : 'انقطاع';
+
+  return (
+    <View style={pdcStyles.chip}>
+      <TouchableOpacity
+        onPress={onCancel}
+        style={pdcStyles.cancelBtn}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        <Text style={pdcStyles.cancelText}>✕</Text>
+      </TouchableOpacity>
+      <View style={{ flex: 1 }}>
+        <Text style={pdcStyles.title}>⏳ معايرة DSD بانتظار Growatt</Text>
+        <Text style={pdcStyles.body}>
+          بلاغ {eventLabel} · فارق مؤقت: {tentative}د · منذ {ageMin} دقيقة
+        </Text>
+        <Text style={pdcStyles.sub}>سيتم تأكيد الفارق تلقائياً عند وصول إشارة Growatt</Text>
+      </View>
+      <View style={pdcStyles.dot} />
+    </View>
+  );
+}
+
+const pdcStyles = StyleSheet.create({
+  chip: {
+    flexDirection: 'row-reverse',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#0c1a0c',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    marginBottom: 12,
+    borderWidth: 1.5,
+    borderColor: T.success + '44',
+  },
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: T.success,
+    flexShrink: 0,
+  },
+  title: { color: T.success, fontSize: 11, fontWeight: '800', textAlign: 'right', marginBottom: 3 },
+  body: { color: T.success + 'cc', fontSize: 11, textAlign: 'right' },
+  sub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginTop: 2 },
+  cancelBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: T.elevated,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  cancelText: { color: T.textMuted, fontSize: 10, fontWeight: '700' },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1: Personal Utility Status Hero Card
 // ─────────────────────────────────────────────────────────────────────────────
 function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt }: {
@@ -164,6 +242,29 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt }: {
     : remainM === 0 ? (remainH === 1 ? 'ساعة' : `${remainH} ساعات`)
     : `${remainH} س و ${remainM} د`;
 
+  // ── Revert confirmation state ───────────────────────────────────────────────
+  const [revertConfirmVisible, setRevertConfirmVisible] = useState(false);
+
+  const handleRevertPress = useCallback(() => {
+    if (Platform.OS === 'web') {
+      // Web: show inline confirmation banner instead of native Alert
+      setRevertConfirmVisible(true);
+    } else {
+      Alert.alert(
+        'العودة إلى Growatt',
+        'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.',
+        [
+          { text: 'إلغاء', style: 'cancel' },
+          {
+            text: 'تأكيد العودة',
+            style: 'destructive',
+            onPress: () => onRevertToGrowatt?.(),
+          },
+        ],
+      );
+    }
+  }, [onRevertToGrowatt]);
+
   const animColor = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     Animated.loop(
@@ -174,6 +275,31 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt }: {
     ).start();
   }, []);
   const pulseOpacity = animColor.interpolate({ inputRange: [0, 1], outputRange: [0.65, 1] });
+
+  // ── Web revert confirm banner ────────────────────────────────────────────────
+  const RevertConfirmBanner = revertConfirmVisible ? (
+    <View style={psStyles.revertConfirmBox}>
+      <Text style={psStyles.revertConfirmText}>
+        هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.
+      </Text>
+      <View style={psStyles.revertConfirmBtns}>
+        <TouchableOpacity
+          style={[psStyles.revertConfirmBtn, psStyles.revertConfirmBtnCancel]}
+          onPress={() => setRevertConfirmVisible(false)}
+          activeOpacity={0.8}
+        >
+          <Text style={psStyles.revertConfirmBtnCancelText}>إلغاء</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[psStyles.revertConfirmBtn, psStyles.revertConfirmBtnOk]}
+          onPress={() => { setRevertConfirmVisible(false); onRevertToGrowatt?.(); }}
+          activeOpacity={0.8}
+        >
+          <Text style={psStyles.revertConfirmBtnOkText}>تأكيد العودة</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  ) : null;
 
   // COMMUNITY_SYNCED: show rich reporter card
   if (atcMode === 'COMMUNITY_SYNCED') {
@@ -216,10 +342,11 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt }: {
           <Text style={{ fontSize: 30 }}>👥</Text>
         </View>
 
-        {/* Revert to Growatt button */}
+        {/* Revert to Growatt button + confirmation */}
+        {RevertConfirmBanner}
         <TouchableOpacity
           style={psStyles.revertBtn}
-          onPress={onRevertToGrowatt}
+          onPress={handleRevertPress}
           activeOpacity={0.75}
         >
           <Text style={psStyles.revertIcon}>↩</Text>
@@ -376,6 +503,17 @@ const psStyles = StyleSheet.create({
   },
   revertIcon: { color: T.accent, fontSize: 16, fontWeight: '700' },
   revertLabel: { color: T.accent, fontSize: 13, fontWeight: '700' },
+  revertConfirmBox: {
+    backgroundColor: '#0a1929', borderRadius: 14, padding: 14, marginBottom: 12,
+    borderWidth: 1.5, borderColor: T.danger + '55',
+  },
+  revertConfirmText: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 12 },
+  revertConfirmBtns: { flexDirection: 'row-reverse', gap: 10 },
+  revertConfirmBtn: { flex: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1 },
+  revertConfirmBtnCancel: { backgroundColor: T.elevated, borderColor: T.border },
+  revertConfirmBtnCancelText: { color: T.textSecondary, fontSize: 13, fontWeight: '700' },
+  revertConfirmBtnOk: { backgroundColor: '#1a0505', borderColor: T.danger + '55' },
+  revertConfirmBtnOkText: { color: T.danger, fontSize: 13, fontWeight: '800' },
   atcBadge: { borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1 },
   atcBadgeLine: { fontSize: 13, fontWeight: '700', textAlign: 'right', marginBottom: 4 },
   atcSubLine: { color: T.accent, fontSize: 11, textAlign: 'right' },
@@ -922,7 +1060,7 @@ export default function Home() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { profile, signOut } = useAuth();
-  const { offset, loading: offsetLoading } = useUserOffset();
+  const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD } = useUserOffset();
   const { resyncPoint, clearResync } = useResync();
   const { userPrediction, loading: predLoading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { pendingCount } = useResyncNotifications();
@@ -1004,6 +1142,7 @@ export default function Home() {
       ) : null}
 
       <ParticipationNudge userId={profile?.id} />
+      <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
       <ValidationWindowToast prediction={stablePrediction} />
       <PersonalStatusCard
         prediction={stablePrediction}
