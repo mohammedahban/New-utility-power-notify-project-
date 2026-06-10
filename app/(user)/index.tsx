@@ -66,11 +66,68 @@ function fmtTimeAr(iso: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// VALIDATION WINDOW TOAST (Task 3)
+// Shown when atcMode is COMMUNITY_SYNCED and Growatt disagrees.
+// Non-blocking — never clears the resync.
+// ─────────────────────────────────────────────────────────────────────────────
+function ValidationWindowToast({ prediction }: { prediction: UserPrediction | null }) {
+  const atcMode = prediction?.atc?.mode;
+  const inWindow = prediction?.atc?.inValidationWindow ?? false;
+  const remaining = Math.ceil(prediction?.atc?.validationWindowRemainingMin ?? 0);
+  const [dismissed, setDismissed] = useState(false);
+
+  // Reset dismissed state when a new validation window opens
+  const prevInWindow = useRef(false);
+  useEffect(() => {
+    if (inWindow && !prevInWindow.current) setDismissed(false);
+    prevInWindow.current = inWindow;
+  }, [inWindow]);
+
+  if (atcMode !== 'COMMUNITY_SYNCED' || !inWindow || dismissed) return null;
+
+  return (
+    <View style={vwStyles.toast}>
+      <View style={{ flex: 1 }}>
+        <Text style={vwStyles.title}>⚠ الحساس الرئيسي يُشير إلى تغيير</Text>
+        <Text style={vwStyles.body}>
+          حالتك مزامَنة مجتمعياً وتظل كما هي. نافذة التحقق: {remaining} دقيقة متبقية.
+        </Text>
+      </View>
+      <TouchableOpacity onPress={() => setDismissed(true)} style={vwStyles.close} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <Text style={vwStyles.closeText}>✕</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+const vwStyles = StyleSheet.create({
+  toast: {
+    flexDirection: 'row-reverse',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#1a0e00',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1.5,
+    borderColor: T.warning + '66',
+  },
+  title: { color: T.warning, fontSize: 12, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  body: { color: '#fbbf24aa', fontSize: 11, lineHeight: 17, textAlign: 'right' },
+  close: {
+    width: 26, height: 26, borderRadius: 13,
+    backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+  },
+  closeText: { color: T.textMuted, fontSize: 11, fontWeight: '700' },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1: Personal Utility Status Hero Card
 // ─────────────────────────────────────────────────────────────────────────────
-function PersonalStatusCard({ prediction, anchorStartIso }: {
+function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt }: {
   prediction: UserPrediction | null;
   anchorStartIso: string | null;
+  onRevertToGrowatt?: () => void;
 }) {
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
@@ -159,14 +216,15 @@ function PersonalStatusCard({ prediction, anchorStartIso }: {
           <Text style={{ fontSize: 30 }}>👥</Text>
         </View>
 
-        {/* Validation window warning */}
-        {prediction?.atc?.inValidationWindow && (
-          <View style={psStyles.validationBox}>
-            <Text style={psStyles.validationText}>
-              ⚠ الحساس الرئيسي يُشير إلى تغيير — نافذة التحقق: {Math.ceil(prediction.atc.validationWindowRemainingMin ?? 0)} د متبقية
-            </Text>
-          </View>
-        )}
+        {/* Revert to Growatt button */}
+        <TouchableOpacity
+          style={psStyles.revertBtn}
+          onPress={onRevertToGrowatt}
+          activeOpacity={0.75}
+        >
+          <Text style={psStyles.revertIcon}>↩</Text>
+          <Text style={psStyles.revertLabel}>العودة إلى Growatt</Text>
+        </TouchableOpacity>
 
         {/* Time blocks */}
         <View style={psStyles.timeRow}>
@@ -310,8 +368,14 @@ const psStyles = StyleSheet.create({
   communityBannerTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
   reliabilityChip: { backgroundColor: T.success + '20', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: T.success + '44' },
   reliabilityChipText: { color: T.success, fontSize: 10, fontWeight: '700' },
-  validationBox: { backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.warning + '55' },
-  validationText: { color: T.warning, fontSize: 11, textAlign: 'right', lineHeight: 17 },
+  revertBtn: {
+    flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center',
+    gap: 7, backgroundColor: '#0f172a', borderRadius: 12, paddingVertical: 11,
+    paddingHorizontal: 16, marginBottom: 14, borderWidth: 1.5, borderColor: T.accent + '55',
+    alignSelf: 'stretch',
+  },
+  revertIcon: { color: T.accent, fontSize: 16, fontWeight: '700' },
+  revertLabel: { color: T.accent, fontSize: 13, fontWeight: '700' },
   atcBadge: { borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1 },
   atcBadgeLine: { fontSize: 13, fontWeight: '700', textAlign: 'right', marginBottom: 4 },
   atcSubLine: { color: T.accent, fontSize: 11, textAlign: 'right' },
@@ -859,7 +923,7 @@ export default function Home() {
   const insets = useSafeAreaInsets();
   const { profile, signOut } = useAuth();
   const { offset, loading: offsetLoading } = useUserOffset();
-  const { resyncPoint } = useResync();
+  const { resyncPoint, clearResync } = useResync();
   const { userPrediction, loading: predLoading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
@@ -940,7 +1004,12 @@ export default function Home() {
       ) : null}
 
       <ParticipationNudge userId={profile?.id} />
-      <PersonalStatusCard prediction={stablePrediction} anchorStartIso={anchorStartIso} />
+      <ValidationWindowToast prediction={stablePrediction} />
+      <PersonalStatusCard
+        prediction={stablePrediction}
+        anchorStartIso={anchorStartIso}
+        onRevertToGrowatt={clearResync}
+      />
       <UpcomingTransitionCard prediction={stablePrediction} />
 
       {stablePrediction && (
