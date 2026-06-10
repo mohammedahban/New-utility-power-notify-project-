@@ -95,13 +95,12 @@ function shiftMs(iso: string, deltaMs: number): string {
   return new Date(new Date(iso).getTime() + deltaMs).toISOString();
 }
 
+// Western numerals + Arabic AM/PM suffix, LTR (spec §20: "7:00 م → 8:03 م")
 function fmtYemenTime(iso: string): string {
-  return new Date(iso).toLocaleString('en-US', {
-    timeZone: 'Asia/Aden',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: true,
+  const raw = new Date(iso).toLocaleString('en-US', {
+    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
   });
+  return raw.replace('AM', 'ص').replace('PM', 'م');
 }
 
 function getZoneFromIso(iso: string): string {
@@ -467,6 +466,23 @@ function deriveCurrentStateATC(
   return { state: masterCurrentState, startIso: null };
 }
 
+// ── Human-friendly Arabic duration range label (spec §23) ──────────────────────
+// Converts RangeLabel min/max to Arabic like:
+//   "من ساعتين إلى ساعتين و15 دقيقة"  (ON)
+//   "من 8 ساعات إلى 9 ساعات و12 دقيقة" (OFF)
+function arabicDurationRange(minMin: number, maxMin: number): string {
+  const fmtSingle = (min: number): string => {
+    const h = Math.floor(min / 60);
+    const m = Math.round(min % 60);
+    if (h === 0) return m === 1 ? 'دقيقة' : m === 2 ? 'دقيقتان' : `${m} دقيقة`;
+    const hoursAr = h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h} ساعات`;
+    if (m === 0) return hoursAr;
+    return `${hoursAr} و ${m} دقيقة`;
+  };
+  if (Math.round(minMin) === Math.round(maxMin)) return fmtSingle(minMin);
+  return `من ${fmtSingle(minMin)} إلى ${fmtSingle(maxMin)}`;
+}
+
 // ── Duration label from startIso ──────────────────────────────────────────────
 function elapsedLabel(startIso: string | null): string {
   if (!startIso) return '';
@@ -510,8 +526,13 @@ export function applyOffsetToPrediction(
 
   return {
     nextTransition,
-    expectedOffDurationLabel: prediction.expectedOffRange?.label ?? null,
-    expectedOnDurationLabel: prediction.expectedOnRange?.label ?? null,
+    // Spec §23: human-friendly Arabic range labels
+    expectedOffDurationLabel: prediction.expectedOffRange
+      ? arabicDurationRange(prediction.expectedOffRange.minMin, prediction.expectedOffRange.maxMin)
+      : null,
+    expectedOnDurationLabel: prediction.expectedOnRange
+      ? arabicDurationRange(prediction.expectedOnRange.minMin, prediction.expectedOnRange.maxMin)
+      : null,
     confidence: prediction.confidence,
     confidenceLabel: prediction.confidenceLabel,
     isUnstable: prediction.isUnstable,
