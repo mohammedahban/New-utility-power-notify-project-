@@ -22,7 +22,8 @@ export type ScheduleStateMode =
   | 'PREDICTION_RANGE'
   | 'UNCERTAIN_ZONE'
   | 'COMMUNITY_SYNCED'
-  | 'WAITING_FOR_GROWATT';
+  | 'WAITING_FOR_GROWATT'
+  | 'GRACE_MODE';
 
 export interface ATCState {
   mode: ScheduleStateMode;
@@ -262,7 +263,9 @@ function computeATCState(
 ): ATCState {
   const nowMs = Date.now();
 
-  // Community Sync path — check validation window
+  // Community Sync path — personal timeline branch is PERMANENT until explicit revert.
+  // Per spec §10: never auto-revert. The validation window only shows a warning,
+  // it does NOT remove the sync. Only explicit user revert clears it.
   if (resyncPoint) {
     const syncedState = resyncPoint.syncedState;
     const growattState = prediction.currentState;
@@ -271,31 +274,17 @@ function computeATCState(
     const inValidationWindow = growattDiffers && syncAgeMs < VALIDATION_WINDOW_MS;
     const validationRemainingMin = inValidationWindow ? (VALIDATION_WINDOW_MS - syncAgeMs) / 60_000 : 0;
 
-    if (inValidationWindow) {
-      return {
-        mode: 'COMMUNITY_SYNCED',
-        overrunMinutes: 0,
-        communityElevated: true,
-        statusLine: `نافذة التحقق نشطة — ${Math.ceil(validationRemainingMin)} د متبقية`,
-        inValidationWindow: true,
-        validationWindowRemainingMin: validationRemainingMin,
-      };
-    }
-
-    // Validation window expired & Growatt differs → ATC takes over (fall through)
-    if (growattDiffers && syncAgeMs >= VALIDATION_WINDOW_MS) {
-      // Community sync expired due to Growatt confirmation
-      // Fall through to normal ATC logic below
-    } else {
-      return {
-        mode: 'COMMUNITY_SYNCED',
-        overrunMinutes: 0,
-        communityElevated: false,
-        statusLine: null,
-        inValidationWindow: false,
-        validationWindowRemainingMin: 0,
-      };
-    }
+    return {
+      mode: 'COMMUNITY_SYNCED',
+      overrunMinutes: 0,
+      // Elevate community priority during validation window
+      communityElevated: inValidationWindow,
+      statusLine: inValidationWindow
+        ? `نافذة التحقق نشطة — الحساس يُشير لتغيير · ${Math.ceil(validationRemainingMin)} د`
+        : null,
+      inValidationWindow,
+      validationWindowRemainingMin: validationRemainingMin,
+    };
   }
 
   // ── Find the active slot ──────────────────────────────────────────────────
@@ -335,8 +324,11 @@ function computeATCState(
     };
   }
 
+  // ── Post-range ATC logic per DSD sign (spec §14 / §6) ──────────────────────
   const GRACE_PERIOD_MS = 15 * 60_000;
 
+  // Negative DSD: user is ahead of Growatt → UNCERTAIN_ZONE immediately
+  // (spec §14.1 / §6.1: do not auto-transition; wait for confirmation)
   if (offsetMinutes < 0) {
     return {
       mode: 'UNCERTAIN_ZONE',
@@ -348,6 +340,8 @@ function computeATCState(
     };
   }
 
+  // Positive DSD: user is behind Growatt → WAITING_FOR_GROWATT
+  // (spec §14.2 / §6.3: wait for Growatt confirmation or user/community report)
   if (offsetMinutes > 0) {
     return {
       mode: 'WAITING_FOR_GROWATT',
@@ -359,9 +353,11 @@ function computeATCState(
     };
   }
 
+  // Neutral DSD (≈ 0): enter GRACE_MODE for 15 minutes first
+  // (spec §14.3 / §6.2: GRACE_MODE before WAITING_FOR_GROWATT)
   if (overrunMs <= GRACE_PERIOD_MS) {
     return {
-      mode: 'PREDICTION_RANGE',
+      mode: 'GRACE_MODE',
       overrunMinutes: overrunMin,
       communityElevated: false,
       statusLine: 'تأخر غير معتاد — لا يزال التشغيل مستمراً خارج النطاق المتوقع',
@@ -370,8 +366,9 @@ function computeATCState(
     };
   }
 
+  // Grace period expired → WAITING_FOR_GROWATT
   return {
-    mode: 'UNCERTAIN_ZONE',
+    mode: 'WAITING_FOR_GROWATT',
     overrunMinutes: overrunMin,
     communityElevated: true,
     statusLine: 'النمط الحالي ممتد بشكل غير معتاد — بانتظار تأكيد تغير الحالة',
@@ -381,7 +378,14 @@ function computeATCState(
 }
 
 function atcShouldHold(mode: ScheduleStateMode): boolean {
-  return mode === 'UNCERTAIN_ZONE' || mode === 'WAITING_FOR_GROWATT' || mode === 'PREDICTION_RANGE';
+  // During any of these modes ATC prevents automatic state transition.
+  // GRACE_MODE also holds — the cycle continues until confirmation arrives.
+  return (
+    mode === 'UNCERTAIN_ZONE' ||
+    mode === 'WAITING_FOR_GROWATT' ||
+    mode === 'PREDICTION_RANGE' ||
+    mode === 'GRACE_MODE'
+  );
 }
 
 // ── Derive next transition ────────────────────────────────────────────────────

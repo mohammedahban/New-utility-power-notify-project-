@@ -246,6 +246,8 @@ function PersonalStatusCard({ prediction, anchorStartIso }: {
           PREDICTION_RANGE: { icon: '🔮', bg: '#0a1a2e', border: T.accent + '55', textColor: T.accent },
           UNCERTAIN_ZONE: { icon: '⚠', bg: '#1a0e00', border: T.warning + '55', textColor: T.warning },
           WAITING_FOR_GROWATT: { icon: '⏳', bg: '#0a1a2e', border: T.accent + '44', textColor: T.accent },
+          // GRACE_MODE: neutral DSD — 15-min window before WAITING_FOR_GROWATT
+          GRACE_MODE: { icon: '⏳', bg: '#0a1a2e', border: T.warning + '44', textColor: T.warning },
         };
         const cfg = configs[atcMode as keyof typeof configs];
         if (!cfg) return null;
@@ -342,6 +344,8 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
       UNCERTAIN_ZONE: { icon: '⚠️', title: 'استمرار غير معتاد', body: 'لا يزال التغيير متوقعاً — النمط الحالي ممتد', borderColor: T.warning + '44', iconColor: T.warning },
       WAITING_FOR_GROWATT: { icon: '⏳', title: 'بانتظار تأكيد الحساس', body: 'تجاوزنا نطاق التوقع. بانتظار تأكيد مجتمعي أو Growatt', borderColor: T.accent + '44', iconColor: T.accent },
       PREDICTION_RANGE: { icon: '🔮', title: 'نطاق التوقع نشط', body: 'التغيير محتمل الآن — بانتظار تأكيد.', borderColor: T.accent + '33', iconColor: T.accent },
+      // GRACE_MODE: neutral DSD 15-min window (spec §14.3)
+      GRACE_MODE: { icon: '⏳', title: 'تأخر غير معتاد', body: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع — سيتم المزامنة فور تغيير الحالة', borderColor: T.warning + '44', iconColor: T.warning },
     };
     const cfg = modeConfigs[atcMode as keyof typeof modeConfigs] ?? modeConfigs.UNCERTAIN_ZONE;
     return (

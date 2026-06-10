@@ -1,7 +1,7 @@
 /**
  * ResyncContext
  *
- * Stores a single "personal sync point" per user.
+ * Stores a single "personal sync point" (personal timeline branch) per user.
  * When a community resync is applied (either by submitting a report or
  * confirming YES on a notification) the sync point is saved here AND in
  * AsyncStorage so it survives app restarts.
@@ -9,14 +9,15 @@
  * The sync point tells useUserPredictions:
  *   "treat the schedule as if state <syncedState> started at <syncedAtIso>"
  *
- * It does NOT modify the master prediction, offset, Growatt data, or any
- * other user's data.
+ * Per spec §10 (Community Resynchronization V2):
+ *   - The resync is a PERMANENT personal timeline branch, not a temporary override.
+ *   - It does NOT auto-revert because Growatt changed.
+ *   - It does NOT auto-clear when the validation window expires.
+ *   - The ONLY way to clear a resync is the user pressing an explicit revert control.
  *
- * Auto-clears when:
- *   1. Age > 6 hours (original expiry)
- *   2. Validation window (20 min) expires AND Growatt state differs from
- *      syncedState — prevents stale community sync persisting indefinitely
- *      after Growatt has already confirmed a different state.
+ * Safety net: auto-clears after 6 hours max age to prevent forever-stale data.
+ * The ATC validation window still DISPLAYS a warning in the UI (via computeATCState)
+ * but does not trigger a clear here.
  */
 
 import React, {
@@ -25,7 +26,6 @@ import React, {
 } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from './AuthContext';
-import { supabase } from '../lib/supabase';
 
 export interface ResyncPoint {
   /** The utility state that was confirmed as active */
@@ -82,12 +82,12 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
     })();
   }, [storageKey]);
 
-  // ── Validation-window watchdog ───────────────────────────────────────────────
-  // Every 30 seconds while a resync is active, check:
-  //   1. Has the 6-hour max age been reached?
-  //   2. Has the 20-minute validation window expired AND does Growatt now
-  //      report a different state than what was synced?
-  // If either condition is true, clear the resync automatically.
+  // ── Max-age watchdog ────────────────────────────────────────────────────────
+  // Per spec §10: community sync is a PERMANENT personal timeline branch.
+  // It must NOT be cleared because Growatt disagrees or the validation window
+  // expired. The ONLY programmatic clear allowed is the 6-hour safety-net to
+  // prevent forever-stale data. The user must explicitly press a revert button
+  // to leave the community-synced branch at any other time.
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -99,46 +99,19 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
 
     const check = async () => {
       if (!resyncPoint) return;
-
       const ageMs = Date.now() - new Date(resyncPoint.appliedAtIso).getTime();
-
-      // 1. Max age exceeded
+      // Safety-net only: clear after 6-hour max age
       if (ageMs >= MAX_AGE_MS) {
-        await AsyncStorage.removeItem(storageKey);
+        console.log('[ResyncContext] 6-hour safety-net reached — clearing resync');
+        await AsyncStorage.removeItem(storageKey!);
         setResyncPoint(null);
-        return;
       }
-
-      // 2. Validation window expired — check Growatt state
-      if (ageMs >= VALIDATION_WINDOW_MS) {
-        try {
-          const { data } = await supabase
-            .from('inverter_state')
-            .select('utility_on, inverter_offline')
-            .eq('id', 1)
-            .maybeSingle();
-
-          if (data && !data.inverter_offline) {
-            const growattIsOn: boolean = data.utility_on ?? false;
-            const syncedIsOn = resyncPoint.syncedState === 'ON';
-
-            if (growattIsOn !== syncedIsOn) {
-              // Growatt has confirmed a different state and the validation
-              // window has expired — ATC takes over, community sync is done.
-              console.log('[ResyncContext] Validation window expired, Growatt differs — clearing resync');
-              await AsyncStorage.removeItem(storageKey);
-              setResyncPoint(null);
-            }
-          }
-        } catch (_) {
-          // Network error — keep resync, try again next interval
-        }
-      }
+      // NOTE: validation window expiry and Growatt mismatch do NOT clear the
+      // resync here. The ATC layer shows a warning badge in the UI instead.
     };
 
-    // Run once immediately, then every 30 seconds
     check();
-    intervalRef.current = setInterval(check, 30_000);
+    intervalRef.current = setInterval(check, 60_000); // check every minute
 
     return () => {
       if (intervalRef.current) {

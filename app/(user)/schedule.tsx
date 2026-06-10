@@ -77,7 +77,9 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
             const atcCfg: Record<string, { label: string; bg: string; border: string; color: string }> = {
               UNCERTAIN_ZONE:      { label: '⚠ بانتظار تأكيد', bg: '#1a0e00', border: '#f59e0b66', color: '#f59e0b' },
               WAITING_FOR_GROWATT: { label: '⏳ بانتظار Growatt', bg: '#001020', border: '#38bdf866', color: '#38bdf8' },
-              PREDICTION_RANGE:   { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
+              PREDICTION_RANGE:    { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
+              // GRACE_MODE: neutral DSD 15-min grace window (spec §14.3)
+              GRACE_MODE:          { label: '⏳ تأخر غير معتاد — مهلة المزامنة', bg: '#1a0e00', border: '#f9731666', color: '#f97316' },
             };
             const cfg = atcCfg[atcMode];
             if (!cfg) return null;

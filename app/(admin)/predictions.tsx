@@ -123,6 +123,7 @@ function ATCSystemIndicator({ prediction }: { prediction: Prediction | null }) {
     UNCERTAIN_ZONE: '#f59e0b',
     COMMUNITY_SYNCED: '#a78bfa',
     WAITING_FOR_GROWATT: '#3b82f6',
+    GRACE_MODE: '#f97316',
   };
   const modeIcons: Record<ScheduleStateMode, string> = {
     NORMAL: '✅',
@@ -130,6 +131,7 @@ function ATCSystemIndicator({ prediction }: { prediction: Prediction | null }) {
     UNCERTAIN_ZONE: '⚠️',
     COMMUNITY_SYNCED: '👥',
     WAITING_FOR_GROWATT: '⏳',
+    GRACE_MODE: '⏳',
   };
 
   const rows: { label: string; mode: ScheduleStateMode; overrun: number }[] = [
