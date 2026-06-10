@@ -130,8 +130,10 @@ import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
 
 function PendingDSDChip({
   pendingDSD,
+  onCancel,
 }: {
   pendingDSD: PendingDSDCandidate | null;
+  onCancel: () => void;
 }) {
   if (!pendingDSD) return null;
 
@@ -143,7 +145,13 @@ function PendingDSDChip({
 
   return (
     <View style={pdcStyles.chip}>
-      <View style={pdcStyles.dot} />
+      <TouchableOpacity
+        onPress={onCancel}
+        style={pdcStyles.cancelBtn}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        <Text style={pdcStyles.cancelText}>✕</Text>
+      </TouchableOpacity>
       <View style={{ flex: 1 }}>
         <Text style={pdcStyles.title}>⏳ معايرة DSD بانتظار Growatt</Text>
         <Text style={pdcStyles.body}>
@@ -151,6 +159,7 @@ function PendingDSDChip({
         </Text>
         <Text style={pdcStyles.sub}>سيتم تأكيد الفارق تلقائياً عند وصول إشارة Growatt</Text>
       </View>
+      <View style={pdcStyles.dot} />
     </View>
   );
 }
@@ -178,6 +187,16 @@ const pdcStyles = StyleSheet.create({
   title: { color: T.success, fontSize: 11, fontWeight: '800', textAlign: 'right', marginBottom: 3 },
   body: { color: T.success + 'cc', fontSize: 11, textAlign: 'right' },
   sub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginTop: 2 },
+  cancelBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: T.elevated,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  cancelText: { color: T.textMuted, fontSize: 10, fontWeight: '700' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1123,7 +1142,7 @@ export default function Home() {
       ) : null}
 
       <ParticipationNudge userId={profile?.id} />
-      <PendingDSDChip pendingDSD={pendingDSD} />
+      <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
       <ValidationWindowToast prediction={stablePrediction} />
       <PersonalStatusCard
         prediction={stablePrediction}
