@@ -25,6 +25,9 @@ export type ScheduleStateMode =
   | 'WAITING_FOR_GROWATT'
   | 'GRACE_MODE';
 
+/** TMMS transition authority modes (spec: TRANSITION MODES) */
+export type TransitionMode = 'AUTO' | 'MANUAL';
+
 export interface ATCState {
   mode: ScheduleStateMode;
   overrunMinutes: number;
@@ -33,6 +36,8 @@ export interface ATCState {
   /** True when Growatt changed state but validation window is still active */
   inValidationWindow: boolean;
   validationWindowRemainingMin: number;
+  /** TMMS: active transition authority mode */
+  transitionMode: TransitionMode;
 }
 
 export interface CommunitySyncMeta {
@@ -87,6 +92,14 @@ export interface UserPrediction {
   resyncedAtIso: string | null;
   isHoldingState: boolean;
   communitySyncMeta: CommunitySyncMeta | null;
+  /**
+   * TMMS Lost-Time Reconciliation (spec §CYCLE CONTINUITY RULE):
+   * When exiting UNCERTAIN_ZONE via Growatt confirmation, the next cycle
+   * start is backdated to: user_cycle_start + actual_growatt_duration.
+   * This ISO represents that backdated start so the elapsed timer in the
+   * NEW state reflects time already spent waiting, not just since now.
+   */
+  reconciledCycleStartIso: string | null;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -259,6 +272,7 @@ function computeATCState(
   offsetMinutes: number,
   resyncPoint: ResyncPoint | null,
   prediction: Prediction,
+  transitionMode: TransitionMode = 'AUTO',
 ): ATCState {
   const nowMs = Date.now();
 
@@ -283,6 +297,7 @@ function computeATCState(
         : null,
       inValidationWindow,
       validationWindowRemainingMin: validationRemainingMin,
+      transitionMode,
     };
   }
 
@@ -298,7 +313,7 @@ function computeATCState(
   }
 
   if (!activeSlot || !activeSlot.endIso) {
-    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null, inValidationWindow: false, validationWindowRemainingMin: 0 };
+    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null, inValidationWindow: false, validationWindowRemainingMin: 0, transitionMode };
   }
 
   const slotEndMs = new Date(activeSlot.endIso).getTime();
@@ -309,7 +324,7 @@ function computeATCState(
   const overrunMin = overrunMs / 60_000;
 
   if (nowMs < rangeStartMs) {
-    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null, inValidationWindow: false, validationWindowRemainingMin: 0 };
+    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null, inValidationWindow: false, validationWindowRemainingMin: 0, transitionMode };
   }
 
   if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) {
@@ -320,35 +335,45 @@ function computeATCState(
       statusLine: 'نطاق التوقع نشط — التغيير محتمل',
       inValidationWindow: false,
       validationWindowRemainingMin: 0,
+      transitionMode,
     };
   }
 
   // ── Post-range ATC logic per DSD sign (spec §14 / §6) ──────────────────────
   const GRACE_PERIOD_MS = 15 * 60_000;
 
-  // Negative DSD: user is ahead of Growatt → UNCERTAIN_ZONE immediately
-  // (spec §14.1 / §6.1: do not auto-transition; wait for confirmation)
+  // ── TMMS: In MANUAL mode, Growatt transitions cannot trigger state changes.
+  // For negative DSD, we always enter UNCERTAIN_ZONE regardless of mode.
+  // For positive DSD in AUTO mode, we can trust Growatt has already confirmed
+  // (spec §POSITIVE OFFSET BEHAVIOR: "rarely wait because Growatt already knows").
+  // For positive DSD in MANUAL mode, community/user report required.
+  // Negative DSD: user is ahead of Growatt → always UNCERTAIN_ZONE
+  // (spec §14.1 / §6.1 / §NEGATIVE OFFSET BEHAVIOR: do not auto-transition)
   if (offsetMinutes < 0) {
     return {
       mode: 'UNCERTAIN_ZONE',
       overrunMinutes: overrunMin,
       communityElevated: true,
-      statusLine: 'استمرار غير معتاد — بانتظار تأكيد تغير الحالة',
+      statusLine: `استمرار غير معتاد — تجاوزت المدة المتوقعة بـ ${Math.ceil(overrunMin)} دقيقة — بانتظار تأكيد تغير الحالة`,
       inValidationWindow: false,
       validationWindowRemainingMin: 0,
+      transitionMode,
     };
   }
 
   // Positive DSD: user is behind Growatt → WAITING_FOR_GROWATT
-  // (spec §14.2 / §6.3: wait for Growatt confirmation or user/community report)
+  // (spec §14.2 / §6.3: Growatt has likely already confirmed — short wait)
   if (offsetMinutes > 0) {
     return {
       mode: 'WAITING_FOR_GROWATT',
       overrunMinutes: overrunMin,
-      communityElevated: true,
-      statusLine: 'بانتظار تأكيد الحساس الرئيسي أو بلاغ مجتمعي',
+      communityElevated: transitionMode === 'MANUAL',
+      statusLine: transitionMode === 'MANUAL'
+        ? 'وضع يدوي — بانتظار بلاغك أو تأكيد مجتمعي'
+        : 'بانتظار تأكيد الحساس الرئيسي أو بلاغ مجتمعي',
       inValidationWindow: false,
       validationWindowRemainingMin: 0,
+      transitionMode,
     };
   }
 
@@ -362,6 +387,7 @@ function computeATCState(
       statusLine: 'تأخر غير معتاد — لا يزال التشغيل مستمراً خارج النطاق المتوقع',
       inValidationWindow: false,
       validationWindowRemainingMin: 0,
+      transitionMode,
     };
   }
 
@@ -370,9 +396,12 @@ function computeATCState(
     mode: 'WAITING_FOR_GROWATT',
     overrunMinutes: overrunMin,
     communityElevated: true,
-    statusLine: 'النمط الحالي ممتد بشكل غير معتاد — بانتظار تأكيد تغير الحالة',
+    statusLine: transitionMode === 'MANUAL'
+      ? 'وضع يدوي — بانتظار بلاغك أو تأكيد مجتمعي لإنهاء الدورة'
+      : 'النمط الحالي ممتد بشكل غير معتاد — بانتظار تأكيد تغير الحالة',
     inValidationWindow: false,
     validationWindowRemainingMin: 0,
+    transitionMode,
   };
 }
 
@@ -433,11 +462,16 @@ function deriveNextTransition(
 }
 
 // ── ATC-aware current state derivation ───────────────────────────────────────
+// TMMS spec §MANUAL MODE:
+//   In MANUAL mode, Growatt state changes (masterCurrentState) do NOT update
+//   the user's current state. Only community/user resync can change it.
+//   Growatt continues to feed APPPE learning only.
 function deriveCurrentStateATC(
   effectiveSlots: ShiftedScheduleSlot[],
   atcMode: ScheduleStateMode,
   masterCurrentState: 'ON' | 'OFF',
   resyncPoint: ResyncPoint | null,
+  transitionMode: TransitionMode = 'AUTO',
 ): { state: 'ON' | 'OFF'; startIso: string | null } {
   if (resyncPoint) {
     return { state: resyncPoint.syncedState, startIso: resyncPoint.syncedAtIso };
@@ -447,6 +481,8 @@ function deriveCurrentStateATC(
   const holding = atcShouldHold(atcMode);
 
   if (holding) {
+    // TMMS §MANUAL MODE: in MANUAL mode, even if not holding due to ATC,
+    // we keep the last known slot state — Growatt cannot force a transition.
     let bestSlot: ShiftedScheduleSlot | null = null;
     for (const slot of effectiveSlots) {
       const startMs = new Date(slot.startIso).getTime();
@@ -456,6 +492,23 @@ function deriveCurrentStateATC(
     if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
   }
 
+  // TMMS §MANUAL MODE: Growatt's current state is ignored for user-facing display.
+  // We derive state only from the effective schedule slots (which are offset-shifted
+  // APPPE slots, not live Growatt state) so the user's personal timeline is respected.
+  if (transitionMode === 'MANUAL') {
+    // In MANUAL mode: find last slot before now in effective schedule.
+    // This ignores masterCurrentState entirely.
+    let bestSlot: ShiftedScheduleSlot | null = null;
+    for (const slot of effectiveSlots) {
+      const startMs = new Date(slot.startIso).getTime();
+      if (startMs <= nowMs) bestSlot = slot;
+      else break;
+    }
+    if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
+    return { state: effectiveSlots[0]?.state ?? masterCurrentState, startIso: null };
+  }
+
+  // AUTO mode: use schedule slots (which already reflect Growatt timing + offset)
   for (let i = effectiveSlots.length - 1; i >= 0; i--) {
     const slot = effectiveSlots[i];
     if (new Date(slot.startIso).getTime() <= nowMs) {
@@ -495,12 +548,48 @@ function elapsedLabel(startIso: string | null): string {
   return `${eH}س ${eM}د`;
 }
 
+// ── Lost-Time Reconciliation (spec §CYCLE CONTINUITY RULE) ──────────────────
+// When exiting UNCERTAIN_ZONE via Growatt confirmation:
+//   next cycle start = user cycle start + actual Growatt duration
+// This prevents artificial gaps and correctly shows elapsed time in new state.
+//
+// Parameters:
+//   userCycleStartIso: when the user's current (held) cycle began
+//   growattActualDurationMin: the actual ON/OFF duration Growatt measured
+//   heldState: the state that was being held during UNCERTAIN_ZONE
+//   effectiveSlots: the shifted schedule to find the next slot
+// Returns: the corrected start ISO for the next cycle (backdated start)
+function computeReconciledCycleStart(
+  userCycleStartIso: string | null,
+  growattActualDurationMin: number | null,
+  heldState: 'ON' | 'OFF',
+  effectiveSlots: ShiftedScheduleSlot[],
+  masterCurrentState: 'ON' | 'OFF',
+): string | null {
+  // Only applies when Growatt has confirmed a transition (state changed)
+  if (heldState === masterCurrentState) return null;
+  if (!userCycleStartIso || !growattActualDurationMin || growattActualDurationMin <= 0) return null;
+
+  // Corrected user cycle end = user cycle start + actual Growatt duration
+  // (spec: offset shifts timestamps only, never duration)
+  const reconciledEndMs =
+    new Date(userCycleStartIso).getTime() + growattActualDurationMin * 60_000;
+
+  // Verify this is in the past (the cycle has already ended)
+  if (reconciledEndMs >= Date.now()) return null;
+
+  return new Date(reconciledEndMs).toISOString();
+}
+
 // ── Main pipeline ─────────────────────────────────────────────────────────────
 export function applyOffsetToPrediction(
   prediction: Prediction,
   offsetMinutes: number,
   resyncPoint?: ResyncPoint | null,
   communitySyncMeta?: CommunitySyncMeta | null,
+  transitionMode: TransitionMode = 'AUTO',
+  /** ISO of the start of the current HELD state (for lost-time reconciliation) */
+  heldCycleStartIso?: string | null,
 ): UserPrediction {
   const offsetMs = offsetMinutes * 60_000;
 
@@ -512,17 +601,45 @@ export function applyOffsetToPrediction(
     effectiveSlots = applyCommunityDelta(effectiveSlots, resyncPoint);
   }
 
-  const atcState = computeATCState(effectiveSlots, offsetMinutes, resyncPoint ?? null, prediction);
+  const atcState = computeATCState(effectiveSlots, offsetMinutes, resyncPoint ?? null, prediction, transitionMode);
 
   const { state: currentState, startIso: currentStateStartIso } =
-    deriveCurrentStateATC(effectiveSlots, atcState.mode, prediction.currentState, resyncPoint ?? null);
+    deriveCurrentStateATC(effectiveSlots, atcState.mode, prediction.currentState, resyncPoint ?? null, transitionMode);
 
   const nextTransition = prediction.isUnstable
     ? null
     : deriveNextTransition(effectiveSlots, currentState, prediction);
 
   const isHolding = atcShouldHold(atcState.mode);
-  const durLabel = elapsedLabel(currentStateStartIso);
+
+  // ── Lost-Time Reconciliation (spec §CYCLE CONTINUITY RULE) ─────────────────
+  // When the system was holding in UNCERTAIN_ZONE and Growatt has now confirmed
+  // the transition (masterCurrentState differs from held state), compute the
+  // backdated start for the new cycle so elapsed time is correct and no gap
+  // is created in the timeline.
+  //
+  // Growatt's actual duration = from its last transition to now (approximated
+  // by the APPPE currentStateDurationMin which tracks the master cycle duration).
+  const heldStateForReconciliation: 'ON' | 'OFF' | null =
+    (atcState.mode === 'UNCERTAIN_ZONE' || isHolding) ? currentState : null;
+
+  let reconciledCycleStartIso: string | null = null;
+  if (
+    heldStateForReconciliation !== null &&
+    heldStateForReconciliation !== prediction.currentState &&
+    heldCycleStartIso
+  ) {
+    // Growatt has confirmed the transition — compute reconciled start
+    reconciledCycleStartIso = computeReconciledCycleStart(
+      heldCycleStartIso,
+      prediction.currentStateDurationMin, // Growatt's actual cycle duration
+      heldStateForReconciliation,
+      effectiveSlots,
+      prediction.currentState,
+    );
+  }
+
+  const durLabel = elapsedLabel(reconciledCycleStartIso ?? currentStateStartIso);
 
   return {
     nextTransition,
@@ -552,6 +669,7 @@ export function applyOffsetToPrediction(
     resyncedAtIso: resyncPoint?.syncedAtIso ?? null,
     atc: atcState,
     isHoldingState: isHolding,
+    reconciledCycleStartIso,
     communitySyncMeta: communitySyncMeta
       ?? (resyncPoint ? {
           reporterName: resyncPoint.reporterName ?? null,
@@ -566,6 +684,9 @@ export function applyOffsetToPrediction(
 export function useUserPredictions(
   offsetMinutes: number,
   resyncPoint?: ResyncPoint | null,
+  transitionMode: TransitionMode = 'AUTO',
+  /** Passed from useStateAnchor — the start of the currently anchored state */
+  heldCycleStartIso?: string | null,
 ) {
   const [rawPrediction, setRawPrediction] = useState<Prediction | null>(null);
   const [loading, setLoading] = useState(true);
@@ -656,7 +777,7 @@ export function useUserPredictions(
 
   const userPrediction: UserPrediction | null = rawPrediction
     ? (() => {
-        const pred = applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null);
+        const pred = applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, heldCycleStartIso ?? null);
 
         // ── Stabilize currentStateStartIso ────────────────────────────────────
         // Only update the anchor when the actual utility state changes (ON↔OFF).

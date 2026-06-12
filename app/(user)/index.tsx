@@ -8,6 +8,7 @@ import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
 import { useUserOffset } from '../../hooks/useUserOffset';
+import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { useUserPredictions, UserPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
@@ -16,6 +17,7 @@ import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
+import type { TransitionMode } from '../../hooks/useTransitionMode';
 
 const T = {
   bg: '#060d1a', surface: '#0d1526', elevated: '#162035',
@@ -24,7 +26,77 @@ const T = {
   success: '#22c55e', warning: '#f59e0b', danger: '#ef4444',
 };
 
-// ── Stable elapsed timer ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// TRANSITION MODE TOGGLE — TMMS
+// Placed at the top of the Home screen (spec: §TRANSITION MODES).
+// AUTO:   Growatt + community + user reports all drive transitions.
+// MANUAL: Only community confirmations and user reports drive transitions.
+//         Growatt feeds APPPE learning only.
+// ─────────────────────────────────────────────────────────────────────────────
+function TransitionModeToggle({ mode, onToggle }: {
+  mode: TransitionMode;
+  onToggle: () => void;
+}) {
+  const isAuto = mode === 'AUTO';
+  const bg       = isAuto ? '#001a2e' : '#1a0a00';
+  const border   = isAuto ? T.accent + '55' : T.warning + '55';
+  const iconColor = isAuto ? T.accent : T.warning;
+  const label    = isAuto ? 'الانتقال التلقائي مفعَّل' : 'الانتقال اليدوي مفعَّل';
+  const sub      = isAuto
+    ? 'يعتمد على الحساس الرئيسي + التقارير الموثوقة'
+    : 'يعتمد فقط على بلاغاتك وتأكيدات المجتمع';
+  const icon     = isAuto ? '⚙️' : '✋';
+
+  return (
+    <TouchableOpacity
+      style={[tmtStyles.wrap, { backgroundColor: bg, borderColor: border }]}
+      onPress={onToggle}
+      activeOpacity={0.8}
+    >
+      <View style={tmtStyles.left}>
+        <Text style={[tmtStyles.switchLabel, { color: T.textMuted }]}>
+          {isAuto ? 'تبديل إلى يدوي' : 'تبديل إلى تلقائي'}
+        </Text>
+        <View style={[tmtStyles.switchTrack, { backgroundColor: isAuto ? T.accent + '33' : T.warning + '33' }]}>
+          <View style={[tmtStyles.switchThumb, {
+            backgroundColor: iconColor,
+            alignSelf: isAuto ? 'flex-end' : 'flex-start',
+          }]} />
+        </View>
+      </View>
+      <View style={{ flex: 1 }}>
+        <View style={tmtStyles.labelRow}>
+          <Text style={[tmtStyles.modeBadge, { backgroundColor: iconColor + '22', color: iconColor, borderColor: iconColor + '55' }]}>
+            {icon}  {isAuto ? 'AUTO' : 'MANUAL'}
+          </Text>
+          <Text style={[tmtStyles.modeLabel, { color: iconColor }]}>{label}</Text>
+        </View>
+        <Text style={tmtStyles.modeSub}>{sub}</Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+const tmtStyles = StyleSheet.create({
+  wrap: {
+    flexDirection: 'row-reverse', alignItems: 'center', gap: 12,
+    borderRadius: 14, paddingHorizontal: 14, paddingVertical: 11,
+    marginBottom: 12, borderWidth: 1.5,
+  },
+  labelRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 3 },
+  modeLabel: { fontSize: 13, fontWeight: '800', textAlign: 'right', flex: 1 },
+  modeBadge: {
+    borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, fontSize: 10,
+    fontWeight: '800', borderWidth: 1, overflow: 'hidden', flexShrink: 0,
+  },
+  modeSub: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
+  left: { alignItems: 'center', gap: 4 },
+  switchLabel: { fontSize: 9, fontWeight: '600', textAlign: 'center', width: 48 },
+  switchTrack: { width: 40, height: 22, borderRadius: 11, padding: 3, justifyContent: 'center' },
+  switchThumb: { width: 16, height: 16, borderRadius: 8 },
+});
+
+// ── Stable elapsed timer ──────────────────────────────────────────────────────
 function useElapsedFromIso(startIso: string | null): string {
   const [label, setLabel] = useState('');
   useEffect(() => {
@@ -59,19 +131,15 @@ function useCountdownSec(targetMinutes: number | null) {
 }
 
 // ── Format time — Western numerals + Arabic AM/PM suffix, always LTR (spec §20) ──
-// Spec §20: "7:00 م → 8:03 م" — Western numerals, Arabic AM/PM, render LTR.
 function fmtTimeAr(iso: string): string {
   const raw = new Date(iso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
   });
-  // raw: "7:30 AM" or "11:05 PM" → replace suffix with Arabic
   return raw.replace('AM', 'ص').replace('PM', 'م');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VALIDATION WINDOW TOAST
-// Shown when atcMode is COMMUNITY_SYNCED and Growatt disagrees.
-// Non-blocking — never clears the resync (spec §10).
 // ─────────────────────────────────────────────────────────────────────────────
 function ValidationWindowToast({ prediction }: { prediction: UserPrediction | null }) {
   const atcMode = prediction?.atc?.mode;
@@ -159,10 +227,10 @@ const pdcStyles = StyleSheet.create({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1: Personal Utility Status Hero Card
-// Spec §17: shows the PERSONAL current state, not just Growatt state.
-// Spec §21: current state, duration, expected range, why, waiting status, next preview.
+// Spec §17/§21: shows PERSONAL current state, duration, range, why, waiting.
 // Spec §22: community sync card with reporter name + reliability always shown.
 // Spec §23: typical durations in human-friendly Arabic.
+// TMMS: UNCERTAIN_ZONE shows overrun + accumulation message.
 // ─────────────────────────────────────────────────────────────────────────────
 function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, reasoningLine }: {
   prediction: UserPrediction | null;
@@ -178,11 +246,11 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
   // Elapsed — driven by persistent anchor, never resets on prediction refresh
   const elapsed = useElapsedFromIso(anchorStartIso);
 
-  // Community sync elapsed — unconditional to satisfy Rules of Hooks
+  // Community sync elapsed — unconditional (Rules of Hooks)
   const meta = prediction?.communitySyncMeta;
   const syncElapsed = useElapsedFromIso(meta?.syncedAtIso ?? null);
 
-  // Remaining time from the branched schedule (only when not holding)
+  // Remaining time from schedule
   const currentSlot = (() => {
     const slots = prediction?.daySchedule ?? [];
     const nowMs = Date.now();
@@ -205,7 +273,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
     : remainM === 0 ? (remainH === 1 ? 'ساعة' : `${remainH} ساعات`)
     : `${remainH} س و ${remainM} د`;
 
-  // Revert confirmation (spec §10 — only explicit user action clears sync)
+  // Revert confirmation (spec §10)
   const [revertConfirmVisible, setRevertConfirmVisible] = useState(false);
   const handleRevertPress = useCallback(() => {
     if (Platform.OS === 'web') {
@@ -249,7 +317,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
     </View>
   ) : null;
 
-  // ── Shared typical durations block (spec §23) ─────────────────────────────
+  // ── Typical durations (spec §23) ─────────────────────────────────────────
   const DurationsBlock = (prediction?.expectedOnDurationLabel || prediction?.expectedOffDurationLabel) ? (
     <View style={psStyles.durRow}>
       {prediction?.expectedOnDurationLabel ? (
@@ -273,7 +341,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
     </View>
   ) : null;
 
-  // ── Reasoning line (spec §21 — why this prediction exists) ─────────────────
+  // ── Reasoning (spec §21) ──────────────────────────────────────────────────
   const ReasoningBlock = reasoningLine ? (
     <View style={psStyles.reasoningBox}>
       <Text style={psStyles.reasoningText}>💡 {reasoningLine}</Text>
@@ -287,16 +355,13 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
     return (
       <View style={[psStyles.card, { borderColor: color + '50' }]}>
         <Text style={psStyles.cardTitle}>⚡ حالتي الكهربائية</Text>
-
         <View style={psStyles.statusRow}>
           <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{isOn ? '⚡' : '🔴'}</Animated.Text>
           <Text style={[psStyles.statusText, { color }]}>{isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}</Text>
         </View>
-
-        {/* Community banner — spec §22: reporter name + reliability always shown */}
         <View style={[psStyles.communityBanner, { borderColor: T.accent + '44' }]}>
           <View style={{ flex: 1 }}>
-            <Text style={psStyles.communityBannerTitle}>تم تأكيد الحالة عبر المجتمع</Text>
+            <Text style={psStyles.communityBannerTitle}>تمت مزامنة الحالة عبر المجتمع 🤝</Text>
             <View style={psStyles.communityBannerRow}>
               {reporterRel !== null && (
                 <View style={psStyles.reliabilityChip}>
@@ -313,14 +378,11 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
           </View>
           <Text style={{ fontSize: 30 }}>👥</Text>
         </View>
-
-        {/* Revert — spec §10: only explicit user action reverts */}
         {RevertConfirmBanner}
         <TouchableOpacity style={psStyles.revertBtn} onPress={handleRevertPress} activeOpacity={0.75}>
           <Text style={psStyles.revertIcon}>↩</Text>
           <Text style={psStyles.revertLabel}>العودة إلى Growatt</Text>
         </TouchableOpacity>
-
         <View style={psStyles.timeRow}>
           {elapsed ? (
             <View style={psStyles.timeBlock}>
@@ -335,27 +397,26 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
             </View>
           ) : null}
         </View>
-
         {DurationsBlock}
         {ReasoningBlock}
       </View>
     );
   }
 
-  // ── NORMAL / ATC modes (spec §21) ─────────────────────────────────────────
+  // ── NORMAL / ATC modes ────────────────────────────────────────────────────
   const icon = isOn ? '⚡' : '🔴';
   const statusText = isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية';
   const showATCBadge = atcMode !== 'NORMAL';
+  const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
+  const tMode = prediction?.atc?.transitionMode ?? 'AUTO';
 
   return (
     <View style={[psStyles.card, { borderColor: color + '30' }]}>
       <Text style={psStyles.cardTitle}>⚡ حالتي الكهربائية</Text>
-
       <View style={psStyles.statusRow}>
         <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{icon}</Animated.Text>
         <Text style={[psStyles.statusText, { color }]}>{statusText}</Text>
       </View>
-
       <View style={psStyles.timeRow}>
         {elapsed ? (
           <View style={psStyles.timeBlock}>
@@ -371,13 +432,22 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
         ) : null}
       </View>
 
-      {/* ATC mode badge — friendly Arabic messages, no internal terms (spec §16) */}
+      {/* ATC mode badge with TMMS-aware messages (spec §16/§UNCERTAIN_ZONE) */}
       {showATCBadge && (() => {
-        const configs: Record<string, { icon: string; bg: string; border: string; textColor: string }> = {
+        const configs: Record<string, { icon: string; bg: string; border: string; textColor: string; body?: string }> = {
           PREDICTION_RANGE: { icon: '🔮', bg: '#0a1a2e', border: T.accent + '55', textColor: T.accent },
-          UNCERTAIN_ZONE:   { icon: '⚠',  bg: '#1a0e00', border: T.warning + '55', textColor: T.warning },
-          WAITING_FOR_GROWATT: { icon: '⏳', bg: '#0a1a2e', border: T.accent + '44', textColor: T.accent },
-          GRACE_MODE:       { icon: '⏳', bg: '#0a1a2e', border: T.warning + '44', textColor: T.warning },
+          UNCERTAIN_ZONE: {
+            icon: '⚠',  bg: '#1a0e00', border: T.warning + '55', textColor: T.warning,
+            // TMMS spec §UNCERTAIN_ZONE: show overrun + accumulation message
+            body: overrunMin > 0
+              ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — وقت الانتظار سيُجمع إلى المدة الفعلية`
+              : undefined,
+          },
+          WAITING_FOR_GROWATT: {
+            icon: '⏳', bg: '#0a1a2e', border: T.accent + '44', textColor: T.accent,
+            body: tMode === 'MANUAL' ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة' : undefined,
+          },
+          GRACE_MODE: { icon: '⏳', bg: '#0a1a2e', border: T.warning + '44', textColor: T.warning },
         };
         const cfg = configs[atcMode];
         if (!cfg) return null;
@@ -386,6 +456,9 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
             <Text style={[psStyles.atcBadgeLine, { color: cfg.textColor }]}>
               {cfg.icon}  {prediction?.atc?.statusLine ?? atcMode}
             </Text>
+            {cfg.body ? (
+              <Text style={[psStyles.atcBodyLine, { color: cfg.textColor + 'aa' }]}>{cfg.body}</Text>
+            ) : null}
             <Text style={psStyles.atcSubLine}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن</Text>
           </View>
         );
@@ -436,22 +509,22 @@ const psStyles = StyleSheet.create({
   revertConfirmBtnOkText: { color: T.danger, fontSize: 13, fontWeight: '800' },
   atcBadge: { borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1 },
   atcBadgeLine: { fontSize: 13, fontWeight: '700', textAlign: 'right', marginBottom: 4 },
+  atcBodyLine: { fontSize: 11, textAlign: 'right', marginBottom: 4, lineHeight: 16 },
   atcSubLine: { color: T.accent, fontSize: 11, textAlign: 'right' },
-  // Spec §21: why this prediction exists
   reasoningBox: { backgroundColor: T.elevated, borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.border },
   reasoningText: { color: T.textMuted, fontSize: 11, lineHeight: 17, textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 2: Upcoming Expected Transition Hero Card
-// Spec §19: range is PRIMARY — stacked layout (start / و / end).
-// Spec §20: all times and countdowns render LTR with Western numerals.
-// Spec §8: ATC hold modes shown with friendly Arabic messages, no internal labels.
+// Spec §19: range PRIMARY — stacked layout. Spec §20: LTR Western numerals.
+// TMMS: UNCERTAIN_ZONE shows overrun + accumulation message.
 // ─────────────────────────────────────────────────────────────────────────────
 function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
+  const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
   const midMin = nt ? (nt.minFromNowMin + nt.maxFromNowMin) / 2 : null;
   const { h, m, s, total } = useCountdownSec(midMin);
   const maxSec = midMin ? midMin * 60 : 1;
@@ -464,18 +537,24 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   if (!prediction) return null;
 
-  // ATC hold: show hold-state card with friendly Arabic (spec §16 — no internal terms)
+  // ATC hold card
   if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
     const isCurrentOn = prediction.currentState === 'ON';
+    const tMode = prediction.atc.transitionMode ?? 'AUTO';
     const modeConfigs: Record<string, { icon: string; title: string; body: string; borderColor: string; iconColor: string }> = {
       UNCERTAIN_ZONE: {
         icon: '⚠️', title: 'استمرار غير معتاد',
-        body: 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد',
+        // TMMS §UNCERTAIN_ZONE: display overrun + accumulation message
+        body: overrunMin > 0
+          ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — هذا الوقت سيُجمع إلى المدة الفعلية للدورة`
+          : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد',
         borderColor: T.warning + '44', iconColor: T.warning,
       },
       WAITING_FOR_GROWATT: {
         icon: '⏳', title: 'بانتظار تأكيد الحساس',
-        body: 'تجاوزنا نطاق التوقع. بانتظار تأكيد مجتمعي أو Growatt',
+        body: tMode === 'MANUAL'
+          ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة'
+          : 'تجاوزنا نطاق التوقع. بانتظار تأكيد مجتمعي أو Growatt',
         borderColor: T.accent + '44', iconColor: T.accent,
       },
       PREDICTION_RANGE: {
@@ -483,7 +562,6 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         body: 'التغيير محتمل الآن — بانتظار تأكيد',
         borderColor: T.accent + '33', iconColor: T.accent,
       },
-      // GRACE_MODE: neutral DSD 15-min grace window (spec §14.3)
       GRACE_MODE: {
         icon: '⏳', title: 'تأخر غير معتاد',
         body: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع — سيتم المزامنة فور تغيير الحالة',
@@ -505,13 +583,11 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
             <Text style={utStyles.communityPrioText}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — شارك بملاحظاتك</Text>
           </View>
         )}
-        {/* Range still shown even during hold — spec §19 range is primary */}
         {nt && (
           <View style={utStyles.rangeBox}>
             <Text style={[utStyles.rangeBoxLabel, { color: isCurrentOn ? T.danger : T.success }]}>
               {nt.type === 'UTILITY_ON' ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
             </Text>
-            {/* Stacked + LTR per spec §19/§20 */}
             <View style={utStyles.rangeTimeStack} dir="ltr">
               <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(nt.rangeStartIso)}</Text>
               <Text style={utStyles.rangeSep}>و</Text>
@@ -566,7 +642,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         </View>
       )}
 
-      {/* PRIMARY: stacked range per spec §19, LTR per spec §20 */}
+      {/* PRIMARY: stacked range (spec §19), LTR (spec §20) */}
       <View style={[utStyles.rangeBox, { borderColor: color + '25' }]}>
         <Text style={[utStyles.rangeBoxLabel, { color }]}>
           {isNextOn ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
@@ -578,7 +654,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         </View>
       </View>
 
-      {/* SECONDARY: countdown — always LTR per spec §20 */}
+      {/* SECONDARY: countdown (spec §20) */}
       {!nt.inRangeWindow && (
         <View style={utStyles.countdownSection}>
           <Text style={utStyles.countdownLabel}>⏳ يبدأ نطاق التوقع بعد</Text>
@@ -635,11 +711,7 @@ const utStyles = StyleSheet.create({
   rangeWindowSub: { fontSize: 11, textAlign: 'center' },
   rangeBox: { backgroundColor: T.elevated, borderRadius: 18, padding: 20, marginBottom: 16, borderWidth: 1, alignItems: 'center' },
   rangeBoxLabel: { fontSize: 14, fontWeight: '600', marginBottom: 14, textAlign: 'center' },
-  // Stacked layout per spec §19 — each time on its own line, LTR per spec §20
   rangeTimeStack: { alignItems: 'center', gap: 8 },
-  // Legacy horizontal row (kept for other uses)
-  rangeTimeRow: { flexDirection: 'row', alignItems: 'center', gap: 14, justifyContent: 'center' },
-  // Western numerals + LTR writing direction (spec §20)
   rangeTime: { fontSize: 32, fontWeight: '900', textAlign: 'center', letterSpacing: -0.5, writingDirection: 'ltr' },
   rangeSep: { fontSize: 14, fontWeight: '600', color: T.textMuted },
   countdownSection: { alignItems: 'center', marginBottom: 14 },
@@ -719,7 +791,6 @@ function TodayTimeline({ prediction, anchorStartIso }: {
           stableStartMapRef.current[slotKey] = currentStartF;
         }
         const startF = stableStartMapRef.current[slotKey] ?? currentStartF;
-
         const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
         if (!stableEndMapRef.current[slotKey] && currentEndF) {
           stableEndMapRef.current[slotKey] = currentEndF;
@@ -947,20 +1018,16 @@ const sbStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STABLE RANGE REF — prevents UpcomingTransitionCard range times from shifting
+// STABLE RANGE REF
 // ─────────────────────────────────────────────────────────────────────────────
 function useStableNextTransition(nt: UserPrediction['nextTransition'] | null | undefined) {
   const ref = useRef<{ key: string; rangeStartIso: string; rangeEndIso: string; rangeLabel: string } | null>(null);
-
   if (!nt) { ref.current = null; return nt ?? null; }
-
   const roundedStart = Math.round(new Date(nt.rangeStartIso).getTime() / (5 * 60_000));
   const key = `${nt.type}|${roundedStart}`;
-
   if (!ref.current || ref.current.key !== key) {
     ref.current = { key, rangeStartIso: nt.rangeStartIso, rangeEndIso: nt.rangeEndIso, rangeLabel: nt.rangeLabel };
   }
-
   return { ...nt, rangeStartIso: ref.current.rangeStartIso, rangeEndIso: ref.current.rangeEndIso, rangeLabel: ref.current.rangeLabel };
 }
 
@@ -973,12 +1040,18 @@ export default function Home() {
   const { profile, signOut } = useAuth();
   const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD } = useUserOffset();
   const { resyncPoint, clearResync } = useResync();
-  const { userPrediction, loading: predLoading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
+  const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
+  const { anchor } = useStateAnchor();
+  const { userPrediction, loading: predLoading } = useUserPredictions(
+    offset?.offset_minutes ?? 0,
+    resyncPoint,
+    transitionMode,
+    anchor?.startIso ?? null,
+  );
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
   const [refreshing, setRefreshing] = useState(false);
 
-  const { anchor } = useStateAnchor();
   const anchorStartIso = anchor && userPrediction && anchor.state === userPrediction.currentState
     ? anchor.startIso
     : userPrediction?.currentStateStartIso ?? null;
@@ -1046,6 +1119,9 @@ export default function Home() {
           </View>
         </View>
       ) : null}
+
+      {/* TMMS toggle — at the top of home screen per spec */}
+      <TransitionModeToggle mode={transitionMode} onToggle={toggleTransitionMode} />
 
       <ParticipationNudge userId={profile?.id} />
       <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
