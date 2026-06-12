@@ -462,10 +462,23 @@ function deriveNextTransition(
 }
 
 // ── ATC-aware current state derivation ───────────────────────────────────────
-// TMMS spec §MANUAL MODE:
-//   In MANUAL mode, Growatt state changes (masterCurrentState) do NOT update
-//   the user's current state. Only community/user resync can change it.
-//   Growatt continues to feed APPPE learning only.
+// Spec §3 / TMMS §PRINCIPLE 3: Home Screen must ALWAYS reflect the USER's
+// personal schedule, never Growatt's live state directly.
+//
+// The user's state is derived exclusively from the offset-shifted effective
+// schedule slots (= master APPPE pattern shifted by user DSD).
+//
+// Critical fallback rule (spec §POSITIVE OFFSET BEHAVIOR example):
+//   If no effective slot has started before now (all slots are in the future
+//   because a positive offset pushed them forward), the user is currently in
+//   the state that PRECEDES the first upcoming slot — always the OPPOSITE of
+//   that slot's state.
+//   Example: offset +60, Growatt ON started 08:00 → user ON starts 09:00.
+//   At 08:30 the user schedule has no active slot yet, so user is still OFF.
+//
+// TMMS §MANUAL MODE:
+//   Growatt's live state (masterCurrentState) is NEVER used for user display.
+//   Growatt feeds APPPE learning only.
 function deriveCurrentStateATC(
   effectiveSlots: ShiftedScheduleSlot[],
   atcMode: ScheduleStateMode,
@@ -478,45 +491,54 @@ function deriveCurrentStateATC(
   }
 
   const nowMs = Date.now();
-  const holding = atcShouldHold(atcMode);
 
-  if (holding) {
-    // TMMS §MANUAL MODE: in MANUAL mode, even if not holding due to ATC,
-    // we keep the last known slot state — Growatt cannot force a transition.
-    let bestSlot: ShiftedScheduleSlot | null = null;
+  // ── Helper: find the last slot that started at or before now ──────────────
+  // Returns null if all slots are in the future.
+  const findBestSlot = (): ShiftedScheduleSlot | null => {
+    let best: ShiftedScheduleSlot | null = null;
     for (const slot of effectiveSlots) {
-      const startMs = new Date(slot.startIso).getTime();
-      if (startMs <= nowMs) bestSlot = slot;
+      if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
       else break;
     }
-    if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
-  }
+    return best;
+  };
 
-  // TMMS §MANUAL MODE: Growatt's current state is ignored for user-facing display.
-  // We derive state only from the effective schedule slots (which are offset-shifted
-  // APPPE slots, not live Growatt state) so the user's personal timeline is respected.
-  if (transitionMode === 'MANUAL') {
-    // In MANUAL mode: find last slot before now in effective schedule.
-    // This ignores masterCurrentState entirely.
-    let bestSlot: ShiftedScheduleSlot | null = null;
-    for (const slot of effectiveSlots) {
-      const startMs = new Date(slot.startIso).getTime();
-      if (startMs <= nowMs) bestSlot = slot;
-      else break;
+  // ── Helper: derive state when no slot has started yet ─────────────────────
+  // The state BEFORE the first upcoming slot is always the OPPOSITE of that
+  // slot's state (schedule always alternates ON↔OFF).
+  // This correctly handles positive-offset users whose next event is in the
+  // future but whose CURRENT state is the inverse of that upcoming event.
+  const derivePreScheduleState = (): { state: 'ON' | 'OFF'; startIso: string | null } => {
+    if (effectiveSlots.length > 0) {
+      const firstSlot = effectiveSlots[0];
+      const preState: 'ON' | 'OFF' = firstSlot.state === 'ON' ? 'OFF' : 'ON';
+      return { state: preState, startIso: null };
     }
+    // Absolute last resort — no slots at all. Should never happen in practice.
+    // Even here we do NOT expose masterCurrentState directly; we treat as unknown
+    // and return the master's state only as a best-effort fallback.
+    return { state: masterCurrentState, startIso: null };
+  };
+
+  // ── ATC hold path ──────────────────────────────────────────────────────────
+  // During UNCERTAIN_ZONE / WAITING_FOR_GROWATT / PREDICTION_RANGE / GRACE_MODE
+  // we keep the user in the last confirmed effective slot to prevent false transitions.
+  if (atcShouldHold(atcMode)) {
+    const bestSlot = findBestSlot();
     if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
-    return { state: effectiveSlots[0]?.state ?? masterCurrentState, startIso: null };
+    return derivePreScheduleState();
   }
 
-  // AUTO mode: use schedule slots (which already reflect Growatt timing + offset)
-  for (let i = effectiveSlots.length - 1; i >= 0; i--) {
-    const slot = effectiveSlots[i];
-    if (new Date(slot.startIso).getTime() <= nowMs) {
-      return { state: slot.state, startIso: slot.startIso };
-    }
-  }
+  // ── Normal schedule-driven path (AUTO and MANUAL both use this) ───────────
+  // Both modes derive state purely from the offset-shifted effective schedule.
+  // The difference is upstream: in MANUAL mode Growatt events don't update the
+  // master prediction's `currentState` for user display purposes; here we just
+  // read whatever the shifted schedule says regardless of mode.
+  const bestSlot = findBestSlot();
+  if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
 
-  return { state: masterCurrentState, startIso: null };
+  // No slot has started yet — user is in the pre-schedule state.
+  return derivePreScheduleState();
 }
 
 // ── Human-friendly Arabic duration range label (spec §23) ──────────────────────
