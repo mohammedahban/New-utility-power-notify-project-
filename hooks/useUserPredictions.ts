@@ -571,36 +571,34 @@ function elapsedLabel(startIso: string | null): string {
 }
 
 // ── Lost-Time Reconciliation (spec §CYCLE CONTINUITY RULE) ──────────────────
-// When exiting UNCERTAIN_ZONE via Growatt confirmation:
-//   next cycle start = user cycle start + actual Growatt duration
-// This prevents artificial gaps and correctly shows elapsed time in new state.
+// When Growatt finally confirms a transition after UNCERTAIN_ZONE, the new
+// state's start is backdated to:  growattTransitionTime + userOffsetMs
 //
-// Parameters:
-//   userCycleStartIso: when the user's current (held) cycle began
-//   growattActualDurationMin: the actual ON/OFF duration Growatt measured
-//   heldState: the state that was being held during UNCERTAIN_ZONE
-//   effectiveSlots: the shifted schedule to find the next slot
-// Returns: the corrected start ISO for the next cycle (backdated start)
+// Why: offset shifts timestamps only, never duration (spec §PRINCIPLE 2).
+// If Growatt transitioned at T and user has offset -60min, their transition
+// effectively happened at T-60min, so elapsed time in the new state = now - (T-60min).
+//
+// This is ALWAYS more accurate than the old "userCycleStart + growattDuration"
+// approach because lastTransitionAt is the precise Growatt event timestamp.
 function computeReconciledCycleStart(
-  userCycleStartIso: string | null,
-  growattActualDurationMin: number | null,
+  growattLastTransitionAt: string | null,
+  offsetMs: number,
   heldState: 'ON' | 'OFF',
-  effectiveSlots: ShiftedScheduleSlot[],
   masterCurrentState: 'ON' | 'OFF',
 ): string | null {
-  // Only applies when Growatt has confirmed a transition (state changed)
+  // Only applies when Growatt has confirmed a transition (state flipped)
   if (heldState === masterCurrentState) return null;
-  if (!userCycleStartIso || !growattActualDurationMin || growattActualDurationMin <= 0) return null;
+  if (!growattLastTransitionAt) return null;
 
-  // Corrected user cycle end = user cycle start + actual Growatt duration
-  // (spec: offset shifts timestamps only, never duration)
-  const reconciledEndMs =
-    new Date(userCycleStartIso).getTime() + growattActualDurationMin * 60_000;
+  // Backdated start = Growatt transition time + user offset
+  // For negative offset (-60min): start = growattTransitionTime - 60min (earlier)
+  // For positive offset (+60min): start = growattTransitionTime + 60min (later)
+  const reconciledStartMs = new Date(growattLastTransitionAt).getTime() + offsetMs;
 
-  // Verify this is in the past (the cycle has already ended)
-  if (reconciledEndMs >= Date.now()) return null;
+  // Verify this is in the past (the transition has already occurred)
+  if (reconciledStartMs >= Date.now()) return null;
 
-  return new Date(reconciledEndMs).toISOString();
+  return new Date(reconciledStartMs).toISOString();
 }
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -625,41 +623,90 @@ export function applyOffsetToPrediction(
 
   const atcState = computeATCState(effectiveSlots, offsetMinutes, resyncPoint ?? null, prediction, transitionMode);
 
-  const { state: currentState, startIso: currentStateStartIso } =
+  let { state: currentState, startIso: currentStateStartIso } =
     deriveCurrentStateATC(effectiveSlots, atcState.mode, prediction.currentState, resyncPoint ?? null, transitionMode);
+
+  let isHolding = atcShouldHold(atcState.mode);
+  let finalAtcState = atcState;
+  let reconciledCycleStartIso: string | null = null;
+
+  // ── UNCERTAIN_ZONE EXIT via Growatt confirmation (AUTO mode, spec §EXITING UNCERTAIN_ZONE) ──
+  // When the user with negative offset is held in UNCERTAIN_ZONE and Growatt
+  // finally transitions (masterCurrentState !== heldState), immediately exit
+  // UNCERTAIN_ZONE in AUTO mode.
+  //
+  // New state start is backdated to: growattTransitionTime + offsetMs
+  // Example: Growatt OFF at 04:00, offset -60 → user OFF started at 03:00,
+  //          elapsed = 60 minutes ("منذ ساعة").
+  //
+  // In MANUAL mode: Growatt transition does NOT exit UNCERTAIN_ZONE.
+  //                 Only community/user report can exit it.
+  if (
+    atcState.mode === 'UNCERTAIN_ZONE' &&
+    transitionMode === 'AUTO' &&
+    prediction.currentState !== currentState // Growatt confirmed a flip
+  ) {
+    // Compute backdated start for the NEW state
+    const backdatedStart = computeReconciledCycleStart(
+      prediction.lastTransitionAt,
+      offsetMs,
+      currentState,           // heldState = old state (about to be left)
+      prediction.currentState, // masterCurrentState = new Growatt state
+    );
+
+    if (backdatedStart) {
+      reconciledCycleStartIso = backdatedStart;
+      currentState = prediction.currentState as 'ON' | 'OFF';
+      currentStateStartIso = backdatedStart;
+      isHolding = false;
+      finalAtcState = {
+        ...atcState,
+        mode: 'NORMAL',
+        overrunMinutes: 0,
+        statusLine: null,
+        communityElevated: false,
+      };
+    }
+  }
+
+  // ── WAITING_FOR_GROWATT EXIT for positive/neutral offset (AUTO mode) ────────
+  // Positive offset: user is BEHIND Growatt. Growatt already transitioned.
+  // Once the user's shifted schedule says the new state started, transition.
+  // This is already handled by deriveCurrentStateATC reading the shifted slots.
+  // But when ATC is holding in WAITING_FOR_GROWATT and Growatt has confirmed
+  // (masterCurrentState != heldState), exit immediately in AUTO mode.
+  if (
+    (atcState.mode === 'WAITING_FOR_GROWATT' || atcState.mode === 'GRACE_MODE') &&
+    transitionMode === 'AUTO' &&
+    prediction.currentState !== currentState // Growatt confirmed a flip
+  ) {
+    // For positive offset: new state start = growattTransitionTime + offsetMs
+    // (which will be in the future relative to Growatt but may be in the past already)
+    const backdatedStart = computeReconciledCycleStart(
+      prediction.lastTransitionAt,
+      offsetMs,
+      currentState,
+      prediction.currentState,
+    );
+
+    if (backdatedStart) {
+      reconciledCycleStartIso = backdatedStart;
+      currentState = prediction.currentState as 'ON' | 'OFF';
+      currentStateStartIso = backdatedStart;
+      isHolding = false;
+      finalAtcState = {
+        ...atcState,
+        mode: 'NORMAL',
+        overrunMinutes: 0,
+        statusLine: null,
+        communityElevated: false,
+      };
+    }
+  }
 
   const nextTransition = prediction.isUnstable
     ? null
     : deriveNextTransition(effectiveSlots, currentState, prediction);
-
-  const isHolding = atcShouldHold(atcState.mode);
-
-  // ── Lost-Time Reconciliation (spec §CYCLE CONTINUITY RULE) ─────────────────
-  // When the system was holding in UNCERTAIN_ZONE and Growatt has now confirmed
-  // the transition (masterCurrentState differs from held state), compute the
-  // backdated start for the new cycle so elapsed time is correct and no gap
-  // is created in the timeline.
-  //
-  // Growatt's actual duration = from its last transition to now (approximated
-  // by the APPPE currentStateDurationMin which tracks the master cycle duration).
-  const heldStateForReconciliation: 'ON' | 'OFF' | null =
-    (atcState.mode === 'UNCERTAIN_ZONE' || isHolding) ? currentState : null;
-
-  let reconciledCycleStartIso: string | null = null;
-  if (
-    heldStateForReconciliation !== null &&
-    heldStateForReconciliation !== prediction.currentState &&
-    heldCycleStartIso
-  ) {
-    // Growatt has confirmed the transition — compute reconciled start
-    reconciledCycleStartIso = computeReconciledCycleStart(
-      heldCycleStartIso,
-      prediction.currentStateDurationMin, // Growatt's actual cycle duration
-      heldStateForReconciliation,
-      effectiveSlots,
-      prediction.currentState,
-    );
-  }
 
   const durLabel = elapsedLabel(reconciledCycleStartIso ?? currentStateStartIso);
 
@@ -689,7 +736,7 @@ export function applyOffsetToPrediction(
     crisisReason: prediction.apppe?.crisisReason ?? null,
     isResynced: hasResync,
     resyncedAtIso: resyncPoint?.syncedAtIso ?? null,
-    atc: atcState,
+    atc: finalAtcState,
     isHoldingState: isHolding,
     reconciledCycleStartIso,
     communitySyncMeta: communitySyncMeta
@@ -707,7 +754,7 @@ export function useUserPredictions(
   offsetMinutes: number,
   resyncPoint?: ResyncPoint | null,
   transitionMode: TransitionMode = 'AUTO',
-  /** Passed from useStateAnchor — the start of the currently anchored state */
+  /** Passed from useStateAnchor — start of currently anchored state (for lost-time reconciliation) */
   heldCycleStartIso?: string | null,
 ) {
   const [rawPrediction, setRawPrediction] = useState<Prediction | null>(null);

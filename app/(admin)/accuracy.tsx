@@ -2,10 +2,10 @@
  * Prediction Accuracy Center — Admin Analytics Module 1
  * Read-only. Never modifies prediction logic.
  */
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, TouchableOpacity,
-  ActivityIndicator, RefreshControl,
+  ActivityIndicator, RefreshControl, Alert, Platform, Modal,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { supabase } from '../../lib/supabase';
@@ -47,21 +47,16 @@ interface Stats {
 function computeStats(logs: AccuracyLog[]): Stats {
   if (logs.length === 0) return { overall: 0, avgError: 0, onAccuracy: 0, offAccuracy: 0, count: 0, trend: 'stable', trendDelta: 0 };
   const avg = (arr: number[]) => arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length;
-  const scores = logs.map(l => l.accuracy_score);
-  const errors = logs.map(l => l.error_minutes);
   const onLogs = logs.filter(l => l.predicted_state === 'UTILITY_ON');
   const offLogs = logs.filter(l => l.predicted_state === 'UTILITY_OFF');
-
-  // Trend: compare first half vs second half accuracy
   const half = Math.max(1, Math.floor(logs.length / 2));
   const firstHalf = logs.slice(0, half).map(l => l.accuracy_score);
   const secondHalf = logs.slice(half).map(l => l.accuracy_score);
   const delta = avg(secondHalf) - avg(firstHalf);
   const trend = delta > 3 ? 'improving' : delta < -3 ? 'declining' : 'stable';
-
   return {
-    overall: Math.round(avg(scores)),
-    avgError: Math.round(avg(errors)),
+    overall: Math.round(avg(logs.map(l => l.accuracy_score))),
+    avgError: Math.round(avg(logs.map(l => l.error_minutes))),
     onAccuracy: Math.round(avg(onLogs.map(l => l.accuracy_score))),
     offAccuracy: Math.round(avg(offLogs.map(l => l.accuracy_score))),
     count: logs.length,
@@ -107,8 +102,7 @@ const tStyles = StyleSheet.create({
   text: { fontSize: 12, fontWeight: '700' },
 });
 
-// ── 7-day Sparkline ────────────────────────────────────────────────────────
-
+// ── 7-day Sparkline ──────────────────────────────────────────────────────────
 interface DayPoint { label: string; avg: number; count: number; }
 
 function buildDailyPoints(logs: AccuracyLog[]): DayPoint[] {
@@ -124,7 +118,7 @@ function buildDailyPoints(logs: AccuracyLog[]): DayPoint[] {
     const avg = dayLogs.length === 0
       ? 0
       : dayLogs.reduce((s, l) => s + l.accuracy_score, 0) / dayLogs.length;
-    const date = new Date(dayStart + 43200000); // midday of that day
+    const date = new Date(dayStart + 43200000);
     const label = date.toLocaleDateString('ar-SA', {
       timeZone: 'Asia/Aden', month: 'short', day: 'numeric',
     });
@@ -136,30 +130,8 @@ function buildDailyPoints(logs: AccuracyLog[]): DayPoint[] {
 function AccuracySparkline({ logs }: { logs: AccuracyLog[] }) {
   const points = buildDailyPoints(logs);
   const hasData = points.some(p => p.count > 0);
-  const CHART_W = 320;
   const CHART_H = 80;
-  const PAD_X = 6;
   const PAD_Y = 8;
-  const usableW = CHART_W - PAD_X * 2;
-  const usableH = CHART_H - PAD_Y * 2;
-
-  // Y: 0–100 accuracy range
-  const toX = (i: number) => PAD_X + (i / (points.length - 1)) * usableW;
-  const toY = (v: number) => PAD_Y + usableH - (v / 100) * usableH;
-
-  // Build SVG polyline points string
-  const linePoints = points
-    .map((p, i) => `${toX(i).toFixed(1)},${toY(p.avg).toFixed(1)}`)
-    .join(' ');
-
-  // Fill area path
-  const areaPath = points.length > 0
-    ? `M${toX(0).toFixed(1)},${(PAD_Y + usableH).toFixed(1)} ` +
-      points.map((p, i) => `L${toX(i).toFixed(1)},${toY(p.avg).toFixed(1)}`).join(' ') +
-      ` L${toX(points.length - 1).toFixed(1)},${(PAD_Y + usableH).toFixed(1)} Z`
-    : '';
-
-  // Reference lines at 70 and 90
   const refLines = [70, 90];
 
   return (
@@ -175,61 +147,41 @@ function AccuracySparkline({ logs }: { logs: AccuracyLog[] }) {
         </View>
       ) : (
         <View style={spStyles.chartWrap}>
-          {/* Y-axis reference lines rendered as Views */}
           {refLines.map(ref => {
             const yPct = (1 - ref / 100) * 100;
             return (
-              <View
-                key={ref}
-                style={[spStyles.refLine, { top: `${yPct}%` as any }]}
-              >
+              <View key={ref} style={[spStyles.refLine, { top: `${yPct}%` as any }]}>
                 <Text style={spStyles.refLabel}>{ref}%</Text>
               </View>
             );
           })}
-
-          {/* Bars + dots for each day */}
           {points.map((p, i) => {
             const barH = p.count === 0 ? 0 : Math.max(4, (p.avg / 100) * (CHART_H - PAD_Y * 2));
             const barColor = p.avg >= 85 ? T.success : p.avg >= 65 ? T.warning : T.danger;
-            const barOpacity = p.count === 0 ? 0.15 : 0.8;
             return (
               <View key={i} style={spStyles.barCol}>
                 <Text style={[spStyles.dotVal, { color: p.count === 0 ? T.textMuted : barColor }]}>
                   {p.count === 0 ? '—' : `${p.avg}%`}
                 </Text>
                 <View style={spStyles.barTrack}>
-                  <View
-                    style={[
-                      spStyles.barFill,
-                      { height: barH, backgroundColor: barColor, opacity: barOpacity },
-                    ]}
-                  />
+                  <View style={[spStyles.barFill, { height: barH, backgroundColor: barColor, opacity: p.count === 0 ? 0.15 : 0.8 }]} />
                 </View>
                 <Text style={spStyles.dayLabel}>{p.label}</Text>
-                {p.count > 0 && (
-                  <Text style={spStyles.countLabel}>{p.count}</Text>
-                )}
+                {p.count > 0 && <Text style={spStyles.countLabel}>{p.count}</Text>}
               </View>
             );
           })}
         </View>
       )}
 
-      {/* Trend arrow */}
       {hasData && (() => {
         const withData = points.filter(p => p.count > 0);
         if (withData.length < 2) return null;
-        const first = withData[0].avg;
-        const last  = withData[withData.length - 1].avg;
-        const delta = last - first;
+        const delta = withData[withData.length - 1].avg - withData[0].avg;
         const trendColor = delta > 3 ? T.success : delta < -3 ? T.danger : T.warning;
         const trendIcon  = delta > 3 ? '↑' : delta < -3 ? '↓' : '→';
-        const trendLabel = delta > 3
-          ? `تحسّن ${Math.abs(Math.round(delta))}% خلال الأسبوع`
-          : delta < -3
-          ? `تراجع ${Math.abs(Math.round(delta))}% خلال الأسبوع`
-          : 'مستقر خلال الأسبوع';
+        const trendLabel = delta > 3 ? `تحسّن ${Math.abs(Math.round(delta))}% خلال الأسبوع`
+          : delta < -3 ? `تراجع ${Math.abs(Math.round(delta))}% خلال الأسبوع` : 'مستقر خلال الأسبوع';
         return (
           <View style={[spStyles.trendRow, { backgroundColor: trendColor + '15' }]}>
             <Text style={[spStyles.trendText, { color: trendColor }]}>{trendIcon} {trendLabel}</Text>
@@ -241,23 +193,14 @@ function AccuracySparkline({ logs }: { logs: AccuracyLog[] }) {
 }
 
 const spStyles = StyleSheet.create({
-  card: {
-    backgroundColor: '#1e293b', borderRadius: 16, padding: 16, marginBottom: 14,
-    borderWidth: 1, borderColor: '#334155',
-  },
+  card: { backgroundColor: '#1e293b', borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: '#334155' },
   headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
   title: { color: '#64748b', fontSize: 11, fontWeight: '700', letterSpacing: 1 },
   badge: { color: '#475569', fontSize: 10 },
   emptyArea: { height: 60, alignItems: 'center', justifyContent: 'center' },
   emptyText: { color: '#475569', fontSize: 12 },
-  chartWrap: {
-    flexDirection: 'row-reverse', alignItems: 'flex-end',
-    height: 110, gap: 4, position: 'relative', paddingHorizontal: 4,
-  },
-  refLine: {
-    position: 'absolute', left: 0, right: 0, height: 1,
-    backgroundColor: '#334155', flexDirection: 'row-reverse', alignItems: 'center',
-  },
+  chartWrap: { flexDirection: 'row-reverse', alignItems: 'flex-end', height: 110, gap: 4, position: 'relative', paddingHorizontal: 4 },
+  refLine: { position: 'absolute', left: 0, right: 0, height: 1, backgroundColor: '#334155', flexDirection: 'row-reverse', alignItems: 'center' },
   refLabel: { color: '#475569', fontSize: 8, position: 'absolute', right: 0, top: -8 },
   barCol: { flex: 1, alignItems: 'center', justifyContent: 'flex-end', gap: 3 },
   barTrack: { width: '80%', maxWidth: 28, height: 80, justifyContent: 'flex-end', backgroundColor: '#0f172a', borderRadius: 4, overflow: 'hidden' },
@@ -270,24 +213,22 @@ const spStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-
 function InsightWidget({ logs }: { logs: AccuracyLog[] }) {
   if (logs.length < 3) return null;
   const onLogs = logs.filter(l => l.predicted_state === 'UTILITY_ON');
   const offLogs = logs.filter(l => l.predicted_state === 'UTILITY_OFF');
-  const avgOn = onLogs.length ? onLogs.reduce((s, l) => s + l.accuracy_score, 0) / onLogs.length : 0;
+  const avgOn  = onLogs.length  ? onLogs.reduce((s, l) => s + l.accuracy_score, 0) / onLogs.length  : 0;
   const avgOff = offLogs.length ? offLogs.reduce((s, l) => s + l.accuracy_score, 0) / offLogs.length : 0;
   const recent7 = logs.filter(l => Date.now() - new Date(l.created_at).getTime() < 7 * 86400000);
   const avgRecent = recent7.length ? recent7.reduce((s, l) => s + l.accuracy_score, 0) / recent7.length : 0;
   const avgAll = logs.reduce((s, l) => s + l.accuracy_score, 0) / logs.length;
   const insights: string[] = [];
-  if (avgRecent - avgAll > 5) insights.push(`تحسّنت دقة التوقع بنسبة ${Math.round(avgRecent - avgAll)}% هذا الأسبوع.`);
+  if (avgRecent - avgAll > 5)  insights.push(`تحسّنت دقة التوقع بنسبة ${Math.round(avgRecent - avgAll)}% هذا الأسبوع.`);
   if (avgRecent - avgAll < -5) insights.push(`تراجعت دقة التوقع بنسبة ${Math.round(avgAll - avgRecent)}% مؤخراً — قد يكون هناك تغيير في نمط الشبكة.`);
   if (avgOn - avgOff > 10) insights.push(`أنماط الليل أكثر قدرة على التنبؤ من أنماط النهار.`);
   if (avgOff - avgOn > 10) insights.push(`أنماط التشغيل أكثر قدرة على التنبؤ من أنماط الانقطاع.`);
   if (logs.some(l => l.error_minutes > 60)) insights.push(`بعض الأحداث تجاوزت خطأ 60 دقيقة — يُنصح بمراجعة نماذج APPPE.`);
   if (insights.length === 0) insights.push(`دقة التوقع مستقرة ومتسقة عبر أنواع الأحداث المختلفة.`);
-
   return (
     <View style={insStyles.card}>
       <Text style={insStyles.title}>💡 تحليل ذكي</Text>
@@ -346,12 +287,136 @@ const logStyles = StyleSheet.create({
   sub: { color: '#475569', fontSize: 11, textAlign: 'right' },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BACKFILL ENGINE
+// Scans power_events history (last 30 days) against the current APPPE snapshot
+// and inserts missing accuracy logs for events that have no entry yet.
+// Read-only w.r.t. predictions — only writes to prediction_accuracy_logs.
+// ─────────────────────────────────────────────────────────────────────────────
+async function runBackfill(): Promise<{ inserted: number; skipped: number; error: string | null }> {
+  const MAX_ALLOWED_ERROR_MIN = 150;
+
+  const { data: predRow, error: predErr } = await supabase
+    .from('utility_predictions')
+    .select('prediction, computed_at')
+    .eq('id', 1)
+    .maybeSingle();
+
+  if (predErr || !predRow?.prediction) {
+    return { inserted: 0, skipped: 0, error: 'لا توجد بيانات توقعات — شغّل analyze-patterns أولاً' };
+  }
+
+  const pred = predRow.prediction as any;
+  const slots: any[] = pred.daySchedule ?? pred.slots ?? pred.schedule ?? [];
+  if (slots.length === 0) {
+    return { inserted: 0, skipped: 0, error: 'جدول التوقعات فارغ في السجل الحالي' };
+  }
+
+  const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const { data: events, error: evErr } = await supabase
+    .from('power_events')
+    .select('id, event_type, occurred_at')
+    .gte('occurred_at', since)
+    .order('occurred_at', { ascending: true });
+
+  if (evErr || !events || events.length === 0) {
+    return { inserted: 0, skipped: 0, error: 'لا توجد أحداث كهرباء مسجّلة في آخر 30 يوماً' };
+  }
+
+  const { data: existing } = await supabase
+    .from('prediction_accuracy_logs')
+    .select('actual_event_time')
+    .gte('created_at', since);
+
+  const existingTimes = new Set(
+    (existing ?? []).map((e: any) => new Date(e.actual_event_time).toISOString().slice(0, 16))
+  );
+
+  const toInsert: object[] = [];
+
+  for (const ev of events) {
+    const eventMs = new Date(ev.occurred_at).getTime();
+    const eventMinKey = new Date(ev.occurred_at).toISOString().slice(0, 16);
+    if (existingTimes.has(eventMinKey)) continue;
+
+    const targetState = ev.event_type === 'UTILITY_ON' ? 'ON' : 'OFF';
+    let matchingSlot: any = null;
+    let minDist = Infinity;
+
+    for (const slot of slots) {
+      if (slot.state !== targetState) continue;
+      const slotMs = new Date(slot.startIso ?? slot.start_iso ?? '').getTime();
+      if (!slotMs) continue;
+      // Time-of-day distance (mod 24h): yesterday's 08:00 matches today's 08:00 slot
+      const eventHourMs = eventMs % 86_400_000;
+      const slotHourMs  = slotMs  % 86_400_000;
+      let dist = Math.abs(eventHourMs - slotHourMs);
+      if (dist > 43_200_000) dist = 86_400_000 - dist;
+      if (dist < minDist) { minDist = dist; matchingSlot = slot; }
+    }
+
+    if (!matchingSlot) continue;
+
+    const predictedMs = new Date(matchingSlot.startIso ?? matchingSlot.start_iso ?? '').getTime();
+    if (!predictedMs) continue;
+
+    // Time-of-day error (ignore date difference)
+    let errorMs = Math.abs((eventMs % 86_400_000) - (predictedMs % 86_400_000));
+    if (errorMs > 43_200_000) errorMs = 86_400_000 - errorMs;
+    const errorMin = errorMs / 60_000;
+    const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
+
+    // Predicted ISO: event's date + slot's time-of-day
+    const eventDate = new Date(ev.occurred_at);
+    const slotDate  = new Date(matchingSlot.startIso ?? matchingSlot.start_iso);
+    const predictedIso = new Date(Date.UTC(
+      eventDate.getUTCFullYear(), eventDate.getUTCMonth(), eventDate.getUTCDate(),
+      slotDate.getUTCHours(), slotDate.getUTCMinutes(), 0, 0
+    )).toISOString();
+
+    toInsert.push({
+      predicted_event_time: predictedIso,
+      actual_event_time: ev.occurred_at,
+      predicted_state: ev.event_type,
+      actual_state: ev.event_type,
+      error_minutes: Math.round(errorMin * 100) / 100,
+      accuracy_score: Math.round(accuracyScore * 100) / 100,
+      confidence_score: typeof matchingSlot.confidence === 'number' ? matchingSlot.confidence : null,
+      prediction_generated_at: predRow.computed_at ?? null,
+      slot_id: matchingSlot.slotId ?? matchingSlot.slot_id ?? null,
+    });
+  }
+
+  if (toInsert.length === 0) {
+    return { inserted: 0, skipped: events.length, error: null };
+  }
+
+  let inserted = 0;
+  const CHUNK = 50;
+  for (let i = 0; i < toInsert.length; i += CHUNK) {
+    const { error: insErr } = await supabase.from('prediction_accuracy_logs').insert(toInsert.slice(i, i + CHUNK));
+    if (!insErr) inserted += Math.min(CHUNK, toInsert.length - i);
+  }
+
+  return { inserted, skipped: events.length - toInsert.length, error: null };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
 export default function AccuracyScreen() {
   const insets = useSafeAreaInsets();
   const [range, setRange] = useState<Range>('7');
   const [logs, setLogs] = useState<AccuracyLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillResult, setBackfillResult] = useState<{ inserted: number; skipped: number } | null>(null);
+  const [alertVisible, setAlertVisible] = useState(false);
+  const [alertMsg, setAlertMsg] = useState('');
+
+  // Use ref so handleBackfill can call fetchLogs without circular dependency
+  const fetchLogsRef = useRef<() => Promise<void>>(async () => {});
 
   const fetchLogs = useCallback(async () => {
     setLoading(true);
@@ -373,7 +438,33 @@ export default function AccuracyScreen() {
     setLoading(false);
   }, [range]);
 
+  // Keep ref in sync so handleBackfill always calls the latest fetchLogs
+  useEffect(() => { fetchLogsRef.current = fetchLogs; }, [fetchLogs]);
+
   useEffect(() => { fetchLogs(); }, [fetchLogs]);
+
+  const showAlert = useCallback((msg: string) => {
+    if (Platform.OS === 'web') { setAlertMsg(msg); setAlertVisible(true); }
+    else Alert.alert('نتيجة الاسترجاع', msg);
+  }, []);
+
+  const handleBackfill = useCallback(async () => {
+    setBackfilling(true);
+    setBackfillResult(null);
+    const result = await runBackfill();
+    setBackfilling(false);
+    if (result.error) {
+      showAlert(`فشل الاسترجاع:\n${result.error}`);
+    } else {
+      setBackfillResult({ inserted: result.inserted, skipped: result.skipped });
+      showAlert(
+        result.inserted === 0
+          ? `جميع الأحداث مُسجّلة مسبقاً (${result.skipped} حدث).`
+          : `تمّ استرجاع ${result.inserted} سجل دقة جديد.\n(تم تخطي ${result.skipped} حدث موجود مسبقاً)`,
+      );
+      await fetchLogsRef.current();
+    }
+  }, [showAlert]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -399,6 +490,52 @@ export default function AccuracyScreen() {
       showsVerticalScrollIndicator={false}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={T.accent} />}
     >
+      {/* Web alert modal */}
+      {Platform.OS === 'web' && (
+        <Modal visible={alertVisible} transparent animationType="fade">
+          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+            <View style={{ backgroundColor: T.surface, padding: 24, borderRadius: 16, minWidth: 280, maxWidth: 360, borderWidth: 1, borderColor: T.border }}>
+              <Text style={{ color: T.textPrimary, fontSize: 15, fontWeight: '700', marginBottom: 12, textAlign: 'right' }}>نتيجة الاسترجاع</Text>
+              <Text style={{ color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 20 }}>{alertMsg}</Text>
+              <TouchableOpacity
+                style={{ backgroundColor: T.accent + '22', borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: T.accent + '55' }}
+                onPress={() => setAlertVisible(false)}
+              >
+                <Text style={{ color: T.accent, fontWeight: '700', fontSize: 14 }}>حسناً</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+      )}
+
+      {/* Backfill banner */}
+      <View style={bfStyles.banner}>
+        <View style={{ flex: 1 }}>
+          <Text style={bfStyles.title}>📊 استرجاع سجلات الدقة</Text>
+          <Text style={bfStyles.sub}>
+            يقارن أحداث الكهرباء التاريخية (آخر 30 يوماً) بأنماط APPPE الحالية ويُنشئ سجلات الدقة المفقودة فوراً.
+          </Text>
+          {backfillResult ? (
+            <Text style={[bfStyles.result, { color: backfillResult.inserted > 0 ? T.success : T.textMuted }]}>
+              {backfillResult.inserted > 0
+                ? `✓ أُضيف ${backfillResult.inserted} سجل جديد`
+                : `✓ جميع السجلات موجودة مسبقاً`}
+            </Text>
+          ) : null}
+        </View>
+        <TouchableOpacity
+          style={[bfStyles.btn, backfilling && { opacity: 0.6 }]}
+          onPress={handleBackfill}
+          disabled={backfilling}
+          activeOpacity={0.8}
+        >
+          {backfilling
+            ? <ActivityIndicator size="small" color={T.accent} />
+            : <Text style={bfStyles.btnText}>استرجاع</Text>
+          }
+        </TouchableOpacity>
+      </View>
+
       {/* Range filter */}
       <View style={styles.filterRow}>
         {ranges.map(r => (
@@ -422,11 +559,10 @@ export default function AccuracyScreen() {
         <View style={styles.emptyBox}>
           <Text style={styles.emptyIcon}>📊</Text>
           <Text style={styles.emptyTitle}>لا توجد بيانات دقة بعد</Text>
-          <Text style={styles.emptySub}>تُسجَّل بيانات الدقة تلقائياً في كل مرة يكتشف فيها Growatt تغيّراً حقيقياً في الكهرباء.</Text>
+          <Text style={styles.emptySub}>اضغط "استرجاع" أعلاه لتعبئة السجلات من أحداث الكهرباء السابقة، أو انتظر حتى يكتشف Growatt تغيّراً جديداً.</Text>
         </View>
       ) : (
         <>
-          {/* Main accuracy gauges */}
           <View style={styles.card}>
             <View style={styles.cardHeader}>
               <TrendBadge trend={stats.trend} delta={stats.trendDelta} />
@@ -440,7 +576,6 @@ export default function AccuracyScreen() {
             </View>
           </View>
 
-          {/* Stats pills */}
           <View style={styles.pillsRow}>
             <View style={styles.pill}>
               <Text style={styles.pillVal}>{stats.avgError} د</Text>
@@ -460,15 +595,14 @@ export default function AccuracyScreen() {
             </View>
           </View>
 
-          {/* Error distribution bar */}
           <View style={styles.card}>
             <Text style={styles.cardTitle}>توزيع الخطأ</Text>
             {[
-              { label: '< 5 د', filter: (e: number) => e < 5, color: T.success },
-              { label: '5–15 د', filter: (e: number) => e >= 5 && e < 15, color: '#86efac' },
-              { label: '15–30 د', filter: (e: number) => e >= 15 && e < 30, color: T.warning },
-              { label: '30–60 د', filter: (e: number) => e >= 30 && e < 60, color: '#f97316' },
-              { label: '> 60 د', filter: (e: number) => e >= 60, color: T.danger },
+              { label: '< 5 د',   filter: (e: number) => e < 5,              color: T.success },
+              { label: '5–15 د',  filter: (e: number) => e >= 5 && e < 15,   color: '#86efac' },
+              { label: '15–30 د', filter: (e: number) => e >= 15 && e < 30,  color: T.warning },
+              { label: '30–60 د', filter: (e: number) => e >= 30 && e < 60,  color: '#f97316' },
+              { label: '> 60 د',  filter: (e: number) => e >= 60,            color: T.danger },
             ].map(bucket => {
               const count = logs.filter(l => bucket.filter(l.error_minutes)).length;
               const pct = logs.length > 0 ? (count / logs.length) * 100 : 0;
@@ -485,10 +619,8 @@ export default function AccuracyScreen() {
           </View>
 
           <AccuracySparkline logs={logs} />
-
           <InsightWidget logs={logs} />
 
-          {/* Log entries */}
           <View style={styles.card}>
             <Text style={styles.cardTitle}>أحدث الأحداث ({logs.length})</Text>
             {logs.slice(0, 30).map(l => <LogRow key={l.id} log={l} />)}
@@ -498,6 +630,24 @@ export default function AccuracyScreen() {
     </ScrollView>
   );
 }
+
+const bfStyles = StyleSheet.create({
+  banner: {
+    flexDirection: 'row-reverse', alignItems: 'center', gap: 12,
+    backgroundColor: '#0f1f2e', borderRadius: 16, padding: 16, marginBottom: 14,
+    borderWidth: 1.5, borderColor: T.accent + '44',
+  },
+  title: { color: T.accent, fontSize: 12, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  sub: { color: T.textMuted, fontSize: 11, lineHeight: 17, textAlign: 'right' },
+  result: { fontSize: 11, fontWeight: '700', textAlign: 'right', marginTop: 6 },
+  btn: {
+    backgroundColor: T.accent + '22', borderRadius: 12,
+    paddingHorizontal: 14, paddingVertical: 10,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: T.accent + '55', minWidth: 72,
+  },
+  btnText: { color: T.accent, fontSize: 13, fontWeight: '800' },
+});
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: T.bg },
