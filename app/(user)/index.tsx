@@ -1207,13 +1207,15 @@ export default function Home() {
   // ── Revert handler (used by PersonalStatusCard) ──────────────────────────
   // If a snapshot exists: show "العودة إلى الحالة الأصلية" flow
   // Otherwise: plain clearResync (old Growatt-revert behaviour)
+    // ── Revert handler (مصحح) ──────────────────────────────────────────
   const handleRevert = useCallback(() => {
     const confirmMsg = hasSnapshot
-      ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.'
+      ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك وفارق التوقيت (Offset) السابق تماماً.'
       : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
+      
     const doRestore = hasSnapshot ? handleRestoreSnapshot : clearResync;
+    
     if (Platform.OS === 'web') {
-      // Web uses Alert.alert polyfill handled inside PersonalStatusCard
       doRestore();
     } else {
       Alert.alert(
@@ -1221,11 +1223,12 @@ export default function Home() {
         confirmMsg,
         [
           { text: 'إلغاء', style: 'cancel' },
-          { text: 'تأكيد العودة', style: 'destructive', onPress: () => doRestore() },
+          { text: 'تأكيد العودة والاستعادة', style: 'destructive', onPress: () => doRestore() },
         ],
       );
     }
   }, [hasSnapshot, handleRestoreSnapshot, clearResync]);
+
   const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? '';
 
   if (loading && !userPrediction) {
