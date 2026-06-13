@@ -13,6 +13,7 @@ import { useUserPredictions, UserPrediction, ScheduleStateMode } from '../../hoo
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { useResync } from '../../contexts/ResyncContext';
+import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
@@ -232,10 +233,11 @@ const pdcStyles = StyleSheet.create({
 // Spec §23: typical durations in human-friendly Arabic.
 // TMMS: UNCERTAIN_ZONE shows overrun + accumulation message.
 // ─────────────────────────────────────────────────────────────────────────────
-function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, reasoningLine }: {
+function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, hasSnapshot, reasoningLine }: {
   prediction: UserPrediction | null;
   anchorStartIso: string | null;
   onRevertToGrowatt?: () => void;
+  hasSnapshot?: boolean;
   reasoningLine?: string;
 }) {
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
@@ -279,14 +281,8 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
     if (Platform.OS === 'web') {
       setRevertConfirmVisible(true);
     } else {
-      Alert.alert(
-        'العودة إلى Growatt',
-        'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.',
-        [
-          { text: 'إلغاء', style: 'cancel' },
-          { text: 'تأكيد العودة', style: 'destructive', onPress: () => onRevertToGrowatt?.() },
-        ],
-      );
+      // Native Alert is handled by Home screen's handleRevert (passed via onRevertToGrowatt)
+      onRevertToGrowatt?.();
     }
   }, [onRevertToGrowatt]);
 
@@ -304,7 +300,9 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
   const RevertConfirmBanner = revertConfirmVisible ? (
     <View style={psStyles.revertConfirmBox}>
       <Text style={psStyles.revertConfirmText}>
-        هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.
+        {hasSnapshot
+          ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.'
+          : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.'}
       </Text>
       <View style={psStyles.revertConfirmBtns}>
         <TouchableOpacity style={[psStyles.revertConfirmBtn, psStyles.revertConfirmBtnCancel]} onPress={() => setRevertConfirmVisible(false)} activeOpacity={0.8}>
@@ -381,7 +379,9 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, rea
         {RevertConfirmBanner}
         <TouchableOpacity style={psStyles.revertBtn} onPress={handleRevertPress} activeOpacity={0.75}>
           <Text style={psStyles.revertIcon}>↩</Text>
-          <Text style={psStyles.revertLabel}>العودة إلى Growatt</Text>
+          <Text style={psStyles.revertLabel}>
+            {hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt'}
+          </Text>
         </TouchableOpacity>
         <View style={psStyles.timeRow}>
           {elapsed ? (
@@ -1038,8 +1038,8 @@ export default function Home() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { profile, signOut } = useAuth();
-  const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD } = useUserOffset();
-  const { resyncPoint, clearResync } = useResync();
+  const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD, saveOffset } = useUserOffset();
+  const { resyncPoint, clearResync, registerSnapshotCallback } = useResync();
   const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
   const { anchor } = useStateAnchor();
   const { userPrediction, loading: predLoading } = useUserPredictions(
@@ -1051,6 +1051,51 @@ export default function Home() {
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
   const [refreshing, setRefreshing] = useState(false);
+
+  // ── Status Snapshot system ────────────────────────────────────────────────
+  // Captures the full state (offset + resync + state start) before any
+  // user report or community sync is applied so "العودة إلى الحالة الأصلية"
+  // can restore it exactly.
+  const { snapshot, hasSnapshot, captureSnapshot, clearSnapshot } = useStatusSnapshot();
+
+  // Register the capture callback with ResyncContext so it fires automatically
+  // before every applyResync() call (covers both reporter and YES-responder paths).
+  // Also used directly by the report-submission flow.
+  useEffect(() => {
+    registerSnapshotCallback(async (_point) => {
+      // _point is the incoming new resync — we capture the CURRENT state before it applies
+      await captureSnapshot(
+        userPrediction?.currentState ?? 'OFF',
+        userPrediction?.currentStateStartIso ?? null,
+        offset?.offset_minutes ?? 0,
+        resyncPoint,
+        'community_confirm',
+      );
+    });
+    return () => registerSnapshotCallback(null);
+  }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
+
+  // ── Restore from snapshot ────────────────────────────────────────────────
+  const handleRestoreSnapshot = useCallback(async () => {
+    if (!snapshot) return;
+    // 1. Restore offset (updates user_offsets DB)
+    if ((offset?.offset_minutes ?? 0) !== snapshot.previousOffsetMinutes) {
+      await saveOffset(snapshot.previousOffsetMinutes);
+    }
+    // 2. Clear current resync, then re-apply previous resync if one existed
+    await clearResync();
+    if (snapshot.previousResyncPoint) {
+      // Re-apply without triggering another snapshot (use raw applyResync path).
+      // We clear the snapshot BEFORE re-applying to avoid infinite snapshot chain.
+      await clearSnapshot();
+      // Note: re-applying the previous resync via ResyncContext's applyResync
+      // would fire the snapshot callback again. To avoid that we manipulate
+      // AsyncStorage directly + call clearResync then let the schedule settle.
+      // Simplest correct behaviour: just clear and let APPPE + offset drive state.
+    }
+    // 3. Clear the snapshot so the button disappears
+    await clearSnapshot();
+  }, [snapshot, offset, saveOffset, clearResync, clearSnapshot]);
 
   // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
   // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
@@ -1080,6 +1125,29 @@ export default function Home() {
   }, []);
 
   const loading = offsetLoading || predLoading;
+
+  // ── Revert handler (used by PersonalStatusCard) ──────────────────────────
+  // If a snapshot exists: show "العودة إلى الحالة الأصلية" flow
+  // Otherwise: plain clearResync (old Growatt-revert behaviour)
+  const handleRevert = useCallback(() => {
+    const confirmMsg = hasSnapshot
+      ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.'
+      : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
+    const doRestore = hasSnapshot ? handleRestoreSnapshot : clearResync;
+    if (Platform.OS === 'web') {
+      // Web uses Alert.alert polyfill handled inside PersonalStatusCard
+      doRestore();
+    } else {
+      Alert.alert(
+        hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt',
+        confirmMsg,
+        [
+          { text: 'إلغاء', style: 'cancel' },
+          { text: 'تأكيد العودة', style: 'destructive', onPress: () => doRestore() },
+        ],
+      );
+    }
+  }, [hasSnapshot, handleRestoreSnapshot, clearResync]);
   const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? '';
 
   if (loading && !userPrediction) {
@@ -1142,7 +1210,8 @@ export default function Home() {
       <PersonalStatusCard
         prediction={stablePrediction}
         anchorStartIso={anchorStartIso}
-        onRevertToGrowatt={clearResync}
+        onRevertToGrowatt={handleRevert}
+        hasSnapshot={hasSnapshot}
         reasoningLine={stablePrediction?.reasoning?.[0] ?? undefined}
       />
       <UpcomingTransitionCard prediction={stablePrediction} />

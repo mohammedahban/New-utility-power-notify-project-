@@ -48,6 +48,14 @@ interface ResyncContextType {
   resyncPoint: ResyncPoint | null;
   applyResync: (point: ResyncPoint) => Promise<void>;
   clearResync: () => Promise<void>;
+  /**
+   * Callback registered by the Home screen's useStatusSnapshot instance.
+   * ResyncContext calls this BEFORE applying a new resync so the snapshot
+   * captures the pre-sync state.  Set via registerSnapshotCallback().
+   */
+  registerSnapshotCallback: (
+    cb: ((point: ResyncPoint) => Promise<void>) | null,
+  ) => void;
 }
 
 const ResyncContext = createContext<ResyncContextType | undefined>(undefined);
@@ -59,6 +67,14 @@ const MAX_AGE_MS          = 6 * 60 * 60 * 1000; // 6 hours
 export function ResyncProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const [resyncPoint, setResyncPoint] = useState<ResyncPoint | null>(null);
+  // External snapshot callback — set by Home screen (avoids circular imports)
+  const snapshotCbRef = React.useRef<((point: ResyncPoint) => Promise<void>) | null>(null);
+  const registerSnapshotCallback = useCallback(
+    (cb: ((point: ResyncPoint) => Promise<void>) | null) => {
+      snapshotCbRef.current = cb;
+    },
+    [],
+  );
 
   // Key is per-user so switching accounts doesn't bleed state
   const storageKey = user ? `${STORAGE_KEY_PREFIX}${user.id}` : null;
@@ -123,6 +139,14 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
 
   // ── applyResync ──────────────────────────────────────────────────────────────
   const applyResync = useCallback(async (point: ResyncPoint) => {
+    // Capture snapshot BEFORE applying so the revert button can restore fully.
+    // The callback is registered by the Home screen's useStatusSnapshot hook.
+    try {
+      if (snapshotCbRef.current) {
+        await snapshotCbRef.current(point);
+      }
+    } catch (_) {}
+
     setResyncPoint(point);
     if (!storageKey) return;
     try {
@@ -140,7 +164,7 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
   }, [storageKey]);
 
   return (
-    <ResyncContext.Provider value={{ resyncPoint, applyResync, clearResync }}>
+    <ResyncContext.Provider value={{ resyncPoint, applyResync, clearResync, registerSnapshotCallback }}>
       {children}
     </ResyncContext.Provider>
   );
