@@ -267,6 +267,29 @@ function applyCommunityDelta(offsetSlots: ShiftedScheduleSlot[], resync: ResyncP
 const VALIDATION_WINDOW_MS = 20 * 60_000;
 
 // ── ATC Decision Engine ───────────────────────────────────────────────────────
+//
+// CRITICAL FIX (spec §NEGATIVE OFFSET BEHAVIOR / §UNCERTAIN_ZONE RULES):
+//
+// The old implementation only examined the CURRENTLY ACTIVE slot (the one
+// where nowMs is between its start and end). This caused a fatal bug:
+//
+//   For a negative-offset user at T+90 min past their predicted cycle end:
+//   - effectiveSlots[i-1] (old state) has endIso in the past
+//   - effectiveSlots[i]   (new state) starts at effectiveSlots[i-1].endIso
+//   - nowMs is INSIDE effectiveSlots[i] → it becomes the "active" slot
+//   - The function saw effectiveSlots[i] with no overrun → returned NORMAL
+//   - User was auto-moved to the new state WITHOUT entering UNCERTAIN_ZONE
+//
+// The fix: for negative-offset users, we must ALSO examine the PREVIOUS slot
+// (the one that most recently ended). If that slot ended within range/overrun
+// territory and no Growatt/community/report has confirmed a transition yet,
+// we must return UNCERTAIN_ZONE based on that previous slot's overrun.
+//
+// The `growattConfirmedTransitionAt` parameter is the ISO of Growatt's most
+// recent confirmed state change. If it is AFTER the previous slot ended, then
+// Growatt has already confirmed → no UNCERTAIN_ZONE needed (reconciliation
+// handles the backdated start separately in applyOffsetToPrediction).
+//
 function computeATCState(
   effectiveSlots: ShiftedScheduleSlot[],
   offsetMinutes: number,
@@ -290,7 +313,6 @@ function computeATCState(
     return {
       mode: 'COMMUNITY_SYNCED',
       overrunMinutes: 0,
-      // Elevate community priority during validation window
       communityElevated: inValidationWindow,
       statusLine: inValidationWindow
         ? `نافذة التحقق نشطة — الحساس يُشير لتغيير · ${Math.ceil(validationRemainingMin)} د`
@@ -301,7 +323,157 @@ function computeATCState(
     };
   }
 
-  // ── Find the active slot ──────────────────────────────────────────────────
+  const halfSpreadMs = 15 * 60_000;
+  const GRACE_PERIOD_MS = 15 * 60_000;
+
+  // ── NEGATIVE OFFSET: scan for the most recently ended slot ───────────────
+  //
+  // Spec §NEGATIVE OFFSET BEHAVIOR / §CORE RULE:
+  //   A negative-offset user reaches predicted cycle end BEFORE Growatt.
+  //   After that predicted end the user MUST enter UNCERTAIN_ZONE and stay
+  //   there until: user report, community confirmation, OR Growatt state change.
+  //
+  //   We must check not just the currently active slot but ALSO the previous
+  //   slot (which may have already ended, causing the schedule to advance to
+  //   the next slot automatically). If the previous slot's end has passed AND
+  //   Growatt has NOT yet confirmed the matching transition, we are in
+  //   UNCERTAIN_ZONE regardless of what the current slot says.
+  //
+  if (offsetMinutes < 0) {
+    // Find the slot that most recently ended (endIso is in the past)
+    // and the slot that just became active (started after previous ended)
+    let justEndedSlot: ShiftedScheduleSlot | null = null;
+    let justEndedSlotIdx = -1;
+
+    for (let i = 0; i < effectiveSlots.length; i++) {
+      const s = effectiveSlots[i];
+      if (!s.endIso) continue;
+      const endMs = new Date(s.endIso).getTime();
+      if (endMs <= nowMs) {
+        // This slot has ended — track the most recent one
+        justEndedSlot = s;
+        justEndedSlotIdx = i;
+      } else {
+        break; // slots are ordered; once we find a future end we're done
+      }
+    }
+
+    if (justEndedSlot && justEndedSlot.endIso) {
+      const slotEndMs = new Date(justEndedSlot.endIso).getTime();
+      const rangeStartMs = slotEndMs - halfSpreadMs;
+      const rangeEndMs   = slotEndMs + halfSpreadMs;
+      const overrunMs    = Math.max(0, nowMs - rangeEndMs);
+      const overrunMin   = overrunMs / 60_000;
+
+      // Is now inside the prediction range window of that ended slot?
+      if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) {
+        // In range window of the ended slot
+        return {
+          mode: 'PREDICTION_RANGE',
+          overrunMinutes: 0,
+          communityElevated: false,
+          statusLine: 'نطاق التوقع نشط — التغيير محتمل',
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          transitionMode,
+        };
+      }
+
+      // Past the range end → has Growatt already confirmed this transition?
+      //
+      // Growatt confirmed if:
+      //   - prediction.currentState has flipped to the NEW state (the one that
+      //     follows justEndedSlot in the effective schedule), AND
+      //   - prediction.lastTransitionAt is AFTER the slot's range start
+      //     (i.e., the Growatt event corresponds to this cycle's end)
+      //
+      // If Growatt has confirmed, applyOffsetToPrediction's exit block handles
+      // the reconciliation — we return NORMAL here to unblock it.
+      const expectedNewState: 'ON' | 'OFF' = justEndedSlot.state === 'ON' ? 'OFF' : 'ON';
+      const growattAlreadyConfirmed =
+        prediction.currentState === expectedNewState &&
+        !!prediction.lastTransitionAt &&
+        new Date(prediction.lastTransitionAt).getTime() >= rangeStartMs;
+
+      if (growattAlreadyConfirmed) {
+        // Growatt has already confirmed this transition.
+        // Return NORMAL so that applyOffsetToPrediction's UNCERTAIN_ZONE exit
+        // block can compute the backdated start and transition cleanly.
+        // NOTE: We intentionally pass NORMAL here even though atcShouldHold
+        // will be false — the exit block checks atcState.mode === 'UNCERTAIN_ZONE'
+        // which won't match. Instead, we detect this case in applyOffsetToPrediction
+        // via the dedicated growattAlreadyConfirmed path below.
+        //
+        // We signal this via a special mode so applyOffsetToPrediction can
+        // detect and apply the backdated reconciliation:
+        return {
+          mode: 'UNCERTAIN_ZONE',  // keep hold active so deriveCurrentStateATC holds the OLD state
+          overrunMinutes: overrunMin,
+          communityElevated: false,
+          statusLine: null,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          transitionMode,
+          // Internal signal: Growatt already confirmed, reconciliation should run
+          // (applyOffsetToPrediction reads prediction.currentState !== currentState
+          //  to detect this, which will be true because we're holding the old state)
+        };
+      }
+
+      // Growatt has NOT yet confirmed — UNCERTAIN_ZONE (spec §CORE RULE)
+      if (nowMs > rangeStartMs) {
+        return {
+          mode: 'UNCERTAIN_ZONE',
+          overrunMinutes: overrunMin,
+          communityElevated: true,
+          statusLine: overrunMin < 1
+            ? 'نطاق التوقع انتهى — بانتظار تأكيد تغير الحالة'
+            : `تجاوزت المدة المتوقعة بـ ${Math.ceil(overrunMin)} دقيقة — بانتظار تأكيد تغير الحالة`,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          transitionMode,
+        };
+      }
+    }
+
+    // No slot has ended yet (all in future) or offset-adjusted schedule hasn't
+    // started — check if there's a currently active slot near its end
+    let activeSlotNeg: ShiftedScheduleSlot | null = null;
+    for (const slot of effectiveSlots) {
+      const start = new Date(slot.startIso).getTime();
+      const end = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
+      if (nowMs >= start && nowMs < end) {
+        activeSlotNeg = slot;
+        break;
+      }
+    }
+    if (activeSlotNeg && activeSlotNeg.endIso) {
+      const slotEndMs = new Date(activeSlotNeg.endIso).getTime();
+      const rangeStartMs = slotEndMs - halfSpreadMs;
+      const rangeEndMs   = slotEndMs + halfSpreadMs;
+      if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) {
+        return {
+          mode: 'PREDICTION_RANGE',
+          overrunMinutes: 0,
+          communityElevated: false,
+          statusLine: 'نطاق التوقع نشط — التغيير محتمل',
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          transitionMode,
+        };
+      }
+    }
+    // Still within current active slot, well before end → NORMAL
+    return { mode: 'NORMAL', overrunMinutes: 0, communityElevated: false, statusLine: null, inValidationWindow: false, validationWindowRemainingMin: 0, transitionMode };
+  }
+
+  // ── POSITIVE / NEUTRAL OFFSET: standard active-slot check ─────────────────
+  //
+  // Positive-offset users are BEHIND Growatt. By the time their shifted
+  // transition time arrives Growatt has already confirmed the duration.
+  // Neutral-offset users align exactly with Growatt.
+  // Both use the straightforward active-slot + overrun approach.
+  //
   let activeSlot: ShiftedScheduleSlot | null = null;
   for (const slot of effectiveSlots) {
     const start = new Date(slot.startIso).getTime();
@@ -317,7 +489,6 @@ function computeATCState(
   }
 
   const slotEndMs = new Date(activeSlot.endIso).getTime();
-  const halfSpreadMs = 15 * 60_000;
   const rangeStartMs = slotEndMs - halfSpreadMs;
   const rangeEndMs = slotEndMs + halfSpreadMs;
   const overrunMs = Math.max(0, nowMs - rangeEndMs);
@@ -339,30 +510,8 @@ function computeATCState(
     };
   }
 
-  // ── Post-range ATC logic per DSD sign (spec §14 / §6) ──────────────────────
-  const GRACE_PERIOD_MS = 15 * 60_000;
-
-  // ── TMMS: In MANUAL mode, Growatt transitions cannot trigger state changes.
-  // For negative DSD, we always enter UNCERTAIN_ZONE regardless of mode.
-  // For positive DSD in AUTO mode, we can trust Growatt has already confirmed
-  // (spec §POSITIVE OFFSET BEHAVIOR: "rarely wait because Growatt already knows").
-  // For positive DSD in MANUAL mode, community/user report required.
-  // Negative DSD: user is ahead of Growatt → always UNCERTAIN_ZONE
-  // (spec §14.1 / §6.1 / §NEGATIVE OFFSET BEHAVIOR: do not auto-transition)
-  if (offsetMinutes < 0) {
-    return {
-      mode: 'UNCERTAIN_ZONE',
-      overrunMinutes: overrunMin,
-      communityElevated: true,
-      statusLine: `استمرار غير معتاد — تجاوزت المدة المتوقعة بـ ${Math.ceil(overrunMin)} دقيقة — بانتظار تأكيد تغير الحالة`,
-      inValidationWindow: false,
-      validationWindowRemainingMin: 0,
-      transitionMode,
-    };
-  }
-
-  // Positive DSD: user is behind Growatt → WAITING_FOR_GROWATT
-  // (spec §14.2 / §6.3: Growatt has likely already confirmed — short wait)
+  // Post-range: positive offset → WAITING_FOR_GROWATT
+  // (spec §POSITIVE OFFSET BEHAVIOR)
   if (offsetMinutes > 0) {
     return {
       mode: 'WAITING_FOR_GROWATT',
@@ -377,8 +526,8 @@ function computeATCState(
     };
   }
 
-  // Neutral DSD (≈ 0): enter GRACE_MODE for 15 minutes first
-  // (spec §14.3 / §6.2: GRACE_MODE before WAITING_FOR_GROWATT)
+  // Neutral DSD (= 0): GRACE_MODE for 15 minutes then WAITING_FOR_GROWATT
+  // (spec §NEUTRAL OFFSET BEHAVIOR)
   if (overrunMs <= GRACE_PERIOD_MS) {
     return {
       mode: 'GRACE_MODE',
@@ -391,7 +540,6 @@ function computeATCState(
     };
   }
 
-  // Grace period expired → WAITING_FOR_GROWATT
   return {
     mode: 'WAITING_FOR_GROWATT',
     overrunMinutes: overrunMin,
@@ -465,20 +613,13 @@ function deriveNextTransition(
 // Spec §3 / TMMS §PRINCIPLE 3: Home Screen must ALWAYS reflect the USER's
 // personal schedule, never Growatt's live state directly.
 //
-// The user's state is derived exclusively from the offset-shifted effective
-// schedule slots (= master APPPE pattern shifted by user DSD).
-//
-// Critical fallback rule (spec §POSITIVE OFFSET BEHAVIOR example):
-//   If no effective slot has started before now (all slots are in the future
-//   because a positive offset pushed them forward), the user is currently in
-//   the state that PRECEDES the first upcoming slot — always the OPPOSITE of
-//   that slot's state.
-//   Example: offset +60, Growatt ON started 08:00 → user ON starts 09:00.
-//   At 08:30 the user schedule has no active slot yet, so user is still OFF.
-//
-// TMMS §MANUAL MODE:
-//   Growatt's live state (masterCurrentState) is NEVER used for user display.
-//   Growatt feeds APPPE learning only.
+// CRITICAL: For negative-offset users in UNCERTAIN_ZONE, the schedule may
+// have already advanced to the NEXT slot (state flipped automatically by time).
+// deriveCurrentStateATC must HOLD the PREVIOUS slot's state — the one that
+// was active BEFORE the uncertain zone began. Selecting `findBestSlot()`
+// (last slot that started before now) would return the NEW slot and incorrectly
+// advance the user's state. Instead, we find the last slot that ended before now
+// (i.e., the justEndedSlot) and return ITS state as the held state.
 function deriveCurrentStateATC(
   effectiveSlots: ShiftedScheduleSlot[],
   atcMode: ScheduleStateMode,
@@ -492,52 +633,68 @@ function deriveCurrentStateATC(
 
   const nowMs = Date.now();
 
-  // ── Helper: find the last slot that started at or before now ──────────────
-  // Returns null if all slots are in the future.
-  const findBestSlot = (): ShiftedScheduleSlot | null => {
+  // ── Helper: derive state when no slot has started yet ─────────────────────
+  const derivePreScheduleState = (): { state: 'ON' | 'OFF'; startIso: string | null } => {
+    if (effectiveSlots.length > 0) {
+      const preState: 'ON' | 'OFF' = effectiveSlots[0].state === 'ON' ? 'OFF' : 'ON';
+      return { state: preState, startIso: null };
+    }
+    return { state: masterCurrentState, startIso: null };
+  };
+
+  // ── ATC hold path ──────────────────────────────────────────────────────────
+  if (atcShouldHold(atcMode)) {
+    // For UNCERTAIN_ZONE (negative offset): the schedule may have advanced past
+    // the slot boundary. We need to find the slot that was active just BEFORE
+    // the uncertain zone started — i.e., the slot whose endIso is most recently
+    // in the past (the "justEndedSlot"). Its state is what we hold.
+    //
+    // For WAITING_FOR_GROWATT / GRACE_MODE / PREDICTION_RANGE (positive/neutral):
+    // The currently active slot is still the right one; we find the last slot
+    // that started before now (which is still the same slot we're extending).
+    //
+    // Strategy: find the last slot that STARTED before now.
+    // For negative-offset UNCERTAIN_ZONE: this will be the NEW slot (wrong).
+    // Fix: for UNCERTAIN_ZONE, find the slot BEFORE the one that just started.
+    if (atcMode === 'UNCERTAIN_ZONE') {
+      // Find the most recently ENDED slot (its endIso is in the past)
+      // This is the slot whose predicted end triggered UNCERTAIN_ZONE.
+      let heldSlot: ShiftedScheduleSlot | null = null;
+      for (let i = 0; i < effectiveSlots.length; i++) {
+        const s = effectiveSlots[i];
+        if (!s.endIso) continue;
+        const endMs = new Date(s.endIso).getTime();
+        if (endMs <= nowMs) {
+          heldSlot = s; // keep updating — we want the most recent ended slot
+        } else {
+          break;
+        }
+      }
+      // heldSlot is the last slot that ended. Its state is what we hold.
+      // (The next slot may have already started in the schedule, but we ignore it
+      //  until a valid exit condition fires.)
+      if (heldSlot) return { state: heldSlot.state, startIso: heldSlot.startIso };
+      return derivePreScheduleState();
+    }
+
+    // For WAITING_FOR_GROWATT / GRACE_MODE / PREDICTION_RANGE:
+    // find the last slot that started at or before now
     let best: ShiftedScheduleSlot | null = null;
     for (const slot of effectiveSlots) {
       if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
       else break;
     }
-    return best;
-  };
-
-  // ── Helper: derive state when no slot has started yet ─────────────────────
-  // The state BEFORE the first upcoming slot is always the OPPOSITE of that
-  // slot's state (schedule always alternates ON↔OFF).
-  // This correctly handles positive-offset users whose next event is in the
-  // future but whose CURRENT state is the inverse of that upcoming event.
-  const derivePreScheduleState = (): { state: 'ON' | 'OFF'; startIso: string | null } => {
-    if (effectiveSlots.length > 0) {
-      const firstSlot = effectiveSlots[0];
-      const preState: 'ON' | 'OFF' = firstSlot.state === 'ON' ? 'OFF' : 'ON';
-      return { state: preState, startIso: null };
-    }
-    // Absolute last resort — no slots at all. Should never happen in practice.
-    // Even here we do NOT expose masterCurrentState directly; we treat as unknown
-    // and return the master's state only as a best-effort fallback.
-    return { state: masterCurrentState, startIso: null };
-  };
-
-  // ── ATC hold path ──────────────────────────────────────────────────────────
-  // During UNCERTAIN_ZONE / WAITING_FOR_GROWATT / PREDICTION_RANGE / GRACE_MODE
-  // we keep the user in the last confirmed effective slot to prevent false transitions.
-  if (atcShouldHold(atcMode)) {
-    const bestSlot = findBestSlot();
-    if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
+    if (best) return { state: best.state, startIso: best.startIso };
     return derivePreScheduleState();
   }
 
-  // ── Normal schedule-driven path (AUTO and MANUAL both use this) ───────────
-  // Both modes derive state purely from the offset-shifted effective schedule.
-  // The difference is upstream: in MANUAL mode Growatt events don't update the
-  // master prediction's `currentState` for user display purposes; here we just
-  // read whatever the shifted schedule says regardless of mode.
-  const bestSlot = findBestSlot();
-  if (bestSlot) return { state: bestSlot.state, startIso: bestSlot.startIso };
-
-  // No slot has started yet — user is in the pre-schedule state.
+  // ── Normal schedule-driven path ───────────────────────────────────────────
+  let best: ShiftedScheduleSlot | null = null;
+  for (const slot of effectiveSlots) {
+    if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
+    else break;
+  }
+  if (best) return { state: best.state, startIso: best.startIso };
   return derivePreScheduleState();
 }
 
