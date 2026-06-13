@@ -780,7 +780,20 @@ export function applyOffsetToPrediction(
   }
 
   // ── USER C / NEUTRAL EXIT: WAITING_FOR_GROWATT / GRACE_MODE ──────────────
+ // ── START OF YOUR ADDITION ──────────────────────────────────────────────
   if (
+    offsetMinutes === 0 &&
+    transitionMode === 'AUTO' &&
+    prediction.currentState !== currentState
+  ) {
+    reconciledCycleStartIso = prediction.lastTransitionAt;
+    currentState            = prediction.currentState as 'ON' | 'OFF';
+    currentStateStartIso    = prediction.lastTransitionAt;
+    isHolding               = false;
+    finalAtcState           = { ...atcState, mode: 'NORMAL', overrunMinutes: 0, statusLine: null, communityElevated: false };
+  }
+  // ── END OF YOUR ADDITION ──────────────────────────────────────────────
+  else if (
     (atcState.mode === 'WAITING_FOR_GROWATT' || atcState.mode === 'GRACE_MODE') &&
     transitionMode === 'AUTO' &&
     prediction.currentState !== currentState
