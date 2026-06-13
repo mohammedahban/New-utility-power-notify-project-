@@ -571,15 +571,29 @@ function elapsedLabel(startIso: string | null): string {
 }
 
 // ── Lost-Time Reconciliation (spec §CYCLE CONTINUITY RULE) ──────────────────
-// When Growatt finally confirms a transition after UNCERTAIN_ZONE, the new
-// state's start is backdated to:  growattTransitionTime + userOffsetMs
 //
-// Why: offset shifts timestamps only, never duration (spec §PRINCIPLE 2).
-// If Growatt transitioned at T and user has offset -60min, their transition
-// effectively happened at T-60min, so elapsed time in the new state = now - (T-60min).
+// FORMULA (spec §NEGATIVE OFFSET BEHAVIOR / §FINAL IMPLEMENTATION REQUIREMENT):
 //
-// This is ALWAYS more accurate than the old "userCycleStart + growattDuration"
-// approach because lastTransitionAt is the precise Growatt event timestamp.
+//   UserCycleStartTime = GrowattTransitionTime + UserOffset
+//
+// Since offset is negative for ahead-of-Growatt users:
+//   GrowattTransitionTime = 04:00, Offset = -60 min
+//   → UserCycleStartTime = 03:00  (60 minutes in the past)
+//
+// For positive offset (behind-Growatt users):
+//   GrowattTransitionTime = 12:00, Offset = +60 min
+//   → UserCycleStartTime = 13:00  (60 minutes in the future — user hasn't
+//     transitioned yet, so we return null and let the schedule drive it)
+//
+// For neutral offset:
+//   UserCycleStartTime = GrowattTransitionTime (no shift)
+//
+// ELAPSED TIME after reconciliation:
+//   elapsed = now - UserCycleStartTime
+//   Example: now=04:00, UserCycleStart=03:00 → elapsed = 60 min → "منذ ساعة"
+//
+// This must NEVER show "للتو" (just now) when the offset-adjusted start
+// was in the past — that would violate the offset model.
 function computeReconciledCycleStart(
   growattLastTransitionAt: string | null,
   offsetMs: number,
@@ -590,12 +604,16 @@ function computeReconciledCycleStart(
   if (heldState === masterCurrentState) return null;
   if (!growattLastTransitionAt) return null;
 
-  // Backdated start = Growatt transition time + user offset
-  // For negative offset (-60min): start = growattTransitionTime - 60min (earlier)
-  // For positive offset (+60min): start = growattTransitionTime + 60min (later)
+  // UserCycleStartTime = GrowattTransitionTime + Offset
+  // For negative offset (ahead of Growatt): result is in the PAST → valid
+  // For positive offset (behind Growatt):   result is in the FUTURE → null
+  //   (positive-offset users: the schedule's shifted slot will naturally
+  //    become the active slot once GrowattTransitionTime + offset passes)
   const reconciledStartMs = new Date(growattLastTransitionAt).getTime() + offsetMs;
 
-  // Verify this is in the past (the transition has already occurred)
+  // Only return if the reconciled start is already in the past.
+  // Future-dated reconciliations for positive-offset users are handled by
+  // the schedule slot becoming active at the correct shifted time.
   if (reconciledStartMs >= Date.now()) return null;
 
   return new Date(reconciledStartMs).toISOString();
@@ -630,34 +648,64 @@ export function applyOffsetToPrediction(
   let finalAtcState = atcState;
   let reconciledCycleStartIso: string | null = null;
 
-  // ── UNCERTAIN_ZONE EXIT via Growatt confirmation (AUTO mode, spec §EXITING UNCERTAIN_ZONE) ──
-  // When the user with negative offset is held in UNCERTAIN_ZONE and Growatt
-  // finally transitions (masterCurrentState !== heldState), immediately exit
-  // UNCERTAIN_ZONE in AUTO mode.
+  // ── UNCERTAIN_ZONE EXIT via Growatt confirmation ──────────────────────────
   //
-  // New state start is backdated to: growattTransitionTime + offsetMs
-  // Example: Growatt OFF at 04:00, offset -60 → user OFF started at 03:00,
-  //          elapsed = 60 minutes ("منذ ساعة").
+  // Spec §NEGATIVE OFFSET BEHAVIOR / §VALID EXIT CONDITIONS:
+  //
+  // A negative-offset user in UNCERTAIN_ZONE may exit ONLY via:
+  //   Priority 1: User report           (handled by resyncPoint / report flow)
+  //   Priority 2: Community confirmation (handled by resyncPoint)
+  //   Priority 3: Growatt state change   ← handled here (AUTO mode only)
+  //
+  // When Growatt transitions (prediction.currentState flips relative to our
+  // held state), we IMMEDIATELY exit UNCERTAIN_ZONE and backdate the new
+  // cycle start using the formula:
+  //
+  //   UserCycleStartTime = GrowattTransitionTime + Offset
+  //
+  // Example (spec §EXAMPLE 1):
+  //   Growatt transitions OFF at 12:00, user offset = -60 min
+  //   → UserCycleStartTime = 11:00
+  //   → At 12:00, display: "OFF — منذ ساعة"
+  //   → NEVER show "منذ للتو"
   //
   // In MANUAL mode: Growatt transition does NOT exit UNCERTAIN_ZONE.
-  //                 Only community/user report can exit it.
+  //   Only community/user reports can exit it.
   if (
     atcState.mode === 'UNCERTAIN_ZONE' &&
     transitionMode === 'AUTO' &&
-    prediction.currentState !== currentState // Growatt confirmed a flip
+    prediction.currentState !== currentState // Growatt confirmed a state flip
   ) {
-    // Compute backdated start for the NEW state
     const backdatedStart = computeReconciledCycleStart(
       prediction.lastTransitionAt,
       offsetMs,
-      currentState,           // heldState = old state (about to be left)
-      prediction.currentState, // masterCurrentState = new Growatt state
+      currentState,            // heldState  = old state we're leaving
+      prediction.currentState, // newState   = Growatt's confirmed new state
     );
 
     if (backdatedStart) {
+      // backdatedStart = GrowattTransitionTime + offsetMs (always in the past
+      // for negative-offset users since offsetMs < 0)
       reconciledCycleStartIso = backdatedStart;
       currentState = prediction.currentState as 'ON' | 'OFF';
       currentStateStartIso = backdatedStart;
+      isHolding = false;
+      finalAtcState = {
+        ...atcState,
+        mode: 'NORMAL',
+        overrunMinutes: 0,
+        statusLine: null,
+        communityElevated: false,
+      };
+    }
+    // If backdatedStart is null it means computeReconciledCycleStart returned
+    // null — this should not happen for negative offsets (offset < 0 means
+    // GrowattTime + offsetMs < GrowattTime < now), but as a safety fallback
+    // we still exit the hold and use Growatt's transition time directly.
+    else if (prediction.lastTransitionAt) {
+      // Fallback: use raw Growatt transition time (offset = 0 case)
+      currentState = prediction.currentState as 'ON' | 'OFF';
+      currentStateStartIso = prediction.lastTransitionAt;
       isHolding = false;
       finalAtcState = {
         ...atcState,
@@ -669,19 +717,23 @@ export function applyOffsetToPrediction(
     }
   }
 
-  // ── WAITING_FOR_GROWATT EXIT for positive/neutral offset (AUTO mode) ────────
-  // Positive offset: user is BEHIND Growatt. Growatt already transitioned.
-  // Once the user's shifted schedule says the new state started, transition.
-  // This is already handled by deriveCurrentStateATC reading the shifted slots.
-  // But when ATC is holding in WAITING_FOR_GROWATT and Growatt has confirmed
-  // (masterCurrentState != heldState), exit immediately in AUTO mode.
+  // ── WAITING_FOR_GROWATT / GRACE_MODE EXIT (positive / neutral offset, AUTO) ─
+  //
+  // Spec §POSITIVE OFFSET BEHAVIOR:
+  //   Positive-offset users are BEHIND Growatt. By the time their shifted
+  //   transition time arrives, Growatt has already confirmed the state change.
+  //   We exit WAITING_FOR_GROWATT when:
+  //     a) Growatt has confirmed AND the shifted schedule slot is now active, OR
+  //     b) reconciledCycleStart (= GrowattTransitionTime + positiveOffset) has
+  //        already passed (meaning the user's time has come)
+  //
+  // Spec §NEUTRAL OFFSET BEHAVIOR:
+  //   Same as positive but offset = 0 → UserCycleStart = GrowattTransitionTime
   if (
     (atcState.mode === 'WAITING_FOR_GROWATT' || atcState.mode === 'GRACE_MODE') &&
     transitionMode === 'AUTO' &&
     prediction.currentState !== currentState // Growatt confirmed a flip
   ) {
-    // For positive offset: new state start = growattTransitionTime + offsetMs
-    // (which will be in the future relative to Growatt but may be in the past already)
     const backdatedStart = computeReconciledCycleStart(
       prediction.lastTransitionAt,
       offsetMs,
@@ -690,6 +742,9 @@ export function applyOffsetToPrediction(
     );
 
     if (backdatedStart) {
+      // For neutral/small-positive offset: GrowattTime + 0 = GrowattTime (past) → exits immediately
+      // For large positive offset: GrowattTime + positiveMs may still be future → computeReconciledCycleStart returns null
+      //   In that case the hold continues until the shifted schedule slot becomes active naturally.
       reconciledCycleStartIso = backdatedStart;
       currentState = prediction.currentState as 'ON' | 'OFF';
       currentStateStartIso = backdatedStart;
@@ -702,6 +757,10 @@ export function applyOffsetToPrediction(
         communityElevated: false,
       };
     }
+    // For positive offset where reconciledStart is still in the future:
+    // Keep holding. The shifted schedule slot will become active once
+    // GrowattTransitionTime + positiveOffset passes, and deriveCurrentStateATC
+    // (non-hold path) will naturally pick it up on the next re-render.
   }
 
   const nextTransition = prediction.isUnstable
@@ -848,22 +907,48 @@ export function useUserPredictions(
     ? (() => {
         const pred = applyOffsetToPrediction(rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, heldCycleStartIso ?? null);
 
-        // ── Stabilize currentStateStartIso ────────────────────────────────────
-        // Only update the anchor when the actual utility state changes (ON↔OFF).
-        // If the state is the same as before, reuse the original startIso so
-        // the "منذ" elapsed timer and schedule slot start time don't jump every
-        // time the DB prediction refreshes.
-        if (
+        // ── Stabilize currentStateStartIso ─────────────────────────────────────
+        //
+        // Rules (in priority order):
+        //
+        // 1. If a reconciledCycleStartIso is present (UNCERTAIN_ZONE just exited
+        //    via Growatt), it is the authoritative backdated start.  Store it in
+        //    the ref and never let an older ref value override it.
+        //
+        // 2. If the utility state flipped (ON→OFF or OFF→ON), adopt the new
+        //    startIso from the computation and update the ref.
+        //
+        // 3. If the state is unchanged and no reconciliation just happened, keep
+        //    the ref's startIso so the elapsed timer never jumps on prediction
+        //    DB refreshes.
+        //
+        // This ensures that after UNCERTAIN_ZONE exits with a backdated start
+        // the elapsed label correctly shows "منذ ساعة" rather than "للتو".
+
+        if (pred.reconciledCycleStartIso) {
+          // Reconciliation wins — always adopt and persist the backdated start.
+          stableStartRef.current = {
+            state: pred.currentState,
+            startIso: pred.reconciledCycleStartIso,
+          };
+          pred.currentStateStartIso = pred.reconciledCycleStartIso;
+        } else if (
           stableStartRef.current &&
           stableStartRef.current.state === pred.currentState
         ) {
+          // Same state, no reconciliation — reuse the stable anchor.
           pred.currentStateStartIso = stableStartRef.current.startIso;
         } else {
+          // State changed (or first render) — adopt the computed startIso.
           stableStartRef.current = {
             state: pred.currentState,
             startIso: pred.currentStateStartIso,
           };
         }
+
+        // Recompute duration label using the stabilised startIso
+        // (applyOffsetToPrediction computed it before stableStartRef correction)
+        pred.currentStateDurationLabel = elapsedLabel(pred.currentStateStartIso);
 
         return pred;
       })()
