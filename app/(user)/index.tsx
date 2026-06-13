@@ -158,35 +158,40 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
   const scheduledMs = new Date(scheduledIso).getTime();
   const minutesLeft = Math.max(0, Math.round((scheduledMs - Date.now()) / 60_000));
   const isOn = prediction?.currentState === 'ON';
-  const nextStateLabel = isOn ? 'طافية' : 'شغالة';
-  const nextStateEmoji = isOn ? '🔴' : '⚡';
+  const nextStateLabel = isOn ? ' طافية ' : ' شغالة ';
+  const nextStateEmoji = isOn ? ' 🔴 ' : ' ⚡ ';
+  
+  // حساب الوقت الحقيقي لتغير الحساس (بدلاً من طباعة قيمة الأوفست الثابتة)
+  const offsetMs = (prediction?.offsetMinutes ?? 0) * 60_000;
+  const growattTransitionMs = scheduledMs - offsetMs;
+  const growattAgoMin = Math.max(0, Math.round((Date.now() - growattTransitionMs) / 60_000));
 
-  // Format the scheduled time in Arabic
   const scheduledTimeLabel = new Date(scheduledIso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
-  }).replace('AM', 'ص').replace('PM', 'م');
+  }).replace('AM', ' ص ').replace('PM', ' م ');
 
   return (
     <View style={popStyles.banner}>
       <View style={popStyles.iconWrap}>
-        <Text style={{ fontSize: 22 }}>⏰</Text>
+        <Text style={{ fontSize: 22 }}> ⏰ </Text>
       </View>
       <View style={{ flex: 1 }}>
-        <Text style={popStyles.title}>تغيير تلقائي مجدول</Text>
+        <Text style={popStyles.title}> تغيير   تلقائي   مجدول </Text>
         <Text style={popStyles.body}>
-          سيتم تغيير حالتك إلى{' '}
+           سيتم   تغيير   حالتك   إلى {' '}
           <Text style={{ fontWeight: '800', color: isOn ? T.danger : T.success }}>
             {nextStateEmoji} {nextStateLabel}
           </Text>
-          {' '}تلقائياً في الساعة{' '}
+          {' '} تلقائياً   في   الساعة {' '}
           <Text style={{ fontWeight: '800', color: T.accent }}>{scheduledTimeLabel}</Text>
-          {minutesLeft > 0 ? ` · بعد ${minutesLeft} دقيقة` : ' · الآن'}
+          {minutesLeft > 0 ? ` ·  بعد  ${minutesLeft}  دقيقة ` : ' ·  الآن '}
         </Text>
-        <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {prediction?.offsetMinutes ?? 0} دقيقة</Text>
+        <Text style={popStyles.sub}> الحساس   الرئيسي   حوّل   حالته   منذ  {growattAgoMin}  دقيقة </Text>
       </View>
     </View>
   );
 }
+
 
 const popStyles = StyleSheet.create({
   banner: {
