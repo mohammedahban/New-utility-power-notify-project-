@@ -887,12 +887,20 @@ function TodayTimeline({ prediction, anchorStartIso }: {
                   {isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}
                 </Text>
               </View>
+                            {/* تم التعديل: قمنا بحقن التوقيت المصحح داخل الـ Ref لمنع زحزحة الوقت للأمام */}
+              {(() => {
+                if (isActive && anchorStartIso && !stableStartMapRef.current[slotKey]) {
+                  stableStartMapRef.current[slotKey] = new Date(anchorStartIso).toLocaleString('en-US', { 
+                    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true 
+                  }).replace('AM', 'ص').replace('PM', 'م');
+                }
+              })()}
+
               <Text style={tlStyles.timeText}>
-                {isActive && anchorStartIso
-                  ? new Date(anchorStartIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
-                  : startF
-                }{endF ? ` → ${endF}` : ' → …'}
+                {isActive ? (stableStartMapRef.current[slotKey] ?? startF) : startF}
+                {endF ? ` → ${endF}` : ' → …'}
               </Text>
+
               {slot.durationLabel && (
                 <Text style={[tlStyles.durText, { color: color + 'aa' }]}>{slot.durationLabel}</Text>
               )}
