@@ -581,6 +581,7 @@ function deriveNextTransition(
 }
 
 // ── ATC-aware current state derivation ───────────────────────────────────────
+// ── ATC-aware current state derivation ───────────────────────────────────────
 function deriveCurrentStateATC(
   effectiveSlots: ShiftedScheduleSlot[],
   atcMode: ScheduleStateMode,
@@ -603,7 +604,7 @@ function deriveCurrentStateATC(
   };
 
   if (atcShouldHold(atcMode)) {
-    if (atcMode === 'UNCERTAIN_ZONE') {
+    if (atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT') {
       // CRITICAL LOCK: Maintain the state of the slot that just ended.
       // Do not allow the schedule's next slot to automatically swap states until exit conditions match.
       let heldSlot: ShiftedScheduleSlot | null = null;
@@ -618,7 +619,8 @@ function deriveCurrentStateATC(
       return derivePreScheduleState();
     }
 
-    if (atcMode === 'POSITIVE_OFFSET_PENDING') {
+    if (atcMode === 'POSITIVE_OFFSET_PENDING' || atcMode === 'PREDICTION_RANGE' || atcMode === 'GRACE_MODE') {
+      // The slot hasn't officially ended yet, or we are pending a scheduled time. Hold the active slot.
       let best: ShiftedScheduleSlot | null = null;
       for (const slot of effectiveSlots) {
         if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
@@ -627,16 +629,9 @@ function deriveCurrentStateATC(
       if (best) return { state: best.state, startIso: best.startIso };
       return derivePreScheduleState();
     }
-
-    let best: ShiftedScheduleSlot | null = null;
-    for (const slot of effectiveSlots) {
-      if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
-      else break;
-    }
-    if (best) return { state: best.state, startIso: best.startIso };
-    return derivePreScheduleState();
   }
 
+  // Normal schedule-driven path
   let best: ShiftedScheduleSlot | null = null;
   for (const slot of effectiveSlots) {
     if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
@@ -645,6 +640,7 @@ function deriveCurrentStateATC(
   if (best) return { state: best.state, startIso: best.startIso };
   return derivePreScheduleState();
 }
+
 
 // ── Human-friendly Arabic duration range label (spec §23) ────────────────────
 function arabicDurationRange(minMin: number, maxMin: number): string {
