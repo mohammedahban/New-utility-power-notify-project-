@@ -422,55 +422,60 @@ function computeATCState(
     return { ...EMPTY_ATC, transitionMode };
   }
 
-  // ── USER B: POSITIVE OFFSET ────────────────────────────────────────────────
+    // ── USER B: POSITIVE OFFSET ────────────────────────────────────────────────
   if (offsetMinutes > 0) {
+    if (prediction.lastTransitionAt && transitionMode === 'AUTO') {
+      const offsetMs = offsetMinutes * 60_000;
+      const scheduledMs = new Date(prediction.lastTransitionAt).getTime() + offsetMs;
+      
+      // الحالة 1: نحن لا نزال في فترة الانتظار الإلزامية (الـ Offset لم ينتهِ بعد)
+      if (nowMs < scheduledMs) {
+        const minutesUntil = Math.round((scheduledMs - nowMs) / 60_000);
+        return {
+          ...EMPTY_ATC,
+          mode: 'POSITIVE_OFFSET_PENDING',
+          statusLine: `سيتم تغيير حالتك تلقائياً في ${fmtYemenTime(new Date(scheduledMs).toISOString())} · بعد ${minutesUntil}د`,
+          scheduledAutoTransitionIso: new Date(scheduledMs).toISOString(),
+          transitionMode,
+        };
+      }
+      
+      // الحالة 2: وقت الانتظار انتهى، ولكن الجدول الزمني لا يزال متأخراً في الحالة القديمة
+      let activeSlotPos: ShiftedScheduleSlot | null = null;
+      for (const slot of effectiveSlots) {
+        const start = new Date(slot.startIso).getTime();
+        const end   = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
+        if (nowMs >= start && nowMs < end) { activeSlotPos = slot; break; }
+      }
+      
+      // إجبار النظام على الانتقال للحالة الجديدة فوراً وتجاهل الجدول المتأخر
+      if (activeSlotPos && activeSlotPos.state !== prediction.currentState) {
+        return {
+          ...EMPTY_ATC,
+          mode: 'POSITIVE_OFFSET_PENDING',
+          statusLine: `تم التحديث بناءً على الحساس الرئيسي`,
+          scheduledAutoTransitionIso: new Date(scheduledMs).toISOString(),
+          transitionMode,
+        };
+      }
+    }
+
+    // المسار الطبيعي إذا كان الجدول متزامناً
     let activeSlotPos: ShiftedScheduleSlot | null = null;
     for (const slot of effectiveSlots) {
       const start = new Date(slot.startIso).getTime();
       const end   = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
       if (nowMs >= start && nowMs < end) { activeSlotPos = slot; break; }
     }
-
-    let nextSlotPos: ShiftedScheduleSlot | null = null;
-    for (const slot of effectiveSlots) {
-      if (new Date(slot.startIso).getTime() > nowMs) { nextSlotPos = slot; break; }
-    }
-
-    const scheduleCurrentState = activeSlotPos?.state ?? (nextSlotPos ? (nextSlotPos.state === 'ON' ? 'OFF' : 'ON') : null);
-
-    const growattFlippedAhead =
-      scheduleCurrentState !== null &&
-      prediction.currentState !== scheduleCurrentState &&
-      !!prediction.lastTransitionAt;
-
-    if (growattFlippedAhead && transitionMode === 'AUTO') {
-      const offsetMs = offsetMinutes * 60_000;
-      const scheduledMs = new Date(prediction.lastTransitionAt!).getTime() + offsetMs;
-      const scheduledAutoTransitionIso = new Date(scheduledMs).toISOString();
-
-      if (scheduledMs > nowMs) {
-        const minutesUntil = Math.round((scheduledMs - nowMs) / 60_000);
-        return {
-          ...EMPTY_ATC,
-          mode: 'POSITIVE_OFFSET_PENDING',
-          statusLine: `سيتم تغيير حالتك تلقائياً في ${fmtYemenTime(scheduledAutoTransitionIso)} · بعد ${minutesUntil}د`,
-          scheduledAutoTransitionIso,
-          transitionMode,
-        };
-      }
-    }
-
-    if (!activeSlotPos || !activeSlotPos.endIso) {
-      return { ...EMPTY_ATC, transitionMode };
-    }
-
+    if (!activeSlotPos || !activeSlotPos.endIso) return { ...EMPTY_ATC, transitionMode };
+    
     const slotEndMs    = new Date(activeSlotPos.endIso).getTime();
     const rangeStartMs = slotEndMs - halfSpreadMs;
     const rangeEndMs   = slotEndMs + halfSpreadMs;
     const overrunMs    = Math.max(0, nowMs - rangeEndMs);
     const overrunMin   = overrunMs / 60_000;
 
-    if (nowMs < rangeStartMs)                         return { ...EMPTY_ATC, transitionMode };
+    if (nowMs < rangeStartMs) return { ...EMPTY_ATC, transitionMode };
     if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) return { ...EMPTY_ATC, mode: 'PREDICTION_RANGE', statusLine: 'نطاق التوقع نشط — التغيير محتمل', transitionMode };
 
     return {
@@ -484,6 +489,7 @@ function computeATCState(
       transitionMode,
     };
   }
+
 
   // ── USER C: NEUTRAL OFFSET (= 0) ──────────────────────────────────────────
   let activeSlot: ShiftedScheduleSlot | null = null;
@@ -619,8 +625,22 @@ function deriveCurrentStateATC(
       return derivePreScheduleState();
     }
 
-    if (atcMode === 'POSITIVE_OFFSET_PENDING' || atcMode === 'PREDICTION_RANGE' || atcMode === 'GRACE_MODE') {
-      // The slot hasn't officially ended yet, or we are pending a scheduled time. Hold the active slot.
+        if (atcMode === 'POSITIVE_OFFSET_PENDING') {
+      // إغلاق محكم (LOCK): يجب أن نبقي المستخدم في الحالة المعاكسة لحالة الحساس الرئيسي
+      // طوال فترة الانتظار، حتى لا يقفز للحالة الجديدة مبكراً إذا كان الجدول غير دقيق.
+      const preState: 'ON' | 'OFF' = masterCurrentState === 'ON' ? 'OFF' : 'ON';
+      let heldStartIso: string | null = null;
+      for (const slot of effectiveSlots) {
+        if (slot.state === preState && new Date(slot.startIso).getTime() <= nowMs) {
+          heldStartIso = slot.startIso;
+        } else if (new Date(slot.startIso).getTime() > nowMs) {
+          break;
+        }
+      }
+      return { state: preState, startIso: heldStartIso };
+    }
+
+    if (atcMode === 'PREDICTION_RANGE' || atcMode === 'GRACE_MODE') {
       let best: ShiftedScheduleSlot | null = null;
       for (const slot of effectiveSlots) {
         if (new Date(slot.startIso).getTime() <= nowMs) best = slot;
@@ -629,6 +649,7 @@ function deriveCurrentStateATC(
       if (best) return { state: best.state, startIso: best.startIso };
       return derivePreScheduleState();
     }
+
   }
 
   // Normal schedule-driven path
