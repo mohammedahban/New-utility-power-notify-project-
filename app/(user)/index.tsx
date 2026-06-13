@@ -1149,26 +1149,29 @@ export default function Home() {
   }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
 
   // ── Restore from snapshot ────────────────────────────────────────────────
+  
+  // ── Restore from snapshot (مصحح ومضمون لإعادة الـ offset) ─────────────────
   const handleRestoreSnapshot = useCallback(async () => {
     if (!snapshot) return;
-    // 1. Restore offset (updates user_offsets DB)
-    if ((offset?.offset_minutes ?? 0) !== snapshot.previousOffsetMinutes) {
-      await saveOffset(snapshot.previousOffsetMinutes);
-    }
-    // 2. Clear current resync, then re-apply previous resync if one existed
-    await clearResync();
-    if (snapshot.previousResyncPoint) {
-      // Re-apply without triggering another snapshot (use raw applyResync path).
-      // We clear the snapshot BEFORE re-applying to avoid infinite snapshot chain.
+    try {
+      // 1. استعادة الـ Offset مباشرة إلى قاعدة البيانات والحالة المحلية دون شروط مقيدة
+      const targetOffset = snapshot.previousOffsetMinutes;
+      await saveOffset(targetOffset);
+      
+      // 2. مسح المزامنة المجتمعية الحالية للعودة للحالة الأصلية
+      await clearResync();
+      
+      // 3. مسح الـ لقطة (Snapshot) لتحديث واجهة المستخدم وإخفاء الزر
       await clearSnapshot();
-      // Note: re-applying the previous resync via ResyncContext's applyResync
-      // would fire the snapshot callback again. To avoid that we manipulate
-      // AsyncStorage directly + call clearResync then let the schedule settle.
-      // Simplest correct behaviour: just clear and let APPPE + offset drive state.
+      
+      // تلميح اختياري للمستخدم للتأكيد
+      if (Platform.OS !== 'web') {
+        Alert.alert('تمت العملية', 'تم استعادة توازن الوقت والفارق بنجاح.');
+      }
+    } catch (error) {
+      console.error('خطأ أثناء محاولة استعادة الحالة الأصلية والـ offset:', error);
     }
-    // 3. Clear the snapshot so the button disappears
-    await clearSnapshot();
-  }, [snapshot, offset, saveOffset, clearResync, clearSnapshot]);
+  }, [snapshot, saveOffset, clearResync, clearSnapshot]);
 
   // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
   // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
