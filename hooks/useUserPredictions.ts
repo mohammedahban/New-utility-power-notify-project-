@@ -610,7 +610,7 @@ function deriveCurrentStateATC(
   };
 
   if (atcShouldHold(atcMode)) {
-    if (atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT') {
+    if (atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT' || atcMode === 'GRACE_MODE') {
       // CRITICAL LOCK: Maintain the state of the slot that just ended.
       // Do not allow the schedule's next slot to automatically swap states until exit conditions match.
       let heldSlot: ShiftedScheduleSlot | null = null;
