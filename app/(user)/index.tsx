@@ -19,6 +19,7 @@ import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
 import type { TransitionMode } from '../../hooks/useTransitionMode';
+import type { ScheduleStateMode } from '../../hooks/useUserPredictions';
 
 const T = {
   bg: '#060d1a', surface: '#0d1526', elevated: '#162035',
@@ -138,6 +139,67 @@ function fmtTimeAr(iso: string): string {
   });
   return raw.replace('AM', 'ص').replace('PM', 'م');
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POSITIVE OFFSET PENDING BANNER (User B)
+// Shows when Growatt has already transitioned but user's scheduled time is future.
+// Spec §POSITIVE OFFSET BEHAVIOR: "سيتم تغيير حالتك تلقائياً في الساعة [HH:MM]"
+// ─────────────────────────────────────────────────────────────────────────────
+function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPrediction | null }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 30000);
+    return () => clearInterval(id);
+  }, []);
+
+  const atcMode = prediction?.atc?.mode;
+  const scheduledIso = prediction?.atc?.scheduledAutoTransitionIso;
+  if (atcMode !== 'POSITIVE_OFFSET_PENDING' || !scheduledIso) return null;
+
+  const scheduledMs = new Date(scheduledIso).getTime();
+  const minutesLeft = Math.max(0, Math.round((scheduledMs - Date.now()) / 60_000));
+  const isOn = prediction?.currentState === 'ON';
+  const nextStateLabel = isOn ? 'طافية' : 'شغالة';
+  const nextStateEmoji = isOn ? '🔴' : '⚡';
+
+  // Format the scheduled time in Arabic
+  const scheduledTimeLabel = new Date(scheduledIso).toLocaleString('en-US', {
+    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+  }).replace('AM', 'ص').replace('PM', 'م');
+
+  return (
+    <View style={popStyles.banner}>
+      <View style={popStyles.iconWrap}>
+        <Text style={{ fontSize: 22 }}>⏰</Text>
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text style={popStyles.title}>تغيير تلقائي مجدول</Text>
+        <Text style={popStyles.body}>
+          سيتم تغيير حالتك إلى{' '}
+          <Text style={{ fontWeight: '800', color: isOn ? T.danger : T.success }}>
+            {nextStateEmoji} {nextStateLabel}
+          </Text>
+          {' '}تلقائياً في الساعة{' '}
+          <Text style={{ fontWeight: '800', color: T.accent }}>{scheduledTimeLabel}</Text>
+          {minutesLeft > 0 ? ` · بعد ${minutesLeft} دقيقة` : ' · الآن'}
+        </Text>
+        <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {prediction?.offsetMinutes ?? 0} دقيقة</Text>
+      </View>
+    </View>
+  );
+}
+
+const popStyles = StyleSheet.create({
+  banner: {
+    flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12,
+    backgroundColor: '#001a2e', borderRadius: 16, padding: 14, marginBottom: 12,
+    borderWidth: 1.5, borderColor: T.accent + '66',
+  },
+  iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  title: { color: T.accent, fontSize: 11, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
+  body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 4 },
+  sub: { color: T.textMuted, fontSize: 10, textAlign: 'right' },
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VALIDATION WINDOW TOAST
@@ -438,7 +500,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           PREDICTION_RANGE: { icon: '🔮', bg: '#0a1a2e', border: T.accent + '55', textColor: T.accent },
           UNCERTAIN_ZONE: {
             icon: '⚠',  bg: '#1a0e00', border: T.warning + '55', textColor: T.warning,
-            // TMMS spec §UNCERTAIN_ZONE: show overrun + accumulation message
             body: overrunMin > 0
               ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — وقت الانتظار سيُجمع إلى المدة الفعلية`
               : undefined,
@@ -448,6 +509,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
             body: tMode === 'MANUAL' ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة' : undefined,
           },
           GRACE_MODE: { icon: '⏳', bg: '#0a1a2e', border: T.warning + '44', textColor: T.warning },
+          POSITIVE_OFFSET_PENDING: { icon: '⏰', bg: '#001a2e', border: T.accent + '55', textColor: T.accent },
         };
         const cfg = configs[atcMode];
         if (!cfg) return null;
@@ -544,7 +606,6 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     const modeConfigs: Record<string, { icon: string; title: string; body: string; borderColor: string; iconColor: string }> = {
       UNCERTAIN_ZONE: {
         icon: '⚠️', title: 'استمرار غير معتاد',
-        // TMMS §UNCERTAIN_ZONE: display overrun + accumulation message
         body: overrunMin > 0
           ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — هذا الوقت سيُجمع إلى المدة الفعلية للدورة`
           : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد',
@@ -566,6 +627,11 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         icon: '⏳', title: 'تأخر غير معتاد',
         body: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع — سيتم المزامنة فور تغيير الحالة',
         borderColor: T.warning + '44', iconColor: T.warning,
+      },
+      POSITIVE_OFFSET_PENDING: {
+        icon: '⏰', title: 'تغيير تلقائي مجدول',
+        body: prediction?.atc?.statusLine ?? 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد',
+        borderColor: T.accent + '44', iconColor: T.accent,
       },
     };
     const cfg = modeConfigs[atcMode] ?? modeConfigs.UNCERTAIN_ZONE;
@@ -1206,6 +1272,7 @@ export default function Home() {
 
       <ParticipationNudge userId={profile?.id} />
       <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
+      <PositiveOffsetPendingBanner prediction={stablePrediction} />
       <ValidationWindowToast prediction={stablePrediction} />
       <PersonalStatusCard
         prediction={stablePrediction}
