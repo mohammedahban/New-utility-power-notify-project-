@@ -837,7 +837,8 @@ export function useUserPredictions(
   const stableStartRef = useRef<{ state: 'ON' | 'OFF'; startIso: string | null } | null>(null);
   const reconciledStartRef = useRef<{ state: 'ON' | 'OFF'; startIso: string } | null>(null);
   const prevOffsetRef = useRef<number>(offsetMinutes);
-
+  const prevResyncIsoRef = useRef<string | null>(resyncPoint?.syncedAtIso ?? null); // <-- أضف هذا السطر
+  
   const fetchPrediction = () => {
     supabase
       .from('utility_predictions')
@@ -897,14 +898,29 @@ export function useUserPredictions(
     };
   }, []);
 
-  useEffect(() => {
+    useEffect(() => {
+    let shouldFetch = false;
+    
+    // Clear refs if offset changes
     if (prevOffsetRef.current !== offsetMinutes) {
       prevOffsetRef.current       = offsetMinutes;
       stableStartRef.current      = null;
       reconciledStartRef.current  = null;
+      shouldFetch = true;
+    }
+    
+    // CRITICAL: Clear refs if a community sync is applied or reverted
+    if (prevResyncIsoRef.current !== (resyncPoint?.syncedAtIso ?? null)) {
+      prevResyncIsoRef.current    = resyncPoint?.syncedAtIso ?? null;
+      stableStartRef.current      = null;
+      reconciledStartRef.current  = null;
+    }
+
+    if (shouldFetch) {
       fetchPrediction();
     }
-  }, [offsetMinutes]);
+  }, [offsetMinutes, resyncPoint?.syncedAtIso]);
+ 
 
   const userPrediction: UserPrediction | null = rawPrediction
     ? (() => {
