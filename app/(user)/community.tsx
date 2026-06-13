@@ -16,6 +16,9 @@ import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../contexts/AuthContext';
 import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
+import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
+import { useUserOffset } from '../../hooks/useUserOffset';
+import { useUserPredictions } from '../../hooks/useUserPredictions';
 import { AR } from '../../constants/arabic';
 
 const T = {
@@ -675,7 +678,10 @@ export default function CommunityScreen() {
   const { notifications, history, loading: notifLoading, pendingCount, respond, refresh: refreshNotifs } = useResyncNotifications();
   const { score: myScore } = useMyReliability(user?.id);
   const [myOffsetMinutes, setMyOffsetMinutes] = React.useState(0);
-  const { applyResync } = useResync();
+  const { applyResync, resyncPoint } = useResync();
+  const { offset } = useUserOffset();
+  const { userPrediction } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
+  const { captureSnapshot } = useStatusSnapshot();
 
   useEffect(() => { registerPushToken(); }, []);
 
@@ -748,6 +754,16 @@ export default function CommunityScreen() {
   }, [getStatusWith, following, pending, cancelOrUnfollow, respondToRequest, sendRequest]);
 
   const handleReport = useCallback(async (state: ReportedState, time: TimeOption) => {
+    // Capture snapshot BEFORE report is saved so "العودة إلى الحالة الأصلية" can
+    // fully restore the pre-report state (offset + resync + state start).
+    await captureSnapshot(
+      userPrediction?.currentState ?? 'OFF',
+      userPrediction?.currentStateStartIso ?? null,
+      offset?.offset_minutes ?? 0,
+      resyncPoint ?? null,
+      'user_report',
+    );
+
     const { selfResync, error } = await submitReport(state, time);
     setReportModalVisible(false);
     if (error) {
@@ -756,7 +772,7 @@ export default function CommunityScreen() {
       if (selfResync) await applyResync(selfResync);
       Alert.alert(AR.reportShared, AR.reportSharedBody);
     }
-  }, [submitReport, applyResync]);
+  }, [submitReport, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
 
   const handleRespond = useCallback(async (notif: any, response: 'yes' | 'no' | 'ignore') => {
     const { yesResult, error } = await respond(notif, response);
