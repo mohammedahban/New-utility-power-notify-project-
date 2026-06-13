@@ -741,19 +741,17 @@ function TodayTimeline({ prediction, anchorStartIso }: {
 }) {
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
-  const lastComputedAtRef   = useRef<string | null>(null);
   const lastOffsetRef       = useRef<number | null>(null);
   const lastResyncRef       = useRef<string | null>(null);
 
-  const computedAt       = prediction?.computedAt ?? null;
   const currentOffset    = prediction?.offsetMinutes ?? 0;
   const currentResyncIso = prediction?.resyncedAtIso ?? null;
-
-  if (computedAt && computedAt !== lastComputedAtRef.current) {
-    stableStartMapRef.current = {};
-    stableEndMapRef.current   = {};
-    lastComputedAtRef.current = computedAt;
-  }
+  // NOTE: we intentionally do NOT clear the stable maps when computedAt changes.
+  // analyze-patterns re-runs every ~30 min and updates computedAt, which was
+  // causing slot start/end times to shift forward in the timeline (the active
+  // "الآن" slot's start time would jump 30 min ahead on each re-run).
+  // The stable maps are cleared only when offset or resync changes — events
+  // that genuinely require new slot times to be adopted.
   if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
     stableStartMapRef.current = {};
     stableEndMapRef.current   = {};
@@ -1098,20 +1096,30 @@ export default function Home() {
   }, [snapshot, offset, saveOffset, clearResync, clearSnapshot]);
 
   // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
-  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
-  //   e.g. Growatt OFF at 12:00, offset -60 → reconciledStart = 11:00 → "منذ ساعة"
-  //   This MUST win over anchor.startIso which always holds raw Growatt time.
-  // Priority 2: userPrediction.currentStateStartIso — schedule-derived start.
-  // Priority 3: anchor.startIso — Growatt raw time (correct for neutral/positive offset
-  //   users where no reconciliation is needed and schedule start = Growatt start).
+  //
+  // Priority 1: reconciledCycleStartIso — backdated start for UNCERTAIN_ZONE exit.
+  //   Formula: GrowattTransitionTime + Offset  (always in the past for negative offset).
+  //   e.g. Growatt OFF at 12:00, offset -60 → reconciledStart = 11:00 → "منذ ساعة".
+  //   MUST win over everything else so "منذ" never shows "للتو" after exit.
+  //
+  // Priority 2: anchor.startIso — stable start time from useStateAnchor, sourced
+  //   directly from power_events DB records.  This NEVER changes on APPPE re-runs
+  //   (analyze-patterns runs every ~30 min and shifts slot boundaries slightly,
+  //   which was causing "منذ" to reset to zero and the timeline "الآن" time to
+  //   jump forward every 30 minutes).  Use this when anchor state matches the
+  //   user's current predicted state (normal / waiting / grace modes).
+  //
+  // Priority 3: userPrediction.currentStateStartIso — prediction-derived fallback
+  //   used only when no anchor is available (e.g. very first load before power_events
+  //   data arrives, or when anchor state doesn't yet match predicted state).
   const anchorStartIso = (
     userPrediction?.reconciledCycleStartIso
-  ) ?? (
-    userPrediction?.currentStateStartIso
   ) ?? (
     anchor && userPrediction && anchor.state === userPrediction.currentState
       ? anchor.startIso
       : null
+  ) ?? (
+    userPrediction?.currentStateStartIso
   );
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
