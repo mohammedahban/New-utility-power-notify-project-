@@ -19,7 +19,6 @@ import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
 import type { TransitionMode } from '../../hooks/useTransitionMode';
-import type { ScheduleStateMode } from '../../hooks/useUserPredictions';
 
 const T = {
   bg: '#060d1a', surface: '#0d1526', elevated: '#162035',
