@@ -1052,9 +1052,22 @@ export default function Home() {
   const { score: myScore } = useMyReliability(profile?.id);
   const [refreshing, setRefreshing] = useState(false);
 
-  const anchorStartIso = anchor && userPrediction && anchor.state === userPrediction.currentState
-    ? anchor.startIso
-    : userPrediction?.currentStateStartIso ?? null;
+  // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
+  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
+  //   e.g. Growatt OFF at 12:00, offset -60 → reconciledStart = 11:00 → "منذ ساعة"
+  //   This MUST win over anchor.startIso which always holds raw Growatt time.
+  // Priority 2: userPrediction.currentStateStartIso — schedule-derived start.
+  // Priority 3: anchor.startIso — Growatt raw time (correct for neutral/positive offset
+  //   users where no reconciliation is needed and schedule start = Growatt start).
+  const anchorStartIso = (
+    userPrediction?.reconciledCycleStartIso
+  ) ?? (
+    userPrediction?.currentStateStartIso
+  ) ?? (
+    anchor && userPrediction && anchor.state === userPrediction.currentState
+      ? anchor.startIso
+      : null
+  );
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
   const stablePrediction = userPrediction
