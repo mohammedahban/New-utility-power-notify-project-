@@ -890,10 +890,13 @@ function TodayTimeline({ prediction, anchorStartIso }: {
                 }
               })()}
 
-              <Text style={tlStyles.timeText}>
-                {isActive ? (stableStartMapRef.current[slotKey] ?? startF) : startF}
+                <Text style={tlStyles.timeText}>
+                {isActive && anchorStartIso 
+                  ? new Date(anchorStartIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true }).replace('AM', ' ص ').replace('PM', ' م ') 
+                  : startF}
                 {endF ? ` → ${endF}` : ' → …'}
               </Text>
+
 
               {slot.durationLabel && (
                 <Text style={[tlStyles.durText, { color: color + 'aa' }]}>{slot.durationLabel}</Text>
