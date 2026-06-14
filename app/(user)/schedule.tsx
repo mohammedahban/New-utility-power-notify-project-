@@ -342,11 +342,12 @@ export default function ScheduleScreen() {
               isHolding={userPrediction?.isHoldingState}
               // For the active slot, prefer the persistent anchor start time
               // so the displayed start never shifts on prediction refreshes.
-              stableStartFormatted={
-                isActive && anchor && anchor.state === slot.state
-                  ? new Date(anchor.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
+                            stableStartFormatted={
+                isActive
+                  ? new Date(userPrediction?.reconciledCycleStartIso ?? (anchor && anchor.state === slot.state ? anchor.startIso : null) ?? slot.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
                   : stableStart
               }
+
               stableEndFormatted={stableEnd}
             />
             );
