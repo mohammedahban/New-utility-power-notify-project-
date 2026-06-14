@@ -199,11 +199,7 @@ export default function ScheduleScreen() {
   const currentOffset   = offset?.offset_minutes ?? 0;
   const currentResyncIso = resyncPoint?.syncedAtIso ?? null;
 
-  if (computedAt && computedAt !== lastComputedAtRef.current) {
-    stableStartMapRef.current = {};
-    stableEndMapRef.current   = {};
-    lastComputedAtRef.current = computedAt;
-  }
+
 
   if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
     stableStartMapRef.current = {};
