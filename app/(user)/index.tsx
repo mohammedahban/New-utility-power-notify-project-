@@ -1180,15 +1180,16 @@ export default function Home() {
   // Priority 3: anchor.startIso — Growatt raw time (correct for neutral/positive offset
   //   users where no reconciliation is needed and schedule start = Growatt start).
     // تم التعديل: إعطاء الأولوية لـ anchor الثابت لحماية الوقت من التصفير التلقائي
-  const anchorStartIso = (
-    anchor && userPrediction && anchor.state === userPrediction.currentState
+    // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
+  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
+  // Priority 2: anchor.startIso — Growatt raw time.
+  // Priority 3: userPrediction.currentStateStartIso — schedule-derived start.
+  const anchorStartIso = 
+    userPrediction?.reconciledCycleStartIso ??
+    (anchor && userPrediction && anchor.state === userPrediction.currentState
       ? anchor.startIso
-      : null
-  ) ?? (
-    userPrediction?.reconciledCycleStartIso
-  ) ?? (
-    userPrediction?.currentStateStartIso
-  );
+      : null) ??
+    userPrediction?.currentStateStartIso;
 
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
