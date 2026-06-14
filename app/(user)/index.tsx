@@ -1179,10 +1179,13 @@ export default function Home() {
   // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
   // Priority 2: anchor.startIso — Growatt raw time.
   // Priority 3: userPrediction.currentStateStartIso — schedule-derived start.
-  const anchorStartIso = 
-    userPrediction?.currentStateStartIso ?? 
-    (anchor && userPrediction && anchor.state === userPrediction.currentState ? anchor.startIso : null)
-
+    // ── Mathematical Anchor: Bulletproof start time calculation ──────────
+  const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
+  const anchorStartIso = userPrediction?.isResynced && userPrediction.resyncedAtIso
+    ? userPrediction.resyncedAtIso
+    : (anchor && userPrediction && anchor.state === userPrediction.currentState
+        ? new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString()
+        : userPrediction?.currentStateStartIso);
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
   const stablePrediction = userPrediction
