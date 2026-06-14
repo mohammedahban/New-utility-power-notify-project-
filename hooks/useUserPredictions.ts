@@ -499,7 +499,7 @@ function computeATCState(
       prediction.currentState !== scheduleCurrentState &&
       !!prediction.lastTransitionAt;
 
-    if     if (growattFlippedAhead && transitionMode === 'AUTO') {
+    if (growattFlippedAhead && transitionMode === 'AUTO') {
       // Compute the exact time the user will transition
       const offsetMs = offsetMinutes * 60_000;
       const scheduledMs = new Date(prediction.lastTransitionAt!).getTime() + offsetMs;
