@@ -340,9 +340,10 @@ export default function ScheduleScreen() {
               // so the displayed start never shifts on prediction refreshes.
               stableStartFormatted={
                 isActive
-                  ? new Date(userPrediction?.reconciledCycleStartIso ?? (anchor && anchor.state === slot.state ? anchor.startIso : null) ?? slot.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
+                  ? new Date(userPrediction?.currentStateStartIso ?? slot.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
                   : stableStart
               }
+
 
               stableEndFormatted={stableEnd}
             />
