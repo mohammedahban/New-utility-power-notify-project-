@@ -499,26 +499,25 @@ function computeATCState(
       prediction.currentState !== scheduleCurrentState &&
       !!prediction.lastTransitionAt;
 
-    if (growattFlippedAhead && transitionMode === 'AUTO') {
+    if     if (growattFlippedAhead && transitionMode === 'AUTO') {
       // Compute the exact time the user will transition
       const offsetMs = offsetMinutes * 60_000;
       const scheduledMs = new Date(prediction.lastTransitionAt!).getTime() + offsetMs;
       const scheduledAutoTransitionIso = new Date(scheduledMs).toISOString();
 
-      if (scheduledMs > nowMs) {
-        // Countdown phase: tell the user when their state will change
-        const minutesUntil = Math.round((scheduledMs - nowMs) / 60_000);
-        return {
-          ...EMPTY_ATC,
-          mode: 'POSITIVE_OFFSET_PENDING',
-          statusLine: `سيتم تغيير حالتك تلقائياً في ${fmtYemenTime(scheduledAutoTransitionIso)} · بعد ${minutesUntil}د`,
-          scheduledAutoTransitionIso,
-          transitionMode,
-        };
-      }
-      // scheduledMs has passed → schedule's shifted slot should now be active
-      // (case 3 — fall through to normal active-slot check below)
+      // Return POSITIVE_OFFSET_PENDING unconditionally so the exit block
+      // in applyOffsetToPrediction can apply accurate reconciliation.
+      return {
+        ...EMPTY_ATC,
+        mode: 'POSITIVE_OFFSET_PENDING',
+        statusLine: scheduledMs > nowMs 
+          ? ` سيتم   تغيير   حالتك   تلقائياً   في  ${fmtYemenTime(scheduledAutoTransitionIso)} ·  بعد  ${Math.round((scheduledMs - nowMs) / 60_000)} د ` 
+          : null,
+        scheduledAutoTransitionIso,
+        transitionMode,
+      };
     }
+
 
     // Normal active-slot check for positive offset
     if (!activeSlotPos || !activeSlotPos.endIso) {
