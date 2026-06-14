@@ -1180,11 +1180,8 @@ export default function Home() {
   // Priority 2: anchor.startIso — Growatt raw time.
   // Priority 3: userPrediction.currentStateStartIso — schedule-derived start.
   const anchorStartIso = 
-    userPrediction?.reconciledCycleStartIso ??
-    (anchor && userPrediction && anchor.state === userPrediction.currentState
-      ? anchor.startIso
-      : null) ??
-    userPrediction?.currentStateStartIso;
+    userPrediction?.currentStateStartIso ?? 
+    (anchor && userPrediction && anchor.state === userPrediction.currentState ? anchor.startIso : null)
 
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
