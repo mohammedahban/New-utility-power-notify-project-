@@ -197,6 +197,14 @@ export default function ScheduleScreen() {
 
   const computedAt      = userPrediction?.computedAt ?? null;
   const currentOffset   = offset?.offset_minutes ?? 0;
+    // ── Mathematical Anchor for the active slot ──────────
+  const offsetMs = currentOffset * 60_000;
+  const mathematicalActiveStartIso = userPrediction?.isResynced && userPrediction.resyncedAtIso
+    ? userPrediction.resyncedAtIso
+    : (anchor && userPrediction && anchor.state === userPrediction.currentState
+        ? new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString()
+        : null);
+
   const currentResyncIso = resyncPoint?.syncedAtIso ?? null;
 
 
@@ -339,10 +347,11 @@ export default function ScheduleScreen() {
               // For the active slot, prefer the persistent anchor start time
               // so the displayed start never shifts on prediction refreshes.
               stableStartFormatted={
-                isActive
-                  ? new Date(userPrediction?.currentStateStartIso ?? slot.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
+                isActive && (mathematicalActiveStartIso ?? slot.startIso)
+                  ? new Date(mathematicalActiveStartIso ?? slot.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
                   : stableStart
               }
+
 
 
               stableEndFormatted={stableEnd}
