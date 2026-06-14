@@ -158,35 +158,40 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
   const scheduledMs = new Date(scheduledIso).getTime();
   const minutesLeft = Math.max(0, Math.round((scheduledMs - Date.now()) / 60_000));
   const isOn = prediction?.currentState === 'ON';
-  const nextStateLabel = isOn ? 'طافية' : 'شغالة';
-  const nextStateEmoji = isOn ? '🔴' : '⚡';
+  const nextStateLabel = isOn ? ' طافية ' : ' شغالة ';
+  const nextStateEmoji = isOn ? ' 🔴 ' : ' ⚡ ';
+  
+  // حساب الوقت الحقيقي لتغير الحساس (بدلاً من طباعة قيمة الأوفست الثابتة)
+  const offsetMs = (prediction?.offsetMinutes ?? 0) * 60_000;
+  const growattTransitionMs = scheduledMs - offsetMs;
+  const growattAgoMin = Math.max(0, Math.round((Date.now() - growattTransitionMs) / 60_000));
 
-  // Format the scheduled time in Arabic
   const scheduledTimeLabel = new Date(scheduledIso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
-  }).replace('AM', 'ص').replace('PM', 'م');
+  }).replace('AM', ' ص ').replace('PM', ' م ');
 
   return (
     <View style={popStyles.banner}>
       <View style={popStyles.iconWrap}>
-        <Text style={{ fontSize: 22 }}>⏰</Text>
+        <Text style={{ fontSize: 22 }}> ⏰ </Text>
       </View>
       <View style={{ flex: 1 }}>
-        <Text style={popStyles.title}>تغيير تلقائي مجدول</Text>
+        <Text style={popStyles.title}> تغيير   تلقائي   مجدول </Text>
         <Text style={popStyles.body}>
-          سيتم تغيير حالتك إلى{' '}
+           سيتم   تغيير   حالتك   إلى {' '}
           <Text style={{ fontWeight: '800', color: isOn ? T.danger : T.success }}>
             {nextStateEmoji} {nextStateLabel}
           </Text>
-          {' '}تلقائياً في الساعة{' '}
+          {' '} تلقائياً   في   الساعة {' '}
           <Text style={{ fontWeight: '800', color: T.accent }}>{scheduledTimeLabel}</Text>
-          {minutesLeft > 0 ? ` · بعد ${minutesLeft} دقيقة` : ' · الآن'}
+          {minutesLeft > 0 ? ` ·  بعد  ${minutesLeft}  دقيقة ` : ' ·  الآن '}
         </Text>
-        <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {prediction?.offsetMinutes ?? 0} دقيقة</Text>
+        <Text style={popStyles.sub}> الحساس   الرئيسي   حوّل   حالته   منذ  {growattAgoMin}  دقيقة </Text>
       </View>
     </View>
   );
 }
+
 
 const popStyles = StyleSheet.create({
   banner: {
@@ -887,12 +892,20 @@ function TodayTimeline({ prediction, anchorStartIso }: {
                   {isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}
                 </Text>
               </View>
+                            {/* تم التعديل: قمنا بحقن التوقيت المصحح داخل الـ Ref لمنع زحزحة الوقت للأمام */}
+              {(() => {
+                if (isActive && anchorStartIso && !stableStartMapRef.current[slotKey]) {
+                  stableStartMapRef.current[slotKey] = new Date(anchorStartIso).toLocaleString('en-US', { 
+                    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true 
+                  }).replace('AM', 'ص').replace('PM', 'م');
+                }
+              })()}
+
               <Text style={tlStyles.timeText}>
-                {isActive && anchorStartIso
-                  ? new Date(anchorStartIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
-                  : startF
-                }{endF ? ` → ${endF}` : ' → …'}
+                {isActive ? (stableStartMapRef.current[slotKey] ?? startF) : startF}
+                {endF ? ` → ${endF}` : ' → …'}
               </Text>
+
               {slot.durationLabel && (
                 <Text style={[tlStyles.durText, { color: color + 'aa' }]}>{slot.durationLabel}</Text>
               )}
@@ -1141,26 +1154,29 @@ export default function Home() {
   }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
 
   // ── Restore from snapshot ────────────────────────────────────────────────
+  
+  // ── Restore from snapshot (مصحح ومضمون لإعادة الـ offset) ─────────────────
   const handleRestoreSnapshot = useCallback(async () => {
     if (!snapshot) return;
-    // 1. Restore offset (updates user_offsets DB)
-    if ((offset?.offset_minutes ?? 0) !== snapshot.previousOffsetMinutes) {
-      await saveOffset(snapshot.previousOffsetMinutes);
-    }
-    // 2. Clear current resync, then re-apply previous resync if one existed
-    await clearResync();
-    if (snapshot.previousResyncPoint) {
-      // Re-apply without triggering another snapshot (use raw applyResync path).
-      // We clear the snapshot BEFORE re-applying to avoid infinite snapshot chain.
+    try {
+      // 1. استعادة الـ Offset مباشرة إلى قاعدة البيانات والحالة المحلية دون شروط مقيدة
+      const targetOffset = snapshot.previousOffsetMinutes;
+      await saveOffset(targetOffset);
+      
+      // 2. مسح المزامنة المجتمعية الحالية للعودة للحالة الأصلية
+      await clearResync();
+      
+      // 3. مسح الـ لقطة (Snapshot) لتحديث واجهة المستخدم وإخفاء الزر
       await clearSnapshot();
-      // Note: re-applying the previous resync via ResyncContext's applyResync
-      // would fire the snapshot callback again. To avoid that we manipulate
-      // AsyncStorage directly + call clearResync then let the schedule settle.
-      // Simplest correct behaviour: just clear and let APPPE + offset drive state.
+      
+      // تلميح اختياري للمستخدم للتأكيد
+      if (Platform.OS !== 'web') {
+        Alert.alert('تمت العملية', 'تم استعادة توازن الوقت والفارق بنجاح.');
+      }
+    } catch (error) {
+      console.error('خطأ أثناء محاولة استعادة الحالة الأصلية والـ offset:', error);
     }
-    // 3. Clear the snapshot so the button disappears
-    await clearSnapshot();
-  }, [snapshot, offset, saveOffset, clearResync, clearSnapshot]);
+  }, [snapshot, saveOffset, clearResync, clearSnapshot]);
 
   // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
   // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
@@ -1170,16 +1186,16 @@ export default function Home() {
   // Priority 3: anchor.startIso — Growatt raw time (correct for neutral/positive offset
   //   users where no reconciliation is needed and schedule start = Growatt start).
     // تم التعديل: إعطاء الأولوية لـ anchor الثابت لحماية الوقت من التصفير التلقائي
-  const anchorStartIso = (
-    anchor && userPrediction && anchor.state === userPrediction.currentState
-      ? anchor.startIso
-      : null
-  ) ?? (
-    userPrediction?.reconciledCycleStartIso
-  ) ?? (
-    userPrediction?.currentStateStartIso
-  );
-
+    // ── Elapsed-time source priority (مصحح) ──────────
+  // Priority 1: userPrediction.reconciledCycleStartIso (Backdated offset time / Sync time)
+  // Priority 2: userPrediction.currentStateStartIso (Schedule-derived time)
+  // Priority 3: anchor.startIso (Absolute fallback)
+  const anchorStartIso =
+    userPrediction?.reconciledCycleStartIso ??
+    userPrediction?.currentStateStartIso ??
+    anchor?.startIso ??
+    null;
+ 
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
   const stablePrediction = userPrediction
@@ -1196,13 +1212,15 @@ export default function Home() {
   // ── Revert handler (used by PersonalStatusCard) ──────────────────────────
   // If a snapshot exists: show "العودة إلى الحالة الأصلية" flow
   // Otherwise: plain clearResync (old Growatt-revert behaviour)
+    // ── Revert handler (مصحح) ──────────────────────────────────────────
   const handleRevert = useCallback(() => {
     const confirmMsg = hasSnapshot
-      ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.'
+      ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك وفارق التوقيت (Offset) السابق تماماً.'
       : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
+      
     const doRestore = hasSnapshot ? handleRestoreSnapshot : clearResync;
+    
     if (Platform.OS === 'web') {
-      // Web uses Alert.alert polyfill handled inside PersonalStatusCard
       doRestore();
     } else {
       Alert.alert(
@@ -1210,11 +1228,12 @@ export default function Home() {
         confirmMsg,
         [
           { text: 'إلغاء', style: 'cancel' },
-          { text: 'تأكيد العودة', style: 'destructive', onPress: () => doRestore() },
+          { text: 'تأكيد العودة والاستعادة', style: 'destructive', onPress: () => doRestore() },
         ],
       );
     }
   }, [hasSnapshot, handleRestoreSnapshot, clearResync]);
+
   const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? '';
 
   if (loading && !userPrediction) {
