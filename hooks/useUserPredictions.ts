@@ -887,12 +887,30 @@ export function applyOffsetToPrediction(
       finalAtcState           = { ...atcState, mode: 'NORMAL', overrunMinutes: 0, statusLine: null, communityElevated: false };
     }
   }
-
   const nextTransition = prediction.isUnstable
     ? null
     : deriveNextTransition(effectiveSlots, currentState, prediction);
-
+    
   const durLabel = elapsedLabel(reconciledCycleStartIso ?? currentStateStartIso);
+
+  // ── POSITIVE OFFSET FIX: INJECT SYNTHETIC LINGERING SLOT ──
+  // سد "فجوة الجدول" للمستخدم الموجب: إضافة الفترة الحالية المتبقية التي ينتظر انتهاءها
+  let finalDaySchedule = [...effectiveSlots];
+  if (finalAtcState.mode === 'POSITIVE_OFFSET_PENDING' && finalAtcState.scheduledAutoTransitionIso) {
+    const currentStart = reconciledCycleStartIso ?? currentStateStartIso ?? new Date().toISOString();
+    finalDaySchedule.unshift({
+      state: currentState,
+      startIso: currentStart,
+      endIso: finalAtcState.scheduledAutoTransitionIso,
+      startFormatted: fmtYemenTime(currentStart),
+      endFormatted: fmtYemenTime(finalAtcState.scheduledAutoTransitionIso),
+      shiftedStartFormatted: fmtYemenTime(currentStart),
+      shiftedEndFormatted: fmtYemenTime(finalAtcState.scheduledAutoTransitionIso),
+      durationLabel: '', 
+      zone: getZoneFromIso(currentStart),
+      isEstimated: true,
+    });
+  }
 
   return {
     nextTransition,
@@ -910,7 +928,7 @@ export function applyOffsetToPrediction(
     currentState,
     currentStateDurationLabel: durLabel,
     currentStateStartIso,
-    daySchedule: effectiveSlots,
+    daySchedule: finalDaySchedule, // <-- تم التعديل هنا فقط لربط الفترة الوهمية
     reasoning: prediction.reasoning,
     learningMode: prediction.learningMode ?? 'prior_only',
     computedAt: prediction.computedAt ?? null,
@@ -930,6 +948,8 @@ export function applyOffsetToPrediction(
           syncedState: resyncPoint.syncedState,
         } : null),
   };
+
+  
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
