@@ -915,10 +915,7 @@ let { state: currentState, startIso: currentStateStartIso } =
     
   const durLabel = elapsedLabel(reconciledCycleStartIso ?? currentStateStartIso);
 
-    // ── POSITIVE OFFSET FIX: INJECT SYNTHETIC LINGERING SLOT ──
-  // سد "فجوة الجدول" للمستخدم الموجب: إضافة الفترة الحالية المتبقية التي ينتظر انتهاءها
-  let finalDaySchedule = [...effectiveSlots];
-  // ── UNIVERSAL GAP FIX: INJECT SYNTHETIC LINGERING SLOT ──
+    // ── UNIVERSAL GAP FIX: INJECT SYNTHETIC LINGERING SLOT ──
   // سد الفجوة الشامل: يعالج الوضع اليدوي (MANUAL)، الموجب، وأي منطقة انتظار لمنع اختفاء الحالة الحالية وتصحيح "متبقي"
   let finalDaySchedule = [...effectiveSlots];
   if (currentState !== effectiveSlots[0]?.state) {
