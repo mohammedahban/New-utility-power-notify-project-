@@ -448,7 +448,7 @@ function computeATCState(
       if (nowMs >= start && nowMs < end) { activeSlotNeg = slot; break; }
     }
     if (activeSlotNeg?.endIso) {
-      const slotEndMs   = new Date(activeSlotNeg.endIso).getTime();
+      const slotEndMs    = new Date(activeSlotNeg.endIso).getTime();
       const rangeStartMs = slotEndMs - halfSpreadMs;
       const rangeEndMs   = slotEndMs + halfSpreadMs;
       if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) {
@@ -499,7 +499,7 @@ function computeATCState(
       prediction.currentState !== scheduleCurrentState &&
       !!prediction.lastTransitionAt;
 
-        if (growattFlippedAhead && transitionMode === 'AUTO') {
+    if (growattFlippedAhead && transitionMode === 'AUTO') {
       // Compute the exact time the user will transition
       const offsetMs = offsetMinutes * 60_000;
       const scheduledMs = new Date(prediction.lastTransitionAt!).getTime() + offsetMs;
@@ -510,14 +510,13 @@ function computeATCState(
       return {
         ...EMPTY_ATC,
         mode: 'POSITIVE_OFFSET_PENDING',
-        statusLine: scheduledMs > nowMs 
-          ? ` سيتم   تغيير   حالتك   تلقائياً   في  ${fmtYemenTime(scheduledAutoTransitionIso)} ·  بعد  ${Math.round((scheduledMs - nowMs) / 60_000)} د ` 
+        statusLine: scheduledMs > nowMs
+          ? `سيتم تغيير حالتك تلقائياً في ${fmtYemenTime(scheduledAutoTransitionIso)} · بعد ${Math.round((scheduledMs - nowMs) / 60_000)} د`
           : null,
         scheduledAutoTransitionIso,
         transitionMode,
       };
     }
-
 
     // Normal active-slot check for positive offset
     if (!activeSlotPos || !activeSlotPos.endIso) {
@@ -530,7 +529,7 @@ function computeATCState(
     const overrunMs    = Math.max(0, nowMs - rangeEndMs);
     const overrunMin   = overrunMs / 60_000;
 
-    if (nowMs < rangeStartMs)                         return { ...EMPTY_ATC, transitionMode };
+    if (nowMs < rangeStartMs) return { ...EMPTY_ATC, transitionMode };
     if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) return { ...EMPTY_ATC, mode: 'PREDICTION_RANGE', statusLine: 'نطاق التوقع نشط — التغيير محتمل', transitionMode };
 
     // Overrun beyond range → WAITING_FOR_GROWATT
@@ -565,7 +564,7 @@ function computeATCState(
   const overrunMs    = Math.max(0, nowMs - rangeEndMs);
   const overrunMin   = overrunMs / 60_000;
 
-  if (nowMs < rangeStartMs)                         return { ...EMPTY_ATC, transitionMode };
+  if (nowMs < rangeStartMs) return { ...EMPTY_ATC, transitionMode };
   if (nowMs >= rangeStartMs && nowMs <= rangeEndMs) return { ...EMPTY_ATC, mode: 'PREDICTION_RANGE', statusLine: 'نطاق التوقع نشط — التغيير محتمل', transitionMode };
 
   if (overrunMs <= GRACE_PERIOD_MS) {
@@ -796,7 +795,7 @@ export function applyOffsetToPrediction(
   if (masterSlots.length > 0 && prediction.lastTransitionAt && masterSlots[0].state === prediction.currentState) {
     const hardwareStartMs = new Date(prediction.lastTransitionAt).getTime();
     const creepingStartMs = new Date(masterSlots[0].startIso).getTime();
-    const driftMs = hardwareStartMs - creepingStartMs; // حساب مقدار زحف الخادم
+    const driftMs = hardwareStartMs - creepingStartMs;
     masterSlots = masterSlots.map(slot => ({
       ...slot,
       startIso: shiftMs(slot.startIso, driftMs),
@@ -902,20 +901,21 @@ export function applyOffsetToPrediction(
       finalAtcState           = { ...atcState, mode: 'NORMAL', overrunMinutes: 0, statusLine: null, communityElevated: false };
     }
   }
+
   const nextTransition = prediction.isUnstable
     ? null
     : deriveNextTransition(effectiveSlots, currentState, prediction);
-    
+
   const durLabel = elapsedLabel(reconciledCycleStartIso ?? currentStateStartIso);
 
-    // ── POSITIVE OFFSET FIX: INJECT SYNTHETIC LINGERING SLOT ──
-  // سد "فجوة الجدول" للمستخدم الموجب: إضافة الفترة الحالية المتبقية التي ينتظر انتهاءها
+  // ── UNIVERSAL GAP FIX: INJECT SYNTHETIC LINGERING SLOT ──
+  // سد الفجوة الشامل: يعالج الوضع اليدوي (MANUAL)، الموجب، وأي منطقة انتظار لمنع اختفاء الحالة الحالية وتصحيح "متبقي"
   let finalDaySchedule = [...effectiveSlots];
   if (finalAtcState.mode === 'POSITIVE_OFFSET_PENDING' && finalAtcState.scheduledAutoTransitionIso) {
     // نستخدم المرجع الثابت heldCycleStartIso لمنع الفترة من الزحف للأمام
     const currentStart = reconciledCycleStartIso ?? currentStateStartIso ?? heldCycleStartIso ?? new Date().toISOString();
- 
-  
+    // تحديد وقت النهاية: نستخدم الموعد المجدول للموجب، أو وقت بداية أول فترة في الجدول كحد أقصى للانتظار
+
     finalDaySchedule.unshift({
       state: currentState,
       startIso: currentStart,
@@ -924,7 +924,7 @@ export function applyOffsetToPrediction(
       endFormatted: fmtYemenTime(finalAtcState.scheduledAutoTransitionIso),
       shiftedStartFormatted: fmtYemenTime(currentStart),
       shiftedEndFormatted: fmtYemenTime(finalAtcState.scheduledAutoTransitionIso),
-      durationLabel: '', 
+      durationLabel: '',
       zone: getZoneFromIso(currentStart),
       isEstimated: true,
     });
@@ -946,7 +946,7 @@ export function applyOffsetToPrediction(
     currentState,
     currentStateDurationLabel: durLabel,
     currentStateStartIso,
-    daySchedule: finalDaySchedule, // <-- تم التعديل هنا فقط لربط الفترة الوهمية
+    daySchedule: finalDaySchedule,
     reasoning: prediction.reasoning,
     learningMode: prediction.learningMode ?? 'prior_only',
     computedAt: prediction.computedAt ?? null,
@@ -966,8 +966,6 @@ export function applyOffsetToPrediction(
           syncedState: resyncPoint.syncedState,
         } : null),
   };
-
-  
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
@@ -1054,8 +1052,7 @@ export function useUserPredictions(
   }, [offsetMinutes]);
 
   const userPrediction: UserPrediction | null = rawPrediction
-    ?
-(() => {
+    ? (() => {
         const pred = applyOffsetToPrediction(
           rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, stableStartRef.current?.startIso ?? heldCycleStartIso ?? null,
         );
@@ -1086,9 +1083,9 @@ export function useUserPredictions(
           reconciledStartRef.current.state === pred.currentState
         ) {
           // Re-render after reconciliation — keep the backdated start alive
-          pred.currentStateStartIso  = reconciledStartRef.current.startIso;
+          pred.currentStateStartIso    = reconciledStartRef.current.startIso;
           pred.reconciledCycleStartIso = reconciledStartRef.current.startIso;
-          stableStartRef.current     = reconciledStartRef.current;
+          stableStartRef.current       = reconciledStartRef.current;
         } else if (
           stableStartRef.current &&
           stableStartRef.current.state === pred.currentState
