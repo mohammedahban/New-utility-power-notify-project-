@@ -429,14 +429,14 @@ function computeATCState(
           ...EMPTY_ATC,
           mode: 'UNCERTAIN_ZONE',
           overrunMinutes: overrunMin,
-          communityElevated: !growattAlreadyConfirmed, // elevate community while waiting
+          communityElevated: !growattAlreadyConfirmed || transitionMode === 'MANUAL', 
           statusLine: growattAlreadyConfirmed
-            ? null // reconciliation will handle this
+            ? (transitionMode === 'MANUAL' ? ' وضع يدوي — بانتظار بلاغك لتغيير الحالة ' : null)
             : overrunMin < 1
-              ? 'نطاق التوقع انتهى — بانتظار تأكيد تغير الحالة'
-              : `تجاوزت المدة المتوقعة بـ ${Math.ceil(overrunMin)} دقيقة — بانتظار تأكيد`,
+              ? ' نطاق   التوقع   انتهى  —  بانتظار   تأكيد   تغير   الحالة '
+              : ` تجاوزت   المدة   المتوقعة   بـ  ${Math.ceil(overrunMin)}  دقيقة  —  بانتظار   تأكيد `,
           transitionMode,
-        };
+        }; 
       }
     }
 
@@ -659,12 +659,19 @@ function deriveCurrentStateATC(
   masterCurrentState: 'ON' | 'OFF',
   resyncPoint: ResyncPoint | null,
   transitionMode: TransitionMode = 'AUTO',
+  heldStateObj?: { state: 'ON' | 'OFF'; startIso: string } | null,
 ): { state: 'ON' | 'OFF'; startIso: string | null } {
   if (resyncPoint) {
     return { state: resyncPoint.syncedState, startIso: resyncPoint.syncedAtIso };
   }
+  
+  // ── MANUAL MODE LOCK: القفل الصارم لمنع التغيير التلقائي في الوضع اليدوي ──
+  if (transitionMode === 'MANUAL' && heldStateObj) {
+    return { state: heldStateObj.state, startIso: heldStateObj.startIso };
+  }
 
   const nowMs = Date.now();
+  
 
   const derivePreScheduleState = (): { state: 'ON' | 'OFF'; startIso: string | null } => {
     if (effectiveSlots.length > 0) {
@@ -786,7 +793,7 @@ export function applyOffsetToPrediction(
   resyncPoint?: ResyncPoint | null,
   communitySyncMeta?: CommunitySyncMeta | null,
   transitionMode: TransitionMode = 'AUTO',
-  heldCycleStartIso?: string | null,
+  heldStateObj?: { state: 'ON' | 'OFF'; startIso: string } | null,
 ): UserPrediction {
   const offsetMs = offsetMinutes * 60_000;
 
@@ -813,10 +820,10 @@ export function applyOffsetToPrediction(
   }
 
   const atcState = computeATCState(effectiveSlots, offsetMinutes, resyncPoint ?? null, prediction, transitionMode);
-
-  let { state: currentState, startIso: currentStateStartIso } =
-    deriveCurrentStateATC(effectiveSlots, atcState.mode, prediction.currentState, resyncPoint ?? null, transitionMode);
-
+  
+let { state: currentState, startIso: currentStateStartIso } =
+    deriveCurrentStateATC(effectiveSlots, atcState.mode, prediction.currentState, resyncPoint ?? null, transitionMode, heldStateObj);
+  
   let isHolding = atcShouldHold(atcState.mode);
   let finalAtcState = atcState;
   let reconciledCycleStartIso: string | null = null;
@@ -911,19 +918,22 @@ export function applyOffsetToPrediction(
     // ── POSITIVE OFFSET FIX: INJECT SYNTHETIC LINGERING SLOT ──
   // سد "فجوة الجدول" للمستخدم الموجب: إضافة الفترة الحالية المتبقية التي ينتظر انتهاءها
   let finalDaySchedule = [...effectiveSlots];
-  if (finalAtcState.mode === 'POSITIVE_OFFSET_PENDING' && finalAtcState.scheduledAutoTransitionIso) {
-    // نستخدم المرجع الثابت heldCycleStartIso لمنع الفترة من الزحف للأمام
-    const currentStart = reconciledCycleStartIso ?? currentStateStartIso ?? heldCycleStartIso ?? new Date().toISOString();
- 
-  
+  // ── UNIVERSAL GAP FIX: INJECT SYNTHETIC LINGERING SLOT ──
+  // سد الفجوة الشامل: يعالج الوضع اليدوي (MANUAL)، الموجب، وأي منطقة انتظار لمنع اختفاء الحالة الحالية وتصحيح "متبقي"
+  let finalDaySchedule = [...effectiveSlots];
+  if (currentState !== effectiveSlots[0]?.state) {
+    const currentStart = reconciledCycleStartIso ?? currentStateStartIso ?? heldStateObj?.startIso ?? new Date().toISOString();
+    // تحديد وقت النهاية: نستخدم الموعد المجدول للموجب، أو وقت بداية أول فترة في الجدول كحد أقصى للانتظار
+    const syntheticEndIso = finalAtcState.scheduledAutoTransitionIso ?? effectiveSlots[0]?.startIso ?? null;
+
     finalDaySchedule.unshift({
       state: currentState,
       startIso: currentStart,
-      endIso: finalAtcState.scheduledAutoTransitionIso,
+      endIso: syntheticEndIso,
       startFormatted: fmtYemenTime(currentStart),
-      endFormatted: fmtYemenTime(finalAtcState.scheduledAutoTransitionIso),
+      endFormatted: syntheticEndIso ? fmtYemenTime(syntheticEndIso) : null,
       shiftedStartFormatted: fmtYemenTime(currentStart),
-      shiftedEndFormatted: fmtYemenTime(finalAtcState.scheduledAutoTransitionIso),
+      shiftedEndFormatted: syntheticEndIso ? fmtYemenTime(syntheticEndIso) : null,
       durationLabel: '', 
       zone: getZoneFromIso(currentStart),
       isEstimated: true,
@@ -1057,7 +1067,7 @@ export function useUserPredictions(
     ?
 (() => {
         const pred = applyOffsetToPrediction(
-          rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, stableStartRef.current?.startIso ?? heldCycleStartIso ?? null,
+          rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, stableStartRef.current ?? null,
         );
 
         // ── Stabilize currentStateStartIso ────────────────────────────────────
