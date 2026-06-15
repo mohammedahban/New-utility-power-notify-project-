@@ -779,7 +779,6 @@ function computeReconciledCycleStart(
 }
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
-
 export function applyOffsetToPrediction(
   prediction: Prediction,
   offsetMinutes: number,
@@ -790,21 +789,7 @@ export function applyOffsetToPrediction(
 ): UserPrediction {
   const offsetMs = offsetMinutes * 60_000;
 
-  // ── GLOBAL ANTI-CREEP: Anchor schedule to hardware reality ──
-  // لحماية جميع الفترات الحالية والمستقبلية لجميع المستخدمين من زحف توقيت الخادم
-  let masterSlots = prediction.daySchedule ?? [];
-  if (masterSlots.length > 0 && prediction.lastTransitionAt && masterSlots[0].state === prediction.currentState) {
-    const hardwareStartMs = new Date(prediction.lastTransitionAt).getTime();
-    const creepingStartMs = new Date(masterSlots[0].startIso).getTime();
-    const driftMs = hardwareStartMs - creepingStartMs; // حساب مقدار زحف الخادم
-    masterSlots = masterSlots.map(slot => ({
-      ...slot,
-      startIso: shiftMs(slot.startIso, driftMs),
-      endIso: slot.endIso ? shiftMs(slot.endIso, driftMs) : null,
-    }));
-  }
-
-  const extended = extendScheduleTo48h(masterSlots, prediction);
+  const extended = extendScheduleTo48h(prediction.daySchedule ?? [], prediction);
   let effectiveSlots = applyOffsetToSlots(extended, offsetMs);
 
   const hasResync = !!resyncPoint;
@@ -908,14 +893,11 @@ export function applyOffsetToPrediction(
     
   const durLabel = elapsedLabel(reconciledCycleStartIso ?? currentStateStartIso);
 
-    // ── POSITIVE OFFSET FIX: INJECT SYNTHETIC LINGERING SLOT ──
+  // ── POSITIVE OFFSET FIX: INJECT SYNTHETIC LINGERING SLOT ──
   // سد "فجوة الجدول" للمستخدم الموجب: إضافة الفترة الحالية المتبقية التي ينتظر انتهاءها
   let finalDaySchedule = [...effectiveSlots];
   if (finalAtcState.mode === 'POSITIVE_OFFSET_PENDING' && finalAtcState.scheduledAutoTransitionIso) {
-    // نستخدم المرجع الثابت heldCycleStartIso لمنع الفترة من الزحف للأمام
-    const currentStart = reconciledCycleStartIso ?? currentStateStartIso ?? heldCycleStartIso ?? new Date().toISOString();
- 
-  
+    const currentStart = reconciledCycleStartIso ?? currentStateStartIso ?? new Date().toISOString();
     finalDaySchedule.unshift({
       state: currentState,
       startIso: currentStart,
