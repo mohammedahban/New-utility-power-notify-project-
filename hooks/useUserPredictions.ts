@@ -1054,9 +1054,10 @@ export function useUserPredictions(
   }, [offsetMinutes]);
 
   const userPrediction: UserPrediction | null = rawPrediction
-    ? (() => {
+    ?
+(() => {
         const pred = applyOffsetToPrediction(
-          rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, heldCycleStartIso ?? null,
+          rawPrediction, offsetMinutes, resyncPoint, null, transitionMode, stableStartRef.current?.startIso ?? heldCycleStartIso ?? null,
         );
 
         // ── Stabilize currentStateStartIso ────────────────────────────────────
