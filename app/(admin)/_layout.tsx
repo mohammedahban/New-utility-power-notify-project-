@@ -1,8 +1,47 @@
 import { Stack } from 'expo-router';
+import { useEffect } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
-import { TouchableOpacity, Text, View } from 'react-native';
+import { TouchableOpacity, Text, View, Platform } from 'react-native';
 import { useUnreviewedConflictsCount } from '../../hooks/useResyncHistory';
 import { AR } from '../../constants/arabic';
+import { supabase } from '../../lib/supabase';
+import * as Notifications from 'expo-notifications';
+import Constants from 'expo-constants';
+
+/**
+ * Silently ensures the current device's push token is flagged is_admin=true.
+ * Runs on every admin app launch (mount of AdminLayout) so token stays
+ * current after reinstalls or token rotation — no dialogs shown.
+ */
+async function silentAdminTokenRefresh(userId: string): Promise<void> {
+  if (Platform.OS === 'web') return;
+  try {
+    const { status } = await Notifications.getPermissionsAsync();
+    if (status !== 'granted') return; // don't request permission — silent only
+
+    const projectId =
+      Constants.expoConfig?.extra?.eas?.projectId ??
+      (Constants as any).easConfig?.projectId ??
+      (Constants as any).manifest?.extra?.eas?.projectId ??
+      '2ef3abec-5b06-4be3-9dd0-4dbacf35957d';
+
+    const tokenData = await Notifications.getExpoPushTokenAsync({ projectId });
+    const token = tokenData.data;
+
+    const { error } = await supabase
+      .from('push_tokens')
+      .upsert({ token, user_id: userId, is_admin: true }, { onConflict: 'token' });
+
+    if (error) {
+      console.warn('[AdminLayout] silent token refresh error:', error.message);
+    } else {
+      console.log('[AdminLayout] Admin push token refreshed silently:', token.slice(-8));
+    }
+  } catch (err: any) {
+    // FCM/Firebase errors are swallowed — app works normally without push
+    console.warn('[AdminLayout] silentAdminTokenRefresh skipped:', err?.message ?? err);
+  }
+}
 
 function ConflictsBadge() {
   const { count } = useUnreviewedConflictsCount();
@@ -15,7 +54,13 @@ function ConflictsBadge() {
 }
 
 export default function AdminLayout() {
-  const { signOut } = useAuth();
+  const { signOut, user } = useAuth();
+
+  // Re-register admin push token on every login / app launch
+  useEffect(() => {
+    if (!user?.id) return;
+    silentAdminTokenRefresh(user.id);
+  }, [user?.id]);
 
   return (
     <Stack
