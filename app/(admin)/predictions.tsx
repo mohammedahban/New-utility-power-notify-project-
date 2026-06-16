@@ -418,6 +418,104 @@ const ppStyles = StyleSheet.create({
   shiftText: { color: '#f59e0b', fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
+// ── Prediction Quality Breakdown Card ───────────────────────────────────────
+interface PredictionQuality {
+  dataQuantityFactor: number;
+  stabilityFactor: number;
+  driftStabilityFactor: number;
+  biasStabilityFactor: number;
+  volatilityFactor: number;
+  crisisFactor: number;
+}
+
+function PredictionQualityCard({ quality, confidence }: { quality: PredictionQuality; confidence: number }) {
+  const overallColor = confidence >= 85 ? '#22c55e' : confidence >= 65 ? '#f59e0b' : '#ef4444';
+
+  const factors: { key: keyof PredictionQuality; label: string; icon: string; desc: string }[] = [
+    { key: 'dataQuantityFactor',    label: 'كمية البيانات',      icon: '📦', desc: 'عدد الدورات المرجّحة المتاحة' },
+    { key: 'stabilityFactor',       label: 'استقرار النمط',      icon: '📏', desc: 'MAD النسبي مقارنةً بالوسيط' },
+    { key: 'driftStabilityFactor',  label: 'استقرار الانحراف',   icon: '🧭', desc: 'مدى ثبات خطأ التوقيت الأخير' },
+    { key: 'biasStabilityFactor',   label: 'استقرار التحيّز',    icon: '⚖️',  desc: 'نسبة تحيّز المدة الفعلية/المتوقعة' },
+    { key: 'volatilityFactor',      label: 'معامل التذبذب',      icon: '📈', desc: 'EMA الأخطاء — منخفض يعني استقرار' },
+    { key: 'crisisFactor',          label: 'معامل الأزمة',       icon: '🚨', desc: 'هل وضع الأزمة نشط؟' },
+  ];
+
+  // Weighted contribution per factor (must match analyze-patterns weights)
+  const weights: Record<keyof PredictionQuality, number> = {
+    dataQuantityFactor:   0.30,
+    stabilityFactor:      0.25,
+    driftStabilityFactor: 0.15,
+    biasStabilityFactor:  0.10,
+    volatilityFactor:     0.15,
+    crisisFactor:         0.05,
+  };
+
+  return (
+    <View style={pqStyles.card}>
+      <View style={pqStyles.headerRow}>
+        <View style={[pqStyles.overallBadge, { borderColor: overallColor + '55', backgroundColor: overallColor + '18' }]}>
+          <Text style={[pqStyles.overallVal, { color: overallColor }]}>{confidence}%</Text>
+        </View>
+        <Text style={pqStyles.cardTitle}>🔬 تفصيل عوامل الثقة</Text>
+      </View>
+
+      {factors.map(({ key, label, icon, desc }) => {
+        const pct = quality[key];
+        const contribution = Math.round(pct * weights[key]);
+        const barColor = pct >= 85 ? '#22c55e' : pct >= 65 ? '#38bdf8' : pct >= 40 ? '#f59e0b' : '#ef4444';
+        return (
+          <View key={key} style={pqStyles.factorRow}>
+            <View style={pqStyles.factorMeta}>
+              <Text style={pqStyles.contribution}>+{contribution}%</Text>
+              <Text style={pqStyles.weight}>{Math.round(weights[key] * 100)}% وزن</Text>
+            </View>
+            <View style={pqStyles.factorBody}>
+              <View style={pqStyles.labelRow}>
+                <Text style={[pqStyles.pctLabel, { color: barColor }]}>{pct}%</Text>
+                <View style={pqStyles.labelTextWrap}>
+                  <Text style={pqStyles.factorLabel}>{icon} {label}</Text>
+                  <Text style={pqStyles.factorDesc}>{desc}</Text>
+                </View>
+              </View>
+              <View style={pqStyles.barTrack}>
+                <View style={[pqStyles.barFill, { width: `${Math.min(100, pct)}%` as any, backgroundColor: barColor }]} />
+              </View>
+            </View>
+          </View>
+        );
+      })}
+
+      <View style={pqStyles.footer}>
+        <Text style={pqStyles.footerNote}>
+          الثقة الإجمالية = مجموع (العامل × وزنه) · أعلى قيمة ممكنة 97%
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+const pqStyles = StyleSheet.create({
+  card: { backgroundColor: '#1e293b', borderRadius: 16, padding: 18, marginBottom: 12, borderRightWidth: 3, borderRightColor: '#a78bfa' },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  cardTitle: { color: '#94a3b8', fontSize: 11, fontWeight: '700', letterSpacing: 1 },
+  overallBadge: { borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, paddingVertical: 4 },
+  overallVal: { fontSize: 15, fontWeight: '900' },
+  factorRow: { flexDirection: 'row-reverse', gap: 10, paddingVertical: 9, borderTopWidth: 1, borderTopColor: '#0f172a', alignItems: 'center' },
+  factorMeta: { alignItems: 'center', minWidth: 44 },
+  contribution: { color: '#e2e8f0', fontSize: 12, fontWeight: '800', textAlign: 'center' },
+  weight: { color: '#334155', fontSize: 9, fontWeight: '600', textAlign: 'center', marginTop: 2 },
+  factorBody: { flex: 1 },
+  labelRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 },
+  labelTextWrap: { flex: 1 },
+  factorLabel: { color: '#cbd5e1', fontSize: 13, fontWeight: '700', textAlign: 'right' },
+  factorDesc: { color: '#475569', fontSize: 10, marginTop: 2, textAlign: 'right' },
+  pctLabel: { fontSize: 14, fontWeight: '900', minWidth: 38, textAlign: 'left' },
+  barTrack: { height: 7, backgroundColor: '#0f172a', borderRadius: 4, overflow: 'hidden' },
+  barFill: { height: 7, borderRadius: 4 },
+  footer: { marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#0f172a' },
+  footerNote: { color: '#334155', fontSize: 10, textAlign: 'right', lineHeight: 15 },
+});
+
 function LearningProgressCard({ prediction }: { prediction: Prediction }) {
   const TARGET_DAYS = 7;
   const mode = prediction.learningMode;
@@ -610,6 +708,8 @@ export default function AdminPredictions() {
       </Card>
 
       {prediction.apppe && <ProfileBlendCard apppe={prediction.apppe} />}
+
+      {prediction.apppe?.predictionQuality && <PredictionQualityCard quality={prediction.apppe.predictionQuality} confidence={prediction.confidence} />}
 
       <ATCSystemIndicator prediction={prediction} />
 

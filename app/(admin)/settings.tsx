@@ -33,23 +33,6 @@ const dpStyles = StyleSheet.create({
   btnTextActive: { color: '#fff' },
 });
 
-const PROFILE_DEFS = [
-  { key: 'Night Generator',    icon: '🌑', color: '#818cf8', hours: '00 – 06' },
-  { key: 'Morning Transition', icon: '🌅', color: '#fb923c', hours: '06 – 10' },
-  { key: 'Solar Assisted',     icon: '☀️',  color: '#facc15', hours: '10 – 16' },
-  { key: 'Evening Transition', icon: '🌆', color: '#f472b6', hours: '16 – 20' },
-  { key: 'Night Consumption',  icon: '🌃', color: '#60a5fa', hours: '20 – 00' },
-];
-
-function fmtMin(min: number): string {
-  if (!min || min <= 0) return '—';
-  const h = Math.floor(min / 60);
-  const m = Math.round(min % 60);
-  if (h === 0) return `${m}د`;
-  if (m === 0) return h === 1 ? 'ساعة' : `${h}س`;
-  return `${h}س ${m}د`;
-}
-
 function PatternProfilesCard({ prediction }: { prediction: ReturnType<typeof usePredictions>['prediction'] }) {
   if (!prediction?.apppe) {
     return (
@@ -60,65 +43,76 @@ function PatternProfilesCard({ prediction }: { prediction: ReturnType<typeof use
     );
   }
 
-  const { profileSamples } = prediction.apppe;
-  const dayP  = prediction.dayPattern;
-  const nightP = prediction.nightPattern;
+  const apppe = prediction.apppe;
+  const driftColor = apppe.driftOffset === 0 ? '#22c55e' : Math.abs(apppe.driftOffset) < 20 ? '#f59e0b' : '#ef4444';
+  const biasColor = Math.abs(1 - apppe.biasRatio) < 0.05 ? '#22c55e' : Math.abs(1 - apppe.biasRatio) < 0.15 ? '#f59e0b' : '#ef4444';
+  const volColor = apppe.volatilityLabel === 'Low' ? '#22c55e' : apppe.volatilityLabel === 'Moderate' ? '#f59e0b' : '#ef4444';
+  const trustPct = apppe.learningStrength ?? 0;
+  const trustColor = trustPct >= 70 ? '#22c55e' : trustPct >= 40 ? '#f59e0b' : '#f97316';
+  const confColor = prediction.confidence >= 72 ? '#22c55e' : prediction.confidence >= 52 ? '#f59e0b' : '#ef4444';
+
+  const fmtDriftOffset = (min: number) => {
+    if (min === 0) return 'لا انحراف';
+    const sign = min > 0 ? '+' : '-';
+    const h = Math.floor(Math.abs(min) / 60);
+    const m = Math.round(Math.abs(min) % 60);
+    const durStr = h > 0 ? (m > 0 ? `${h}س ${m}د` : `${h}س`) : `${m}د`;
+    return `${sign}${durStr}`;
+  };
+
+  const volLabel = apppe.volatilityLabel === 'Low' ? 'منخفض'
+    : apppe.volatilityLabel === 'Moderate' ? 'متوسط'
+    : apppe.volatilityLabel === 'Elevated' ? 'مرتفع' : 'عالٍ جداً';
 
   return (
     <View style={ppStyles.card}>
-      <Text style={ppStyles.cardTitle}>{AR.patternProfiles} — APPPE v{prediction.apppe.version}</Text>
-      {prediction.apppe.crisisMode && (
-        <View style={ppStyles.crisisBox}>
-          <Text style={ppStyles.crisisText}>{AR.patternShiftActive}</Text>
-          {prediction.apppe.crisisReason ? <Text style={ppStyles.crisisReason}>{prediction.apppe.crisisReason}</Text> : null}
+      <View style={ppStyles.headerRow}>
+        <View style={[ppStyles.versionBadge, apppe.crisisActive && ppStyles.crisisBadge]}>
+          <Text style={[ppStyles.versionText, apppe.crisisActive && ppStyles.crisisText]}>
+            {apppe.crisisActive ? '⚠️ وضع الأزمة' : `APPPE v${apppe.version}`}
+          </Text>
         </View>
-      )}
-      <Text style={ppStyles.hint}>{AR.patternStatsHint}</Text>
-      {PROFILE_DEFS.map(({ key, icon, color, hours }) => {
-        const samples = profileSamples[key] ?? 0;
-        const blend   = prediction.apppe!.profileBlend[key] ?? 0;
-        const isDominant = prediction.apppe!.dominantProfile === key;
+        <Text style={ppStyles.cardTitle}>{AR.patternProfiles}</Text>
+      </View>
 
-        return (
-          <View key={key} style={[ppStyles.profileRow, isDominant && ppStyles.profileRowDominant]}>
-            <View style={ppStyles.statsGrid}>
-              <View style={ppStyles.statCell}>
-                <Text style={ppStyles.statLabel}>{AR.blend}</Text>
-                <Text style={[ppStyles.statValue, { color }]}>{blend}%</Text>
-              </View>
-              <View style={ppStyles.statCell}>
-                <Text style={ppStyles.statLabel}>{AR.medOn}</Text>
-                <Text style={[ppStyles.statValue, { color: '#22c55e' }]}>
-                  {samples > 0 && dayP?.avgOnMin ? fmtMin(dayP.avgOnMin) : '—'}
-                </Text>
-              </View>
-              <View style={ppStyles.statCell}>
-                <Text style={ppStyles.statLabel}>{AR.medOff}</Text>
-                <Text style={[ppStyles.statValue, { color: '#ef4444' }]}>
-                  {samples > 0 && nightP ? fmtMin(nightP.avgOffMin) : '—'}
-                </Text>
-              </View>
-              <View style={ppStyles.statCell}>
-                <Text style={ppStyles.statLabel}>عينات</Text>
-                <Text style={[ppStyles.statValue, { color: samples >= 4 ? '#22c55e' : samples >= 2 ? '#f59e0b' : '#ef4444' }]}>{samples}</Text>
-              </View>
-            </View>
-            <View style={ppStyles.profileLeft}>
-              <View>
-                <Text style={[ppStyles.profileName, isDominant && { color }]}>
-                  {key}{isDominant ? '  ●' : ''}
-                </Text>
-                <Text style={ppStyles.profileHours}>{hours}</Text>
-              </View>
-              <Text style={ppStyles.profileIcon}>{icon}</Text>
-            </View>
+      {apppe.crisisActive && apppe.crisisReason ? (
+        <View style={ppStyles.crisisBox}>
+          <Text style={ppStyles.crisisReason}>{apppe.crisisReason}</Text>
+        </View>
+      ) : null}
+
+      {/* Learning trust bar */}
+      <View style={ppStyles.trustRow}>
+        <Text style={[ppStyles.trustPct, { color: trustColor }]}>{trustPct}%</Text>
+        <View style={ppStyles.trustTrack}>
+          <View style={[ppStyles.trustFill, { width: `${trustPct}%` as any, backgroundColor: trustColor }]} />
+        </View>
+        <Text style={ppStyles.trustLabel}>قوة التعلم · {(apppe.effectiveWeightedSamples ?? 0).toFixed(1)} عينة</Text>
+      </View>
+
+      {/* Metric rows */}
+      {[
+        { icon: '📐', label: 'انحراف التوقيت',  value: fmtDriftOffset(apppe.driftOffset),                 sub: `${apppe.driftSampleCount} حدث`, color: driftColor },
+        { icon: '⚖️',  label: 'تحيّز المدة',     value: `×${apppe.biasRatio?.toFixed(2) ?? '1.00'}`,      sub: `${apppe.biasSampleCount} حدث`, color: biasColor },
+        { icon: '📈', label: 'تذبذب التوقع',    value: volLabel,                                           sub: `EMA ${(apppe.volatilityEMA ?? 0).toFixed(0)}د`,  color: volColor },
+        { icon: '🔀', label: 'انحراف الانقطاع', value: apppe.madOff != null ? `${apppe.madOff}د` : '—',   sub: 'MAD', color: '#94a3b8' },
+        { icon: '🔀', label: 'انحراف التشغيل',  value: apppe.madOn  != null ? `${apppe.madOn}د`  : '—',  sub: 'MAD', color: '#94a3b8' },
+      ].map((item, i) => (
+        <View key={i} style={ppStyles.metricRow}>
+          <View style={ppStyles.metricRight}>
+            <Text style={[ppStyles.metricValue, { color: item.color }]}>{item.value}</Text>
+            <Text style={ppStyles.metricSub}>{item.sub}</Text>
           </View>
-        );
-      })}
+          <View style={ppStyles.metricLeft}>
+            <Text style={ppStyles.metricIcon}>{item.icon}</Text>
+            <Text style={ppStyles.metricLabel}>{item.label}</Text>
+          </View>
+        </View>
+      ))}
 
       <View style={ppStyles.footer}>
         <View style={ppStyles.footerItem}>
-          <Text style={[ppStyles.footerValue, { color: prediction.confidence >= 72 ? '#22c55e' : prediction.confidence >= 52 ? '#f59e0b' : '#ef4444' }]}>
+          <Text style={[ppStyles.footerValue, { color: confColor }]}>
             {prediction.confidence}%  {prediction.confidenceLabel}
           </Text>
           <Text style={ppStyles.footerLabel}>{AR.confidence}</Text>
@@ -136,22 +130,27 @@ function PatternProfilesCard({ prediction }: { prediction: ReturnType<typeof use
 
 const ppStyles = StyleSheet.create({
   card: { backgroundColor: '#1e293b', borderRadius: 16, paddingHorizontal: 18, paddingTop: 14, paddingBottom: 16, marginBottom: 16, borderRightWidth: 3, borderRightColor: '#38bdf8' },
-  cardTitle: { color: '#64748b', fontSize: 11, fontWeight: '700', letterSpacing: 1, marginBottom: 10, textAlign: 'right' },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
+  cardTitle: { color: '#64748b', fontSize: 11, fontWeight: '700', letterSpacing: 1, textAlign: 'right' },
   noData: { color: '#475569', fontSize: 13, paddingVertical: 8, textAlign: 'right' },
-  hint: { color: '#475569', fontSize: 11, lineHeight: 16, marginBottom: 14, textAlign: 'right' },
+  versionBadge: { backgroundColor: '#0f172a', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: '#334155' },
+  crisisBadge: { borderColor: '#f59e0b', backgroundColor: '#1a0e00' },
+  versionText: { color: '#64748b', fontSize: 10, fontWeight: '600' },
+  crisisText: { color: '#f59e0b', fontWeight: '700' },
   crisisBox: { backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: '#92400e' },
-  crisisText: { color: '#f59e0b', fontSize: 12, fontWeight: '700', marginBottom: 4, textAlign: 'right' },
   crisisReason: { color: '#fbbf24', fontSize: 11, lineHeight: 17, textAlign: 'right' },
-  profileRow: { backgroundColor: '#0f172a', borderRadius: 12, padding: 12, marginBottom: 8 },
-  profileRowDominant: { borderWidth: 1, borderColor: '#334155' },
-  profileLeft: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 10 },
-  profileIcon: { fontSize: 20 },
-  profileName: { color: '#94a3b8', fontSize: 13, fontWeight: '700', lineHeight: 18, textAlign: 'right' },
-  profileHours: { color: '#475569', fontSize: 10, marginTop: 1 },
-  statsGrid: { flexDirection: 'row-reverse', gap: 4 },
-  statCell: { flex: 1, backgroundColor: '#1e293b', borderRadius: 8, padding: 8, alignItems: 'center' },
-  statLabel: { color: '#475569', fontSize: 8, fontWeight: '700', letterSpacing: 0.8, marginBottom: 4 },
-  statValue: { color: '#e2e8f0', fontSize: 13, fontWeight: '800' },
+  trustRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 14 },
+  trustLabel: { color: '#64748b', fontSize: 10, flex: 1, textAlign: 'right' },
+  trustPct: { fontSize: 13, fontWeight: '800', minWidth: 36, textAlign: 'left' },
+  trustTrack: { flex: 1, height: 6, backgroundColor: '#0f172a', borderRadius: 3, overflow: 'hidden' },
+  trustFill: { height: 6, borderRadius: 3 },
+  metricRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9, borderTopWidth: 1, borderTopColor: '#0f172a' },
+  metricLeft: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
+  metricIcon: { fontSize: 14 },
+  metricLabel: { color: '#64748b', fontSize: 13 },
+  metricRight: { alignItems: 'flex-start' },
+  metricValue: { fontSize: 14, fontWeight: '800' },
+  metricSub: { color: '#475569', fontSize: 10, marginTop: 1 },
   footer: { flexDirection: 'row-reverse', gap: 8, marginTop: 8, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#0f172a' },
   footerItem: { flex: 1, backgroundColor: '#0f172a', borderRadius: 10, padding: 10 },
   footerLabel: { color: '#475569', fontSize: 8, fontWeight: '700', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },

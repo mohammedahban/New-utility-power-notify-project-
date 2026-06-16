@@ -13,6 +13,106 @@ import { usePredictions, Prediction } from '../../hooks/usePredictions';
 import { useAdminResyncHistory, useUnreviewedConflictsCount } from '../../hooks/useResyncHistory';
 import { AR } from '../../constants/arabic';
 import { supabase } from '../../lib/supabase';
+import { useCallback } from 'react';
+
+// ── 3-day Accuracy Mini-Sparkline ───────────────────────────────────────────
+interface DayAccuracy { label: string; avg: number; count: number; }
+
+function useThreeDayAccuracy() {
+  const [points, setPoints] = React.useState<DayAccuracy[]>([]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const since = new Date(Date.now() - 3 * 86400000).toISOString();
+        const { data } = await supabase
+          .from('prediction_accuracy_logs')
+          .select('accuracy_score, created_at')
+          .gte('created_at', since)
+          .order('created_at', { ascending: true });
+        if (cancelled || !data) return;
+
+        const pts: DayAccuracy[] = [];
+        for (let d = 2; d >= 0; d--) {
+          const dayStart = Date.now() - (d + 1) * 86400000;
+          const dayEnd   = Date.now() - d * 86400000;
+          const dayLogs  = data.filter((l: any) => {
+            const t = new Date(l.created_at).getTime();
+            return t >= dayStart && t < dayEnd;
+          });
+          const avg = dayLogs.length === 0
+            ? 0
+            : dayLogs.reduce((s: number, l: any) => s + l.accuracy_score, 0) / dayLogs.length;
+          const date = new Date(dayStart + 43200000);
+          const label = d === 0 ? 'اليوم' : d === 1 ? 'أمس'
+            : date.toLocaleDateString('ar-SA', { timeZone: 'Asia/Aden', weekday: 'short' });
+          pts.push({ label, avg: Math.round(avg), count: dayLogs.length });
+        }
+        if (!cancelled) setPoints(pts);
+      } catch { /* non-fatal */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  return points;
+}
+
+function AccuracyMiniSparkline({ onPress }: { onPress: () => void }) {
+  const points = useThreeDayAccuracy();
+  const hasData = points.some(p => p.count > 0);
+
+  return (
+    <TouchableOpacity style={amStyles.card} onPress={onPress} activeOpacity={0.8}>
+      <View style={amStyles.headerRow}>
+        <Text style={amStyles.tapHint}>عرض التفاصيل ›</Text>
+        <Text style={amStyles.title}>🎯 دقة التوقعات — آخر 3 أيام</Text>
+      </View>
+      {!hasData ? (
+        <Text style={amStyles.empty}>لا توجد بيانات دقة بعد</Text>
+      ) : (
+        <View style={amStyles.barsRow}>
+          {points.map((p, i) => {
+            const barColor = p.count === 0 ? '#334155' : p.avg >= 85 ? '#22c55e' : p.avg >= 65 ? '#f59e0b' : '#ef4444';
+            const barH = p.count === 0 ? 4 : Math.max(6, (p.avg / 100) * 44);
+            return (
+              <View key={i} style={amStyles.barCol}>
+                <Text style={[amStyles.pctLabel, { color: barColor }]}>
+                  {p.count === 0 ? '—' : `${p.avg}%`}
+                </Text>
+                <View style={amStyles.barTrack}>
+                  <View style={[amStyles.barFill, { height: barH, backgroundColor: barColor }]} />
+                </View>
+                <Text style={amStyles.dayLabel}>{p.label}</Text>
+                {p.count > 0 && (
+                  <Text style={amStyles.countLabel}>{p.count} قياس</Text>
+                )}
+              </View>
+            );
+          })}
+        </View>
+      )}
+    </TouchableOpacity>
+  );
+}
+
+const amStyles = StyleSheet.create({
+  card: {
+    backgroundColor: '#0a1e14', borderRadius: 14, padding: 14, marginTop: 12,
+    borderWidth: 1, borderColor: '#22c55e33',
+  },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  title: { color: '#4ade80', fontSize: 11, fontWeight: '800', letterSpacing: 0.8 },
+  tapHint: { color: '#166534', fontSize: 10, fontWeight: '600' },
+  empty: { color: '#475569', fontSize: 12, textAlign: 'center', paddingVertical: 8 },
+  barsRow: { flexDirection: 'row-reverse', gap: 10, alignItems: 'flex-end', justifyContent: 'space-around' },
+  barCol: { flex: 1, alignItems: 'center', gap: 4 },
+  barTrack: { width: '70%', height: 48, justifyContent: 'flex-end', backgroundColor: '#0f172a', borderRadius: 6, overflow: 'hidden' },
+  barFill: { width: '100%', borderRadius: 6 },
+  pctLabel: { fontSize: 12, fontWeight: '900', textAlign: 'center' },
+  dayLabel: { color: '#64748b', fontSize: 10, textAlign: 'center' },
+  countLabel: { color: '#334155', fontSize: 9, textAlign: 'center' },
+});
 
 // ── Offset cluster alert ────────────────────────────────────────────────────
 interface ClusterAlert { bucket: number; count: number; }
@@ -291,6 +391,8 @@ export default function AdminDashboard() {
       </View>
 
       <StatusCard state={state} loading={stateLoading} />
+
+      <AccuracyMiniSparkline onPress={() => router.push('/(admin)/accuracy')} />
 
       {prediction?.apppe?.crisisMode && prediction.apppe.crisisReason ? (
         <CrisisBanner reason={prediction.apppe.crisisReason} />
