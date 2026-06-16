@@ -5,10 +5,12 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, TouchableOpacity,
-  ActivityIndicator, RefreshControl, Alert, Platform, Modal,
+  ActivityIndicator, RefreshControl, Alert, Platform, Modal, Share,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { supabase } from '../../lib/supabase';
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 
 const T = {
   bg: '#0f172a', surface: '#1e293b', elevated: '#0f172a',
@@ -19,6 +21,8 @@ const T = {
 };
 
 type Range = '1' | '7' | '30' | 'all';
+
+const PAGE_SIZE = 20;
 
 interface AccuracyLog {
   id: number;
@@ -287,11 +291,84 @@ const logStyles = StyleSheet.create({
   sub: { color: '#475569', fontSize: 11, textAlign: 'right' },
 });
 
+// ── Export / Download ────────────────────────────────────────────────────────
+async function exportLogsToFile(logs: AccuracyLog[], stats: Stats, range: Range): Promise<void> {
+  const rangeLabel = range === '1' ? 'اليوم' : range === '7' ? '7 أيام' : range === '30' ? '30 يوماً' : 'الكل';
+  const now = new Date();
+  const exportedAt = now.toLocaleString('ar-SA', { timeZone: 'Asia/Aden' });
+
+  // Build JSON export object
+  const exportObj = {
+    export_info: {
+      generated_at: now.toISOString(),
+      exported_at_local: exportedAt,
+      range: rangeLabel,
+      total_records: logs.length,
+    },
+    summary_stats: {
+      overall_accuracy_pct: stats.overall,
+      avg_error_minutes: stats.avgError,
+      on_accuracy_pct: stats.onAccuracy,
+      off_accuracy_pct: stats.offAccuracy,
+      trend: stats.trend,
+      trend_delta_pct: stats.trendDelta,
+      high_accuracy_count: logs.filter(l => l.accuracy_score >= 80).length,
+      low_accuracy_count: logs.filter(l => l.accuracy_score < 60).length,
+    },
+    error_distribution: {
+      under_5min: logs.filter(l => l.error_minutes < 5).length,
+      '5_to_15min': logs.filter(l => l.error_minutes >= 5 && l.error_minutes < 15).length,
+      '15_to_30min': logs.filter(l => l.error_minutes >= 15 && l.error_minutes < 30).length,
+      '30_to_60min': logs.filter(l => l.error_minutes >= 30 && l.error_minutes < 60).length,
+      over_60min: logs.filter(l => l.error_minutes >= 60).length,
+    },
+    logs: logs.map(l => ({
+      id: l.id,
+      predicted_state: l.predicted_state,
+      predicted_time: l.predicted_event_time,
+      actual_time: l.actual_event_time,
+      error_minutes: l.error_minutes,
+      accuracy_score: l.accuracy_score,
+      confidence_score: l.confidence_score,
+      slot_id: l.slot_id,
+      created_at: l.created_at,
+    })),
+  };
+
+  const jsonString = JSON.stringify(exportObj, null, 2);
+  const fileName = `apppe_accuracy_${range}d_${now.toISOString().slice(0, 10)}.json`;
+
+  if (Platform.OS === 'web') {
+    // Web: create blob download
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return;
+  }
+
+  // Native: write to cache then share
+  const fileUri = FileSystem.cacheDirectory + fileName;
+  await FileSystem.writeAsStringAsync(fileUri, jsonString, { encoding: FileSystem.EncodingType.UTF8 });
+  const canShare = await Sharing.isAvailableAsync();
+  if (canShare) {
+    await Sharing.shareAsync(fileUri, {
+      mimeType: 'application/json',
+      dialogTitle: 'مشاركة تقرير دقة APPPE',
+      UTI: 'public.json',
+    });
+  } else {
+    Alert.alert('تنزيل التقرير', `تم حفظ الملف مؤقتاً:\n${fileUri}`);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BACKFILL ENGINE
-// Scans power_events history (last 30 days) against the current APPPE snapshot
-// and inserts missing accuracy logs for events that have no entry yet.
-// Read-only w.r.t. predictions — only writes to prediction_accuracy_logs.
 // ─────────────────────────────────────────────────────────────────────────────
 async function runBackfill(): Promise<{ inserted: number; skipped: number; error: string | null }> {
   const MAX_ALLOWED_ERROR_MIN = 150;
@@ -347,7 +424,6 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
       if (slot.state !== targetState) continue;
       const slotMs = new Date(slot.startIso ?? slot.start_iso ?? '').getTime();
       if (!slotMs) continue;
-      // Time-of-day distance (mod 24h): yesterday's 08:00 matches today's 08:00 slot
       const eventHourMs = eventMs % 86_400_000;
       const slotHourMs  = slotMs  % 86_400_000;
       let dist = Math.abs(eventHourMs - slotHourMs);
@@ -360,13 +436,11 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
     const predictedMs = new Date(matchingSlot.startIso ?? matchingSlot.start_iso ?? '').getTime();
     if (!predictedMs) continue;
 
-    // Time-of-day error (ignore date difference)
     let errorMs = Math.abs((eventMs % 86_400_000) - (predictedMs % 86_400_000));
     if (errorMs > 43_200_000) errorMs = 86_400_000 - errorMs;
     const errorMin = errorMs / 60_000;
     const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
 
-    // Predicted ISO: event's date + slot's time-of-day
     const eventDate = new Date(ev.occurred_at);
     const slotDate  = new Date(matchingSlot.startIso ?? matchingSlot.start_iso);
     const predictedIso = new Date(Date.UTC(
@@ -408,40 +482,53 @@ export default function AccuracyScreen() {
   const insets = useSafeAreaInsets();
   const [range, setRange] = useState<Range>('7');
   const [logs, setLogs] = useState<AccuracyLog[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [backfillResult, setBackfillResult] = useState<{ inserted: number; skipped: number } | null>(null);
   const [alertVisible, setAlertVisible] = useState(false);
   const [alertMsg, setAlertMsg] = useState('');
 
-  // Use ref so handleBackfill can call fetchLogs without circular dependency
-  const fetchLogsRef = useRef<() => Promise<void>>(async () => {});
+  const fetchLogsRef = useRef<(p?: number) => Promise<void>>(async () => {});
 
-  const fetchLogs = useCallback(async () => {
+  const fetchLogs = useCallback(async (pageOverride?: number) => {
+    const currentPage = pageOverride ?? page;
     setLoading(true);
     try {
+      const from = currentPage * PAGE_SIZE;
+      const to   = from + PAGE_SIZE - 1;
+
       let q = supabase
         .from('prediction_accuracy_logs')
-        .select('*')
+        .select('*', { count: 'exact' })
         .order('created_at', { ascending: false })
-        .limit(200);
+        .range(from, to);
+
       if (range !== 'all') {
         const days = parseInt(range);
         const since = new Date(Date.now() - days * 86400000).toISOString();
         q = q.gte('created_at', since);
       }
-      const { data, error } = await q;
+
+      const { data, error, count } = await q;
       if (error) console.error('[accuracy] fetch error:', error.message);
       setLogs((data ?? []) as AccuracyLog[]);
+      setTotalCount(count ?? 0);
     } catch (err) { console.error('[accuracy] error:', err); }
     setLoading(false);
-  }, [range]);
+  }, [range, page]);
 
-  // Keep ref in sync so handleBackfill always calls the latest fetchLogs
   useEffect(() => { fetchLogsRef.current = fetchLogs; }, [fetchLogs]);
-
-  useEffect(() => { fetchLogs(); }, [fetchLogs]);
+  useEffect(() => {
+    setPage(0);
+  }, [range]);
+  useEffect(() => {
+    fetchLogs(page);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range, page]);
 
   const showAlert = useCallback((msg: string) => {
     if (Platform.OS === 'web') { setAlertMsg(msg); setAlertVisible(true); }
@@ -462,16 +549,46 @@ export default function AccuracyScreen() {
           ? `جميع الأحداث مُسجّلة مسبقاً (${result.skipped} حدث).`
           : `تمّ استرجاع ${result.inserted} سجل دقة جديد.\n(تم تخطي ${result.skipped} حدث موجود مسبقاً)`,
       );
-      await fetchLogsRef.current();
+      setPage(0);
+      await fetchLogsRef.current(0);
     }
   }, [showAlert]);
 
+  const handleExport = useCallback(async () => {
+    // Fetch ALL logs for export (no pagination limit)
+    setExporting(true);
+    try {
+      let q = supabase
+        .from('prediction_accuracy_logs')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (range !== 'all') {
+        const days = parseInt(range);
+        const since = new Date(Date.now() - days * 86400000).toISOString();
+        q = q.gte('created_at', since);
+      }
+      const { data, error } = await q;
+      if (error || !data) {
+        Alert.alert('خطأ', 'فشل تحميل البيانات للتصدير');
+        return;
+      }
+      const allLogs = data as AccuracyLog[];
+      const allStats = computeStats(allLogs);
+      await exportLogsToFile(allLogs, allStats, range);
+    } catch (err: any) {
+      Alert.alert('خطأ في التصدير', err?.message ?? String(err));
+    }
+    setExporting(false);
+  }, [range]);
+
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await fetchLogs();
+    setPage(0);
+    await fetchLogs(0);
     setRefreshing(false);
   }, [fetchLogs]);
 
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
   const stats = computeStats(logs);
   const todayLogs = logs.filter(l => Date.now() - new Date(l.created_at).getTime() < 86400000);
   const todayStats = computeStats(todayLogs);
@@ -508,12 +625,38 @@ export default function AccuracyScreen() {
         </Modal>
       )}
 
-      {/* Backfill banner */}
+      {/* Backfill + Export banner */}
       <View style={bfStyles.banner}>
+        <View style={{ gap: 8 }}>
+          {/* Export button */}
+          <TouchableOpacity
+            style={[bfStyles.btn, bfStyles.exportBtn, exporting && { opacity: 0.6 }]}
+            onPress={handleExport}
+            disabled={exporting}
+            activeOpacity={0.8}
+          >
+            {exporting
+              ? <ActivityIndicator size="small" color="#a78bfa" />
+              : <Text style={[bfStyles.btnText, { color: '#a78bfa' }]}>📥 تنزيل</Text>
+            }
+          </TouchableOpacity>
+          {/* Backfill button */}
+          <TouchableOpacity
+            style={[bfStyles.btn, backfilling && { opacity: 0.6 }]}
+            onPress={handleBackfill}
+            disabled={backfilling}
+            activeOpacity={0.8}
+          >
+            {backfilling
+              ? <ActivityIndicator size="small" color={T.accent} />
+              : <Text style={bfStyles.btnText}>استرجاع</Text>
+            }
+          </TouchableOpacity>
+        </View>
         <View style={{ flex: 1 }}>
-          <Text style={bfStyles.title}>📊 استرجاع سجلات الدقة</Text>
+          <Text style={bfStyles.title}>📊 استرجاع وتصدير</Text>
           <Text style={bfStyles.sub}>
-            يقارن أحداث الكهرباء التاريخية (آخر 30 يوماً) بأنماط APPPE الحالية ويُنشئ سجلات الدقة المفقودة فوراً.
+            "استرجاع" يملأ السجلات المفقودة من آخر 30 يوماً. "تنزيل" يصدّر التحليل كملف JSON للمشاركة مع AI.
           </Text>
           {backfillResult ? (
             <Text style={[bfStyles.result, { color: backfillResult.inserted > 0 ? T.success : T.textMuted }]}>
@@ -523,17 +666,6 @@ export default function AccuracyScreen() {
             </Text>
           ) : null}
         </View>
-        <TouchableOpacity
-          style={[bfStyles.btn, backfilling && { opacity: 0.6 }]}
-          onPress={handleBackfill}
-          disabled={backfilling}
-          activeOpacity={0.8}
-        >
-          {backfilling
-            ? <ActivityIndicator size="small" color={T.accent} />
-            : <Text style={bfStyles.btnText}>استرجاع</Text>
-          }
-        </TouchableOpacity>
       </View>
 
       {/* Range filter */}
@@ -566,10 +698,10 @@ export default function AccuracyScreen() {
           <View style={styles.card}>
             <View style={styles.cardHeader}>
               <TrendBadge trend={stats.trend} delta={stats.trendDelta} />
-              <Text style={styles.cardTitle}>دقة التوقعات</Text>
+              <Text style={styles.cardTitle}>دقة التوقعات — {totalCount} قياس إجمالاً</Text>
             </View>
             <View style={styles.gaugesRow}>
-              <ScoreGauge score={stats.overall} label="الإجمالي" sub={`${stats.count} حدث`} />
+              <ScoreGauge score={stats.overall} label="الإجمالي" sub={`${totalCount} حدث`} />
               <ScoreGauge score={todayStats.overall} label="اليوم" sub={`${todayStats.count} حدث`} />
               <ScoreGauge score={stats.onAccuracy} label="دقة تشغيل" sub="⚡" />
               <ScoreGauge score={stats.offAccuracy} label="دقة انقطاع" sub="🔴" />
@@ -590,7 +722,7 @@ export default function AccuracyScreen() {
               <Text style={styles.pillLabel}>دقة &lt; 60%</Text>
             </View>
             <View style={styles.pill}>
-              <Text style={styles.pillVal}>{stats.count}</Text>
+              <Text style={styles.pillVal}>{totalCount}</Text>
               <Text style={styles.pillLabel}>إجمالي القياسات</Text>
             </View>
           </View>
@@ -621,9 +753,67 @@ export default function AccuracyScreen() {
           <AccuracySparkline logs={logs} />
           <InsightWidget logs={logs} />
 
+          {/* Paginated log list */}
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>أحدث الأحداث ({logs.length})</Text>
-            {logs.slice(0, 30).map(l => <LogRow key={l.id} log={l} />)}
+            <View style={styles.cardHeader}>
+              <Text style={styles.pageInfo}>
+                صفحة {page + 1} من {totalPages}
+              </Text>
+              <Text style={styles.cardTitle}>
+                الأحداث ({totalCount} إجمالاً)
+              </Text>
+            </View>
+
+            {logs.map(l => <LogRow key={l.id} log={l} />)}
+
+            {/* Pagination controls */}
+            {totalPages > 1 && (
+              <View style={styles.paginationRow}>
+                <TouchableOpacity
+                  style={[styles.pageBtn, page >= totalPages - 1 && styles.pageBtnDisabled]}
+                  onPress={() => setPage(p => Math.min(totalPages - 1, p + 1))}
+                  disabled={page >= totalPages - 1}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.pageBtnText, page >= totalPages - 1 && { color: '#334155' }]}>
+                    التالية ›
+                  </Text>
+                </TouchableOpacity>
+
+                <View style={styles.pageDotsRow}>
+                  {Array.from({ length: Math.min(totalPages, 5) }).map((_, i) => {
+                    // Show pages around current page
+                    let pageIdx = i;
+                    if (totalPages > 5) {
+                      const start = Math.max(0, Math.min(page - 2, totalPages - 5));
+                      pageIdx = start + i;
+                    }
+                    return (
+                      <TouchableOpacity
+                        key={pageIdx}
+                        style={[styles.pageDot, pageIdx === page && styles.pageDotActive]}
+                        onPress={() => setPage(pageIdx)}
+                      >
+                        <Text style={[styles.pageDotText, pageIdx === page && { color: T.accent }]}>
+                          {pageIdx + 1}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                <TouchableOpacity
+                  style={[styles.pageBtn, page === 0 && styles.pageBtnDisabled]}
+                  onPress={() => setPage(p => Math.max(0, p - 1))}
+                  disabled={page === 0}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.pageBtnText, page === 0 && { color: '#334155' }]}>
+                    ‹ السابقة
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
         </>
       )}
@@ -645,6 +835,10 @@ const bfStyles = StyleSheet.create({
     paddingHorizontal: 14, paddingVertical: 10,
     alignItems: 'center', justifyContent: 'center',
     borderWidth: 1, borderColor: T.accent + '55', minWidth: 72,
+  },
+  exportBtn: {
+    backgroundColor: '#a78bfa22',
+    borderColor: '#a78bfa55',
   },
   btnText: { color: T.accent, fontSize: 13, fontWeight: '800' },
 });
@@ -675,4 +869,13 @@ const styles = StyleSheet.create({
   emptyIcon: { fontSize: 48, marginBottom: 16 },
   emptyTitle: { color: '#94a3b8', fontSize: 18, fontWeight: '700', marginBottom: 10, textAlign: 'center' },
   emptySub: { color: '#64748b', fontSize: 13, textAlign: 'center', lineHeight: 20 },
+  pageInfo: { color: '#475569', fontSize: 11 },
+  paginationRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', marginTop: 16, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#0f172a' },
+  pageBtn: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10, backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155' },
+  pageBtnDisabled: { opacity: 0.4 },
+  pageBtnText: { color: T.accent, fontSize: 13, fontWeight: '700' },
+  pageDotsRow: { flexDirection: 'row-reverse', gap: 4 },
+  pageDot: { width: 30, height: 30, borderRadius: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155' },
+  pageDotActive: { backgroundColor: '#1e3a5f', borderColor: T.accent },
+  pageDotText: { color: '#64748b', fontSize: 12, fontWeight: '700' },
 });
