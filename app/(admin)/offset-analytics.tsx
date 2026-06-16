@@ -32,8 +32,12 @@ interface BucketEntry {
   pct: number;
 }
 
-function toBucket(min: number): number {
+function toBucket30(min: number): number {
   return Math.round(min / 30) * 30;
+}
+
+function toBucket15(min: number): number {
+  return Math.round(min / 15) * 15;
 }
 
 function fmtOffset(min: number): string {
@@ -93,6 +97,116 @@ async function exportOffsetCSV(distribution: BucketEntry[]) {
     Alert.alert('خطأ في التصدير', 'فشل تصدير البيانات. يرجى المحاولة مجدداً.');
   }
 }
+
+// ── 15-min bucket horizontal bar chart ──────────────────────────────────────
+
+function OffsetBucketChart({ entries, totalUsers }: { entries: BucketEntry[]; totalUsers: number }) {
+  const maxCount = Math.max(...entries.map(e => e.count), 1);
+  return (
+    <View style={obcStyles.card}>
+      <View style={obcStyles.headerRow}>
+        <Text style={obcStyles.sub}>{totalUsers} مستخدم</Text>
+        <Text style={obcStyles.title}>📊 توزيع الفارق بدقة 15 دقيقة</Text>
+      </View>
+      <Text style={obcStyles.hint}>الأعمدة تُمثّل عدد المستخدمين في كل نطاق زمني من -60 إلى +60 دقيقة</Text>
+      <View style={obcStyles.chartArea}>
+        {entries.map((entry) => {
+          const barWidthPct = maxCount > 0 ? (entry.count / maxCount) * 100 : 0;
+          const isZero = entry.bucket === 0;
+          const isNegative = entry.bucket < 0;
+          const barColor = entry.count === 0
+            ? '#1e293b'
+            : isZero ? '#22c55e'
+            : isNegative ? '#38bdf8'
+            : '#a78bfa';
+          const isMax = entry.count === maxCount && entry.count > 0;
+          return (
+            <View key={entry.bucket} style={obcStyles.row}>
+              {/* Count label */}
+              <View style={obcStyles.countBox}>
+                <Text style={[obcStyles.countText, entry.count > 0 && { color: barColor }]}>
+                  {entry.count > 0 ? entry.count : '—'}
+                </Text>
+              </View>
+              {/* Bar */}
+              <View style={obcStyles.barOuter}>
+                <View
+                  style={[
+                    obcStyles.barInner,
+                    {
+                      width: `${Math.max(barWidthPct, entry.count > 0 ? 4 : 0)}%` as any,
+                      backgroundColor: barColor,
+                      opacity: entry.count === 0 ? 0.3 : 1,
+                    },
+                    isMax && obcStyles.barMax,
+                  ]}
+                />
+                {isMax && entry.count > 0 && (
+                  <View style={[obcStyles.maxTag, { backgroundColor: barColor + '33', borderColor: barColor + '66' }]}>
+                    <Text style={[obcStyles.maxTagText, { color: barColor }]}>{entry.pct}%</Text>
+                  </View>
+                )}
+              </View>
+              {/* Bucket label */}
+              <View style={[obcStyles.labelBox, isZero && { backgroundColor: '#052e16', borderColor: '#166534' }]}>
+                <Text style={[obcStyles.labelText, { color: barColor }]}>
+                  {entry.bucket === 0 ? '±0' : entry.bucket > 0 ? `+${entry.bucket}` : `${entry.bucket}`}
+                </Text>
+              </View>
+            </View>
+          );
+        })}
+      </View>
+      <View style={obcStyles.legendRow}>
+        {[
+          { color: '#38bdf8', label: 'مبكر (سالب)' },
+          { color: '#22c55e', label: 'محايد (صفر)' },
+          { color: '#a78bfa', label: 'متأخر (موجب)' },
+        ].map(l => (
+          <View key={l.label} style={obcStyles.legendItem}>
+            <View style={[obcStyles.legendDot, { backgroundColor: l.color }]} />
+            <Text style={obcStyles.legendText}>{l.label}</Text>
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+const obcStyles = StyleSheet.create({
+  card: {
+    backgroundColor: '#0a1628', borderRadius: 16, padding: 16, marginBottom: 14,
+    borderWidth: 1.5, borderColor: '#38bdf833',
+  },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
+  title: { color: '#38bdf8', fontSize: 11, fontWeight: '800', letterSpacing: 0.8 },
+  sub: { color: '#475569', fontSize: 10 },
+  hint: { color: '#334155', fontSize: 10, textAlign: 'right', marginBottom: 14, lineHeight: 15 },
+  chartArea: { gap: 6 },
+  row: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
+  countBox: { minWidth: 26, alignItems: 'flex-start' },
+  countText: { color: '#475569', fontSize: 11, fontWeight: '700', textAlign: 'left' },
+  barOuter: {
+    flex: 1, height: 22, backgroundColor: '#0f172a', borderRadius: 6,
+    overflow: 'hidden', position: 'relative', flexDirection: 'row', alignItems: 'center',
+  },
+  barInner: { height: 22, borderRadius: 6, position: 'absolute', left: 0 },
+  barMax: { shadowColor: '#38bdf8', shadowOpacity: 0.4, shadowRadius: 4, elevation: 4 },
+  maxTag: {
+    position: 'absolute', right: 6, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1,
+    borderWidth: 1,
+  },
+  maxTagText: { fontSize: 9, fontWeight: '800' },
+  labelBox: {
+    minWidth: 44, borderRadius: 7, paddingHorizontal: 8, paddingVertical: 4,
+    backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#1e293b', alignItems: 'center',
+  },
+  labelText: { fontSize: 11, fontWeight: '800' },
+  legendRow: { flexDirection: 'row-reverse', gap: 12, marginTop: 14, justifyContent: 'center' },
+  legendItem: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5 },
+  legendDot: { width: 8, height: 8, borderRadius: 4 },
+  legendText: { color: '#64748b', fontSize: 10 },
+});
 
 // ── Sub-components ───────────────────────────────────────────────────────────
 
@@ -284,7 +398,7 @@ export default function OffsetAnalyticsScreen() {
   const distribution = useMemo<BucketEntry[]>(() => {
     const bucketMap: Record<number, number> = {};
     for (const u of users) {
-      const b = toBucket(u.offset_minutes);
+      const b = toBucket30(u.offset_minutes);
       bucketMap[b] = (bucketMap[b] ?? 0) + 1;
     }
     const allBuckets = Object.keys(bucketMap).map(Number).sort((a, b) => a - b);
@@ -292,6 +406,22 @@ export default function OffsetAnalyticsScreen() {
       bucket: b,
       count: bucketMap[b],
       pct: Math.round((bucketMap[b] / Math.max(users.length, 1)) * 100),
+    }));
+  }, [users]);
+
+  // 15-minute bucket distribution
+  const dist15 = useMemo<BucketEntry[]>(() => {
+    const bucketMap: Record<number, number> = {};
+    for (const u of users) {
+      const b = toBucket15(u.offset_minutes);
+      bucketMap[b] = (bucketMap[b] ?? 0) + 1;
+    }
+    // Always show the full -60 to +60 range in 15-min steps
+    const BUCKETS_15 = [-60, -45, -30, -15, 0, 15, 30, 45, 60];
+    return BUCKETS_15.map(b => ({
+      bucket: b,
+      count: bucketMap[b] ?? 0,
+      pct: Math.round(((bucketMap[b] ?? 0) / Math.max(users.length, 1)) * 100),
     }));
   }, [users]);
 
@@ -362,11 +492,14 @@ export default function OffsetAnalyticsScreen() {
             </View>
           </View>
 
-          {/* Distribution chart */}
+          {/* 15-min bucket bar chart */}
+          <OffsetBucketChart entries={dist15} totalUsers={users.length} />
+
+          {/* Distribution chart (30-min buckets) */}
           <View style={styles.card}>
             <View style={styles.cardHeader}>
               <Text style={styles.cardSub}>{users.length} مستخدم</Text>
-              <Text style={styles.cardTitle}>توزيع الفارق الزمني</Text>
+              <Text style={styles.cardTitle}>توزيع الفارق الزمني (30د)</Text>
             </View>
             {distribution.map(entry => (
               <DistributionBar key={entry.bucket} entry={entry} maxCount={maxCount} />

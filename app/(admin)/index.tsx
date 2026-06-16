@@ -394,7 +394,7 @@ export default function AdminDashboard() {
 
       <AccuracyMiniSparkline onPress={() => router.push('/(admin)/accuracy')} />
 
-      {prediction?.apppe?.crisisMode && prediction.apppe.crisisReason ? (
+      {prediction?.apppe?.crisisActive && prediction.apppe.crisisReason ? (
         <CrisisBanner reason={prediction.apppe.crisisReason} />
       ) : null}
 

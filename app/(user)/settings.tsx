@@ -2,6 +2,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import {
   View, Text, ScrollView, Switch, TouchableOpacity, StyleSheet,
   ActivityIndicator, TextInput, Alert, KeyboardAvoidingView, Platform,
+  Linking, Share,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -307,16 +308,98 @@ export default function UserSettings() {
         </View>
 
         {/* About */}
-        <Text style={styles.sectionLabel}>{AR.about}</Text>
+        <Text style={styles.sectionLabel}>عن التطبيق</Text>
         <View style={styles.card}>
-          <View style={styles.aboutRow}>
-            <Text style={styles.aboutValue}>{AR.appName}</Text>
-            <Text style={styles.aboutLabel}>{AR.app}</Text>
+          <View style={styles.appLogoRow}>
+            <View style={styles.appIconBadge}>
+              <Text style={styles.appIconText}>⚡</Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.appNameText}>مراقب الكهرباء</Text>
+              <Text style={styles.appVersionText}>الإصدار 1.0 · عدن، اليمن</Text>
+            </View>
           </View>
-          <View style={[styles.aboutRow, { borderBottomWidth: 0 }]}>
+          <View style={styles.aboutDescBox}>
+            <Text style={styles.aboutDescText}>
+              تطبيق مراقب الكهرباء مخصص حالياً لمدينة{' '}
+              <Text style={{ color: T.accent, fontWeight: '800' }}>عدن</Text>
+              {' '}ويتيح لك متابعة انقطاع وعودة التيار الكهربائي بشكل لحظي، مع نظام توقعات ذكي يتعلم من جدول الكهرباء في منطقتك.
+            </Text>
+            <View style={styles.comingSoonBadge}>
+              <Text style={styles.comingSoonText}>🌍 قريباً في بقية محافظات اليمن</Text>
+            </View>
+          </View>
+          <View style={[styles.aboutRow, { borderBottomWidth: 0, marginTop: 4 }]}>
             <Text style={styles.aboutValue}>Growatt · KHM8EYS0SC</Text>
-            <Text style={styles.aboutLabel}>{AR.dataSource}</Text>
+            <Text style={styles.aboutLabel}>مصدر البيانات</Text>
           </View>
+        </View>
+
+        {/* Share App */}
+        <Text style={styles.sectionLabel}>شارك التطبيق</Text>
+        <View style={styles.card}>
+          <Text style={styles.shareDesc}>
+            ساعد جيرانك ومعارفك في مدينة عدن على متابعة الكهرباء — شارك التطبيق معهم الآن.
+          </Text>
+          <TouchableOpacity
+            style={styles.shareBtn}
+            onPress={async () => {
+              try {
+                await Share.share({
+                  message:
+                    '⚡ تطبيق مراقب الكهرباء لعدن\n' +
+                    'تابع انقطاع وعودة الكهرباء لحظياً مع توقعات ذكية وإشعارات فورية.\n' +
+                    'حمّله الآن من OnSpace: https://onspace.ai',
+                  title: 'مراقب الكهرباء — عدن',
+                });
+              } catch (_) {}
+            }}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.shareBtnText}>📤  مشاركة التطبيق</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Contact */}
+        <Text style={styles.sectionLabel}>تواصل معنا</Text>
+        <View style={styles.card}>
+          <Text style={styles.contactDesc}>
+            للدعم الفني، الاقتراحات، أو الاستفسارات حول الإعلانات والشراكات — يسعدنا سماعك.
+          </Text>
+          <TouchableOpacity
+            style={styles.contactRow}
+            onPress={() => Linking.openURL('mailto:Futurewait515@gmail.com')}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.contactEmail}>Futurewait515@gmail.com</Text>
+            <Text style={styles.contactIcon}>✉️</Text>
+          </TouchableOpacity>
+          <View style={styles.contactTagsRow}>
+            {['دعم فني', 'اقتراحات', 'إعلانات', 'شراكات'].map(tag => (
+              <View key={tag} style={styles.contactTag}>
+                <Text style={styles.contactTagText}>{tag}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+
+        {/* Privacy */}
+        <Text style={styles.sectionLabel}>الخصوصية</Text>
+        <View style={styles.card}>
+          {[
+            { icon: '🔒', title: 'بياناتك آمنة', desc: 'لا يتم بيع بياناتك أو مشاركتها مع أي طرف ثالث.' },
+            { icon: '📍', title: 'الموقع الجغرافي', desc: 'يُستخدم موقعك الاختياري فقط لتحسين توقعات منطقتك، ولا يُخزَّن بشكل دائم.' },
+            { icon: '🔔', title: 'الإشعارات', desc: 'يتم إرسال إشعارات الكهرباء فقط عند تغيّر حالة التيار، ويمكنك إيقافها في أي وقت.' },
+            { icon: '🗑️', title: 'حذف الحساب', desc: 'يمكنك حذف حسابك وجميع بياناتك بشكل نهائي من قسم "منطقة الخطر" أدناه.' },
+          ].map((item, i, arr) => (
+            <View key={item.title} style={[styles.privacyRow, i < arr.length - 1 && { borderBottomWidth: 1, borderBottomColor: T.elevated }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.privacyTitle}>{item.title}</Text>
+                <Text style={styles.privacyDesc}>{item.desc}</Text>
+              </View>
+              <Text style={styles.privacyIcon}>{item.icon}</Text>
+            </View>
+          ))}
         </View>
 
         {/* Sign Out */}
@@ -475,6 +558,29 @@ const styles = StyleSheet.create({
   aboutRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: T.elevated },
   aboutLabel: { color: T.textMuted, fontSize: 13 },
   aboutValue: { color: T.textSecondary, fontSize: 13, fontWeight: '600' },
+  appLogoRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 14, marginBottom: 14 },
+  appIconBadge: { width: 52, height: 52, borderRadius: 14, backgroundColor: '#001a2e', alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderColor: T.accent + '55' },
+  appIconText: { fontSize: 24 },
+  appNameText: { color: T.textPrimary, fontSize: 18, fontWeight: '900', textAlign: 'right' },
+  appVersionText: { color: T.textMuted, fontSize: 11, marginTop: 2, textAlign: 'right' },
+  aboutDescBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 14, marginBottom: 12 },
+  aboutDescText: { color: T.textSecondary, fontSize: 13, lineHeight: 22, textAlign: 'right' },
+  comingSoonBadge: { marginTop: 10, backgroundColor: '#001a14', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: T.success + '44', alignSelf: 'flex-end' },
+  comingSoonText: { color: T.success, fontSize: 11, fontWeight: '700' },
+  shareDesc: { color: T.textMuted, fontSize: 13, lineHeight: 20, marginBottom: 14, textAlign: 'right' },
+  shareBtn: { backgroundColor: '#001a2e', borderRadius: 12, paddingVertical: 14, alignItems: 'center', borderWidth: 1.5, borderColor: T.accent + '55' },
+  shareBtnText: { color: T.accent, fontWeight: '700', fontSize: 14 },
+  contactDesc: { color: T.textMuted, fontSize: 13, lineHeight: 20, marginBottom: 14, textAlign: 'right' },
+  contactRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, backgroundColor: T.elevated, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 13, marginBottom: 12 },
+  contactIcon: { fontSize: 22 },
+  contactEmail: { flex: 1, color: T.accent, fontSize: 14, fontWeight: '700', textAlign: 'right' },
+  contactTagsRow: { flexDirection: 'row-reverse', gap: 8, flexWrap: 'wrap' },
+  contactTag: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.border },
+  contactTagText: { color: T.textMuted, fontSize: 11, fontWeight: '600' },
+  privacyRow: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, paddingVertical: 12 },
+  privacyIcon: { fontSize: 20, marginTop: 2 },
+  privacyTitle: { color: T.textPrimary, fontSize: 13, fontWeight: '700', marginBottom: 3, textAlign: 'right' },
+  privacyDesc: { color: T.textMuted, fontSize: 12, lineHeight: 18, textAlign: 'right' },
   dangerCard: { borderColor: T.danger + '44', backgroundColor: '#1a0808' },
   dangerTitle: { color: T.danger, fontSize: 15, fontWeight: '800', marginBottom: 8, textAlign: 'right' },
   dangerDesc: { color: '#f87171', fontSize: 12, lineHeight: 18, marginBottom: 16, textAlign: 'right' },
