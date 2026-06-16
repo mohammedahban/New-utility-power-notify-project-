@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "50602176780",
+    "project_id": "utility-power-status",
+    "storage_bucket": "utility-power-status.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50602176780:android:3abb94ce2bf05bde909929",
+        "android_client_info": {
+          "package_name": "com.onspace.utilitypower"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAez5DNBfJQ4qWEnnHrNTtOIDH7-hnFRuA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
