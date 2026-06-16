@@ -8,6 +8,7 @@ import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../.
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
+import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 
 const T = {
@@ -30,6 +31,9 @@ function parseFormattedTime(label: string): number | null {
   } catch { return null; }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Schedule Block
+// ─────────────────────────────────────────────────────────────────────────────
 function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted, stableEndFormatted }: {
   slot: ShiftedScheduleSlot;
   index: number;
@@ -37,9 +41,7 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
   isActive?: boolean;
   atcMode?: ScheduleStateMode;
   isHolding?: boolean;
-  /** Locked start time string — prevents display shifting on prediction refresh */
   stableStartFormatted?: string;
-  /** Locked end time string — prevents end-time drift on prediction refresh */
   stableEndFormatted?: string;
 }) {
   const isOn = slot.state === 'ON';
@@ -72,13 +74,11 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
               <Text style={sbStyles.resyncBadgeText}>👥 مزامنة مجتمعية</Text>
             </View>
           )}
-          {/* ATC hold badge — only on the active slot when schedule is being held */}
           {isActive && isHolding && atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && (() => {
             const atcCfg: Record<string, { label: string; bg: string; border: string; color: string }> = {
               UNCERTAIN_ZONE:      { label: '⚠ بانتظار تأكيد', bg: '#1a0e00', border: '#f59e0b66', color: '#f59e0b' },
               WAITING_FOR_GROWATT: { label: '⏳ بانتظار Growatt', bg: '#001020', border: '#38bdf866', color: '#38bdf8' },
               PREDICTION_RANGE:    { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
-              // GRACE_MODE: neutral DSD 15-min grace window (spec §14.3)
               GRACE_MODE:          { label: '⏳ تأخر غير معتاد — مهلة المزامنة', bg: '#1a0e00', border: '#f9731666', color: '#f97316' },
             };
             const cfg = atcCfg[atcMode];
@@ -171,33 +171,194 @@ const sbStyles = StyleSheet.create({
   atcBadgeText: { fontSize: 10, fontWeight: '700' },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POWER EVENTS HISTORY — with duration badges
+// Shows past real power transition events from power_events table.
+// The "مدة" badge on each event shows how long the PREVIOUS state lasted
+// (= time from this event back to the one before it).
+// ─────────────────────────────────────────────────────────────────────────────
+interface PowerEvent {
+  id: number;
+  event_type: 'UTILITY_ON' | 'UTILITY_OFF';
+  occurred_at: string;
+  durationLabel?: string;
+}
+
+function usePowerEventsHistory(limit = 20) {
+  const [events, setEvents] = useState<PowerEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    supabase
+      .from('power_events')
+      .select('id, event_type, occurred_at')
+      .order('occurred_at', { ascending: false })
+      .limit(limit + 1)
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        const withDuration: PowerEvent[] = data.slice(0, limit).map((ev: any, i: number) => {
+          const nextEv = data[i + 1];
+          let durationLabel: string | undefined;
+          if (nextEv) {
+            const evMs   = new Date(ev.occurred_at).getTime();
+            const prevMs = new Date(nextEv.occurred_at).getTime();
+            const durMin = Math.round(Math.abs(evMs - prevMs) / 60_000);
+            const h = Math.floor(durMin / 60);
+            const m = durMin % 60;
+            if (h === 0) durationLabel = `${m} دقيقة`;
+            else if (m === 0) durationLabel = h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h} ساعات`;
+            else durationLabel = `${h}س ${m}د`;
+          }
+          return { ...ev, durationLabel };
+        });
+        setEvents(withDuration);
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [limit]);
+
+  return { events, loading };
+}
+
+function fmtEventTime(iso: string): string {
+  return new Date(iso).toLocaleString('en-US', {
+    timeZone: 'Asia/Aden',
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).replace('AM', ' ص').replace('PM', ' م');
+}
+
+function EventsHistorySection() {
+  const { events, loading } = usePowerEventsHistory(20);
+
+  return (
+    <View style={ehStyles.container}>
+      <Text style={ehStyles.sectionTitle}>📋 سجل الأحداث الفعلية</Text>
+      <Text style={ehStyles.sectionSub}>الأحداث الحقيقية المسجَّلة من الحساس الرئيسي</Text>
+
+      {loading ? (
+        <ActivityIndicator color={T.accent} size="small" style={{ marginVertical: 16 }} />
+      ) : events.length === 0 ? (
+        <Text style={ehStyles.emptyText}>لا توجد أحداث مسجَّلة بعد</Text>
+      ) : (
+        events.map((ev, i) => {
+          const isOn = ev.event_type === 'UTILITY_ON';
+          const color = isOn ? T.success : T.danger;
+          const icon  = isOn ? '⚡' : '🔴';
+          const label = isOn ? 'اشتغلت الكهرباء' : 'طفت الكهرباء';
+          return (
+            <View key={ev.id} style={[ehStyles.row, i < events.length - 1 && ehStyles.rowBorder]}>
+              {/* Duration badge */}
+              <View style={ehStyles.badgeCol}>
+                {ev.durationLabel ? (
+                  <View style={[ehStyles.durBadge, { borderColor: color + '44', backgroundColor: color + '10' }]}>
+                    <Text style={[ehStyles.durBadgeText, { color }]}>{ev.durationLabel}</Text>
+                    <Text style={ehStyles.durBadgeSub}>مدة</Text>
+                  </View>
+                ) : (
+                  <View style={[ehStyles.durBadge, { borderColor: T.border, backgroundColor: T.elevated }]}>
+                    <Text style={[ehStyles.durBadgeText, { color: T.textMuted }]}>—</Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Event info */}
+              <View style={ehStyles.details}>
+                <Text style={[ehStyles.eventLabel, { color }]}>{icon} {label}</Text>
+                <Text style={ehStyles.eventTime}>{fmtEventTime(ev.occurred_at)}</Text>
+              </View>
+
+              {/* Color stripe */}
+              <View style={[ehStyles.colorBar, { backgroundColor: color }]} />
+            </View>
+          );
+        })
+      )}
+    </View>
+  );
+}
+
+const ehStyles = StyleSheet.create({
+  container: {
+    backgroundColor: T.surface, borderRadius: 20, padding: 18,
+    marginTop: 8, marginBottom: 16, borderWidth: 1, borderColor: T.border,
+  },
+  sectionTitle: { color: T.textPrimary, fontSize: 14, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  sectionSub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginBottom: 16, letterSpacing: 0.3 },
+  emptyText: { color: T.textMuted, fontSize: 12, textAlign: 'center', paddingVertical: 16 },
+  row: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, paddingVertical: 12 },
+  rowBorder: { borderBottomWidth: 1, borderBottomColor: T.elevated },
+  colorBar: { width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 36, flexShrink: 0 },
+  details: { flex: 1 },
+  eventLabel: { fontSize: 14, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  eventTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
+  badgeCol: { alignItems: 'center', width: 64, flexShrink: 0 },
+  durBadge: { borderRadius: 10, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, alignItems: 'center', minWidth: 58 },
+  durBadgeText: { fontSize: 13, fontWeight: '800', textAlign: 'center' },
+  durBadgeSub: { color: T.textMuted, fontSize: 8, fontWeight: '600', marginTop: 2, letterSpacing: 1 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DSD Chip
+// ─────────────────────────────────────────────────────────────────────────────
+function DSDChip({ offsetMinutes, isPending }: { offsetMinutes: number; isPending: boolean }) {
+  const isNeg = offsetMinutes < 0;
+  const color = isNeg ? '#f97316' : offsetMinutes > 0 ? '#22c55e' : '#94a3b8';
+  const label = `${offsetMinutes > 0 ? '+' : ''}${offsetMinutes}د`;
+
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    if (!isPending) { pulseAnim.setValue(1); return; }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 0.25, duration: 700, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [isPending]);
+
+  return (
+    <View style={[dsdStyles.wrap, { borderColor: color + '44', backgroundColor: color + '12' }]}>
+      {isPending && (
+        <Animated.View style={[dsdStyles.pendingDot, { opacity: pulseAnim, backgroundColor: color }]} />
+      )}
+      <Text style={[dsdStyles.value, { color }]}>{label}</Text>
+      <Text style={dsdStyles.label}>الفارق</Text>
+    </View>
+  );
+}
+
+const dsdStyles = StyleSheet.create({
+  wrap: { flex: 1, alignItems: 'center', borderRadius: 10, paddingVertical: 8, paddingHorizontal: 4, borderWidth: 1, gap: 2 },
+  value: { fontSize: 15, fontWeight: '800' },
+  label: { color: '#64748b', fontSize: 8, fontWeight: '700', letterSpacing: 1, marginTop: 2 },
+  pendingDot: { width: 6, height: 6, borderRadius: 3, position: 'absolute', top: 5, left: 6 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
 export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
   const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
-  // Persistent anchor — provides the real start time for the active slot
   const { anchor } = useStateAnchor();
 
-  /**
-   * Stable slot time maps.
-   * Key: "<state>|<roundedStartMin>" — slot identity stable across prediction refreshes.
-   * Values locked at first observation to prevent display drift on DB refreshes.
-   * Both maps are cleared when computedAt changes so a genuine schedule
-   * recomputation always adopts fresh times.
-   * Also cleared when offset_minutes changes so new offset times are adopted
-   * immediately after the user submits a report.
-   */
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
-  const lastComputedAtRef   = useRef<string | null>(null);
   const lastOffsetRef       = useRef<number | null>(null);
   const lastResyncRef       = useRef<string | null>(null);
 
-  const computedAt      = userPrediction?.computedAt ?? null;
   const currentOffset   = offset?.offset_minutes ?? 0;
-    // ── Mathematical Anchor for the active slot ──────────
   const offsetMs = currentOffset * 60_000;
   const mathematicalActiveStartIso = userPrediction?.isResynced && userPrediction.resyncedAtIso
     ? userPrediction.resyncedAtIso
@@ -207,17 +368,12 @@ export default function ScheduleScreen() {
 
   const currentResyncIso = resyncPoint?.syncedAtIso ?? null;
 
-
-
   if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
     stableStartMapRef.current = {};
     stableEndMapRef.current   = {};
   }
   lastOffsetRef.current = currentOffset;
 
-  // Clear locks when the community resync point changes (new report applied)
-  // OR when resync expires and resyncPoint becomes null — ensuring slot times
-  // revert cleanly to pure offset-based values in both cases.
   const resyncChanged = lastResyncRef.current !== currentResyncIso;
   if (resyncChanged) {
     stableStartMapRef.current = {};
@@ -228,14 +384,12 @@ export default function ScheduleScreen() {
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();
 
-  // Find the first slot where now falls inside it (user-offset-adjusted schedule)
   const activeIdx = allSlots.findIndex(s => {
     const start = new Date(s.startIso).getTime();
     const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
     return nowMs >= start && nowMs < end;
   });
 
-  // Start display from the active (current) slot, not slot[0]
   const startIdx = activeIdx >= 0 ? activeIdx
     : allSlots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
   const slots = startIdx > 0 ? allSlots.slice(startIdx) : allSlots;
@@ -307,6 +461,7 @@ export default function ScheduleScreen() {
         </View>
       </View>
 
+      {/* Upcoming schedule */}
       {slots.length === 0 ? (
         <View style={styles.emptyBox}>
           <Text style={{ fontSize: 48, marginBottom: 16 }}>📅</Text>
@@ -320,11 +475,8 @@ export default function ScheduleScreen() {
             const slotStartMs = new Date(slot.startIso).getTime();
             const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
             const isActive = nowMs >= slotStartMs && nowMs < slotEndMs;
-
-            // Build a stable identity key for this slot.
-            // We use the slot's state + a rounded start minute to tolerate tiny
-            // sub-minute drifts while still detecting genuine schedule shifts.
             const slotKey = `${slot.state}|${Math.round(slotStartMs / 60_000)}`;
+
             const currentFormatted = slot.shiftedStartFormatted ?? slot.startFormatted;
             if (!stableStartMapRef.current[slotKey] && currentFormatted) {
               stableStartMapRef.current[slotKey] = currentFormatted;
@@ -338,31 +490,28 @@ export default function ScheduleScreen() {
             const stableEnd = stableEndMapRef.current[slotKey];
 
             return (
-          <ScheduleBlock
-              key={i} slot={slot} index={i}
-              resyncEvents={resyncHistory}
-              isActive={isActive}
-              atcMode={userPrediction?.atc?.mode}
-              isHolding={userPrediction?.isHoldingState}
-              // For the active slot, prefer the persistent anchor start time
-              // so the displayed start never shifts on prediction refreshes.
-              stableStartFormatted={
-                isActive && (mathematicalActiveStartIso ?? slot.startIso)
-                  ? new Date(mathematicalActiveStartIso ?? slot.startIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true })
-                  : stableStart
-              }
-
-
-
-              stableEndFormatted={stableEnd}
-            />
+              <ScheduleBlock
+                key={i} slot={slot} index={i}
+                resyncEvents={resyncHistory}
+                isActive={isActive}
+                atcMode={userPrediction?.atc?.mode}
+                isHolding={userPrediction?.isHoldingState}
+                stableStartFormatted={
+                  isActive && (mathematicalActiveStartIso ?? slot.startIso)
+                    ? new Date(mathematicalActiveStartIso ?? slot.startIso).toLocaleString('en-US', {
+                        timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true,
+                      }).replace('AM', ' ص').replace('PM', ' م')
+                    : stableStart
+                }
+                stableEndFormatted={stableEnd}
+              />
             );
           })}
           <View style={styles.endDot} />
         </View>
       )}
 
-      {/* Cycle stats row */}
+      {/* Cycle stats */}
       {slots.length >= 2 && (() => {
         const completedSlots = slots.filter(s => s.endIso);
         const onSlots = completedSlots.filter(s => s.state === 'ON');
@@ -402,6 +551,9 @@ export default function ScheduleScreen() {
         );
       })()}
 
+      {/* ── Power Events History ── */}
+      <EventsHistorySection />
+
       {userPrediction?.computedAt && (
         <Text style={styles.computedAt}>
           {AR.computedAt}{' '}
@@ -413,50 +565,6 @@ export default function ScheduleScreen() {
     </ScrollView>
   );
 }
-
-// ── DSD Chip — colored indicator for the 'الفارق' info bar cell ──────────────
-// Green  = positive DSD (user lags Growatt, safe to confirm quickly)
-// Orange = negative DSD (user leads Growatt, pending candidate path active)
-// Pulsing dot = pendingDSD candidate awaiting Growatt confirmation
-function DSDChip({ offsetMinutes, isPending }: { offsetMinutes: number; isPending: boolean }) {
-  const isNeg = offsetMinutes < 0;
-  const color = isNeg ? '#f97316' : offsetMinutes > 0 ? '#22c55e' : '#94a3b8';
-  const label = `${offsetMinutes > 0 ? '+' : ''}${offsetMinutes}د`;
-
-  // Pulsing animation for the pending dot
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    if (!isPending) { pulseAnim.setValue(1); return; }
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 0.25, duration: 700, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
-      ]),
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [isPending]);
-
-  return (
-    <View style={[dsdStyles.wrap, { borderColor: color + '44', backgroundColor: color + '12' }]}>
-      {isPending && (
-        <Animated.View style={[dsdStyles.pendingDot, { opacity: pulseAnim, backgroundColor: color }]} />
-      )}
-      <Text style={[dsdStyles.value, { color }]}>{label}</Text>
-      <Text style={dsdStyles.label}>الفارق</Text>
-    </View>
-  );
-}
-
-const dsdStyles = StyleSheet.create({
-  wrap: {
-    flex: 1, alignItems: 'center', borderRadius: 10, paddingVertical: 8,
-    paddingHorizontal: 4, borderWidth: 1, gap: 2,
-  },
-  value: { fontSize: 15, fontWeight: '800' },
-  label: { color: '#64748b', fontSize: 8, fontWeight: '700', letterSpacing: 1, marginTop: 2 },
-  pendingDot: { width: 6, height: 6, borderRadius: 3, position: 'absolute', top: 5, left: 6 },
-});
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: T.bg },

@@ -164,11 +164,15 @@ serve(async (req) => {
     }
 
     // 5. Send push notifications to followers
-    const recipientIds = (insertedNotifs ?? []).map((n: any) => n.recipient_id);
-    const { data: tokens } = await supabaseAdmin
-      .from('push_tokens')
-      .select('token')
-      .in('user_id', recipientIds);
+    // Only fetch tokens where user_id is non-null and belongs to a recipient
+    const recipientIds = (insertedNotifs ?? []).map((n: any) => n.recipient_id).filter(Boolean);
+    const { data: tokens } = recipientIds.length > 0
+      ? await supabaseAdmin
+          .from('push_tokens')
+          .select('token, user_id')
+          .in('user_id', recipientIds)
+          .not('user_id', 'is', null)
+      : { data: [] };
 
     const stateEmoji = reportedState === 'UTILITY_ON' ? '⚡' : '🔴';
     const stateAr = reportedState === 'UTILITY_ON' ? 'اشتغلت الكهرباء' : 'طفت الكهرباء';

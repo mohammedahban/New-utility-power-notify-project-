@@ -34,10 +34,48 @@
  * ─────────────────────────────────────────────────────────────────────
  */
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
 import { Prediction, ScheduleSlot } from './usePredictions';
 import { ResyncPoint } from '../contexts/ResyncContext';
+
+// ── Client-side accuracy logger ───────────────────────────────────────────────
+// Called when exiting UNCERTAIN_ZONE (User A) or POSITIVE_OFFSET_PENDING (User B)
+// via reconciliation. Logs predicted vs actual transition time to DB.
+// Non-blocking: errors are swallowed so UI is never affected.
+async function logClientAccuracy(
+  predictedTransitionIso: string,
+  actualTransitionIso: string,
+  targetState: 'ON' | 'OFF',
+  offsetMinutes: number,
+  exitMode: 'UNCERTAIN_ZONE' | 'POSITIVE_OFFSET_PENDING',
+): Promise<void> {
+  try {
+    const MAX_ALLOWED_ERROR_MIN = 150;
+    const predictedMs  = new Date(predictedTransitionIso).getTime();
+    const actualMs     = new Date(actualTransitionIso).getTime();
+    const errorMin     = Math.abs((actualMs - predictedMs) / 60_000);
+    const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
+    const eventType    = targetState === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF';
+    const slotId       = `client_${exitMode.toLowerCase()}_offset${offsetMinutes}`;
+
+    await supabase.from('prediction_accuracy_logs').insert({
+      predicted_event_time:    predictedTransitionIso,
+      actual_event_time:       actualTransitionIso,
+      predicted_state:         eventType,
+      actual_state:            eventType,
+      error_minutes:           Math.round(errorMin * 100) / 100,
+      accuracy_score:          Math.round(accuracyScore * 100) / 100,
+      confidence_score:        null,
+      prediction_generated_at: null,
+      slot_id:                 slotId,
+    });
+    console.log(`[useUserPredictions] Accuracy logged (${exitMode}): offset=${offsetMinutes}min error=${errorMin.toFixed(1)}min score=${accuracyScore.toFixed(1)}%`);
+  } catch (err) {
+    // Non-fatal
+    console.warn('[useUserPredictions] Accuracy log failed:', err);
+  }
+}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -833,6 +871,18 @@ export function applyOffsetToPrediction(
       currentStateStartIso    = backdatedStart;
       isHolding               = false;
       finalAtcState           = { ...atcState, mode: 'NORMAL', overrunMinutes: 0, statusLine: null, communityElevated: false };
+
+      // Log accuracy: predicted = backdatedStart (= GrowattTime + offset),
+      // actual = GrowattTransitionTime (when Growatt actually confirmed)
+      if (prediction.lastTransitionAt) {
+        logClientAccuracy(
+          backdatedStart,
+          prediction.lastTransitionAt,
+          prediction.currentState as 'ON' | 'OFF',
+          offsetMinutes,
+          'UNCERTAIN_ZONE',
+        );
+      }
     } else if (prediction.lastTransitionAt) {
       // Safety fallback (should not reach here for negative offsets)
       currentState         = prediction.currentState as 'ON' | 'OFF';
@@ -863,6 +913,18 @@ export function applyOffsetToPrediction(
       currentStateStartIso    = atcState.scheduledAutoTransitionIso;
       isHolding               = false;
       finalAtcState           = { ...atcState, mode: 'NORMAL', overrunMinutes: 0, statusLine: null, scheduledAutoTransitionIso: null };
+
+      // Log accuracy: predicted = scheduledAutoTransitionIso,
+      // actual = prediction.lastTransitionAt (when Growatt actually changed)
+      if (prediction.lastTransitionAt) {
+        logClientAccuracy(
+          atcState.scheduledAutoTransitionIso,
+          prediction.lastTransitionAt,
+          newState,
+          offsetMinutes,
+          'POSITIVE_OFFSET_PENDING',
+        );
+      }
     }
   }
 

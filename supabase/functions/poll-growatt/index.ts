@@ -118,12 +118,41 @@ Deno.serve(async (req) => {
     });
 
     // ── Send push to admin tokens ───────────────────────────────────────────
-    const { data: adminTokens } = await supabase
+    // Primary: tokens flagged is_admin=true
+    // Fallback: look up all user_ids with role='admin' in user_profiles,
+    //           then fetch their tokens (covers tokens registered before
+    //           the admin flag was set on the push_tokens row).
+    const { data: directAdminTokens } = await supabase
       .from("push_tokens")
       .select("token")
       .eq("is_admin", true);
 
-    if (adminTokens && adminTokens.length > 0) {
+    const { data: adminProfiles } = await supabase
+      .from("user_profiles")
+      .select("id")
+      .eq("role", "admin");
+
+    const adminUserIds = (adminProfiles ?? []).map((p: any) => p.id);
+    const { data: profileAdminTokens } = adminUserIds.length > 0
+      ? await supabase.from("push_tokens").select("token").in("user_id", adminUserIds)
+      : { data: [] };
+
+    // Merge and deduplicate by token string
+    const allAdminTokenSet = new Set<string>();
+    for (const row of [...(directAdminTokens ?? []), ...(profileAdminTokens ?? [])]) {
+      if (row.token) allAdminTokenSet.add(row.token);
+    }
+    const adminTokens = Array.from(allAdminTokenSet).map(token => ({ token }));
+
+    // Also back-fill is_admin=true on any token belonging to an admin user
+    // so future queries are instant (fire-and-forget, non-blocking)
+    if (adminUserIds.length > 0) {
+      supabase.from("push_tokens").update({ is_admin: true }).in("user_id", adminUserIds)
+        .then(() => console.log("[poll-growatt] Backfilled is_admin on admin tokens"))
+        .catch(() => {});
+    }
+
+    if (adminTokens.length > 0) {
       const localTimeAr = new Date(now).toLocaleString("ar-SA", {
         timeZone: "Asia/Aden",
         hour: "2-digit",
