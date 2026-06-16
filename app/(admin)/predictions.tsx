@@ -288,77 +288,113 @@ const pbStyles = StyleSheet.create({
   emptyText: { color: '#475569', fontSize: 11 },
 });
 
-const PROFILE_ORDER = [
-  { key: 'Night Generator',    icon: '🌑', color: '#818cf8', hours: '00–06' },
-  { key: 'Morning Transition', icon: '🌅', color: '#fb923c', hours: '06–10' },
-  { key: 'Solar Assisted',     icon: '☀️',  color: '#facc15', hours: '10–16' },
-  { key: 'Evening Transition', icon: '🌆', color: '#f472b6', hours: '16–20' },
-  { key: 'Night Consumption',  icon: '🌃', color: '#60a5fa', hours: '20–00' },
-];
-
 function ProfileBlendCard({ apppe }: { apppe: NonNullable<Prediction['apppe']> }) {
-  const blend = apppe.profileBlend;
-  const samples = apppe.profileSamples;
+  const driftColor = apppe.driftOffset === 0 ? '#22c55e' : Math.abs(apppe.driftOffset) < 20 ? '#f59e0b' : '#ef4444';
+  const biasColor = Math.abs(1 - apppe.biasRatio) < 0.05 ? '#22c55e' : Math.abs(1 - apppe.biasRatio) < 0.15 ? '#f59e0b' : '#ef4444';
+  const volColor = apppe.volatilityLabel === 'Low' ? '#22c55e' : apppe.volatilityLabel === 'Moderate' ? '#f59e0b' : '#ef4444';
+  const trustPct = apppe.learningStrength ?? 0;
+  const trustColor = trustPct >= 70 ? '#22c55e' : trustPct >= 40 ? '#f59e0b' : '#f97316';
+
+  const fmtOffset = (min: number) => {
+    if (min === 0) return 'لا انحراف';
+    const sign = min > 0 ? '+' : '';
+    const h = Math.floor(Math.abs(min) / 60);
+    const m = Math.round(Math.abs(min) % 60);
+    const durStr = h > 0 ? (m > 0 ? `${h}س ${m}د` : `${h}س`) : `${m}د`;
+    return `${sign}${min > 0 ? '' : '-'}${durStr}`;
+  };
 
   return (
     <View style={ppStyles.card}>
       <View style={ppStyles.headerRow}>
-        <View style={[ppStyles.versionBadge, apppe.crisisMode && ppStyles.crisisBadge]}>
-          <Text style={[ppStyles.versionText, apppe.crisisMode && ppStyles.crisisText]}>
-            {apppe.crisisMode ? '⚠️ وضع الأزمة' : `v${apppe.version}`}
+        <View style={[ppStyles.versionBadge, apppe.crisisActive && ppStyles.crisisBadge]}>
+          <Text style={[ppStyles.versionText, apppe.crisisActive && ppStyles.crisisText]}>
+            {apppe.crisisActive ? '⚠️ وضع الأزمة' : `APPPE v${apppe.version}`}
           </Text>
         </View>
-        <Text style={ppStyles.cardTitle}>{AR.apppeProfileBlend}</Text>
+        <Text style={ppStyles.cardTitle}>محركات التعلم التكيّفي</Text>
       </View>
 
-      {apppe.crisisMode && apppe.crisisReason ? (
+      {apppe.crisisActive && apppe.crisisReason ? (
         <View style={ppStyles.crisisBox}>
           <Text style={ppStyles.crisisReason}>{apppe.crisisReason}</Text>
         </View>
       ) : null}
 
-      <Text style={ppStyles.dominantLabel}>
-        {AR.dominant} <Text style={ppStyles.dominantValue}>{apppe.dominantProfile}</Text>
-      </Text>
+      {/* Learning Trust Bar */}
+      <View style={ppStyles.trustRow}>
+        <Text style={[ppStyles.trustPct, { color: trustColor }]}>{trustPct}%</Text>
+        <View style={ppStyles.trustTrack}>
+          <View style={[ppStyles.trustFill, { width: `${trustPct}%` as any, backgroundColor: trustColor }]} />
+        </View>
+        <Text style={ppStyles.trustLabel}>قوة التعلم · {(apppe.effectiveWeightedSamples ?? 0).toFixed(1)} عينة مرجّحة</Text>
+      </View>
 
-      {PROFILE_ORDER.map(({ key, icon, color, hours }) => {
-        const pct = Math.round(blend[key] ?? 0);
-        const count = samples[key] ?? 0;
-        if (pct < 1 && count === 0) return null;
-
-        return (
-          <View key={key} style={ppStyles.profileRow}>
-            <View style={ppStyles.barSection}>
-              <View style={ppStyles.barNums}>
-                <Text style={ppStyles.sampleCount}>
-                  {count === 0 ? 'لا بيانات' : `${count} ${count === 1 ? AR.samples : AR.samplesPlural}`}
-                </Text>
-                <Text style={[ppStyles.barPct, pct > 5 && { color }]}>{pct}%</Text>
-              </View>
-              <View style={ppStyles.barTrack}>
-                <View style={[ppStyles.barFill, { width: `${Math.min(100, pct)}%` as any, backgroundColor: color }, pct >= 50 && ppStyles.barGlow]} />
-              </View>
-            </View>
-
-            <View style={ppStyles.profileLeft}>
-              <View>
-                <Text style={[ppStyles.profileName, pct > 5 && { color }]}>{key}</Text>
-                <Text style={ppStyles.profileHours}>{hours}</Text>
-              </View>
-              <Text style={ppStyles.profileIcon}>{icon}</Text>
-            </View>
+      {/* Metric Rows */}
+      {[
+        {
+          icon: '📐',
+          label: 'انحراف التوقيت',
+          value: fmtOffset(apppe.driftOffset),
+          sub: `${apppe.driftSampleCount} حدث`,
+          color: driftColor,
+        },
+        {
+          icon: '⚖️',
+          label: 'تحيّز المدة',
+          value: `×${apppe.biasRatio?.toFixed(2) ?? '1.00'}`,
+          sub: `${apppe.biasSampleCount} حدث`,
+          color: biasColor,
+        },
+        {
+          icon: '📈',
+          label: 'تذبذب التوقع',
+          value: apppe.volatilityLabel === 'Low' ? 'منخفض' : apppe.volatilityLabel === 'Moderate' ? 'متوسط' : apppe.volatilityLabel === 'Elevated' ? 'مرتفع' : 'عالٍ جداً',
+          sub: `EMA ${(apppe.volatilityEMA ?? 0).toFixed(0)} د`,
+          color: volColor,
+        },
+        {
+          icon: '🔀',
+          label: 'انحراف: انقطاع',
+          value: apppe.madOff != null ? `${apppe.madOff}د` : '—',
+          sub: 'MAD',
+          color: '#94a3b8',
+        },
+        {
+          icon: '🔀',
+          label: 'انحراف: تشغيل',
+          value: apppe.madOn != null ? `${apppe.madOn}د` : '—',
+          sub: 'MAD',
+          color: '#94a3b8',
+        },
+      ].map((item, i) => (
+        <View key={i} style={ppStyles.metricRow}>
+          <View style={ppStyles.metricRight}>
+            <Text style={[ppStyles.metricValue, { color: item.color }]}>{item.value}</Text>
+            <Text style={ppStyles.metricSub}>{item.sub}</Text>
           </View>
-        );
-      })}
+          <View style={ppStyles.metricLeft}>
+            <Text style={ppStyles.metricIcon}>{item.icon}</Text>
+            <Text style={ppStyles.metricLabel}>{item.label}</Text>
+          </View>
+        </View>
+      ))}
 
-      <Text style={ppStyles.noteText}>{AR.blendsSmoothly}</Text>
+      {apppe.crisisActive && apppe.crisisShift && (
+        <View style={ppStyles.shiftRow}>
+          <Text style={ppStyles.shiftText}>
+            إزاحة الأزمة — انقطاع: {apppe.crisisShift.off > 0 ? '+' : ''}{apppe.crisisShift.off}د
+            {'  '}تشغيل: {apppe.crisisShift.on > 0 ? '+' : ''}{apppe.crisisShift.on}د
+          </Text>
+        </View>
+      )}
     </View>
   );
 }
 
 const ppStyles = StyleSheet.create({
   card: { backgroundColor: '#1e293b', borderRadius: 16, padding: 18, marginBottom: 12, borderRightWidth: 3, borderRightColor: '#38bdf8' },
-  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
   cardTitle: { color: '#94a3b8', fontSize: 11, fontWeight: '700', letterSpacing: 1 },
   versionBadge: { backgroundColor: '#0f172a', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: '#334155' },
   crisisBadge: { borderColor: '#f59e0b', backgroundColor: '#1a0e00' },
@@ -366,29 +402,29 @@ const ppStyles = StyleSheet.create({
   crisisText: { color: '#f59e0b', fontWeight: '700' },
   crisisBox: { backgroundColor: '#1a0e00', borderRadius: 10, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: '#78350f' },
   crisisReason: { color: '#fbbf24', fontSize: 12, lineHeight: 18, textAlign: 'right' },
-  dominantLabel: { color: '#64748b', fontSize: 11, marginBottom: 14, textAlign: 'right' },
-  dominantValue: { color: '#e2e8f0', fontWeight: '700' },
-  profileRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 12 },
-  profileLeft: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, width: 148 },
-  profileIcon: { fontSize: 18 },
-  profileName: { color: '#64748b', fontSize: 12, fontWeight: '600', lineHeight: 16, textAlign: 'right' },
-  profileHours: { color: '#334155', fontSize: 10, marginTop: 1 },
-  barSection: { flex: 1 },
-  barTrack: { height: 8, backgroundColor: '#0f172a', borderRadius: 4, overflow: 'hidden', marginBottom: 4 },
-  barFill: { height: 8, borderRadius: 4 },
-  barGlow: { opacity: 0.95 },
-  barNums: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center' },
-  barPct: { color: '#64748b', fontSize: 11, fontWeight: '700' },
-  sampleCount: { color: '#334155', fontSize: 10 },
-  noteText: { color: '#334155', fontSize: 10, textAlign: 'center', marginTop: 8, lineHeight: 15 },
+  trustRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 14 },
+  trustLabel: { color: '#64748b', fontSize: 10, flex: 1, textAlign: 'right' },
+  trustPct: { fontSize: 13, fontWeight: '800', minWidth: 36, textAlign: 'left' },
+  trustTrack: { flex: 1, height: 6, backgroundColor: '#0f172a', borderRadius: 3, overflow: 'hidden' },
+  trustFill: { height: 6, borderRadius: 3 },
+  metricRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 9, borderTopWidth: 1, borderTopColor: '#0f172a' },
+  metricLeft: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
+  metricIcon: { fontSize: 14 },
+  metricLabel: { color: '#64748b', fontSize: 13 },
+  metricRight: { alignItems: 'flex-start' },
+  metricValue: { fontSize: 14, fontWeight: '800' },
+  metricSub: { color: '#475569', fontSize: 10, marginTop: 1 },
+  shiftRow: { marginTop: 10, backgroundColor: '#1a0e00', borderRadius: 8, padding: 10, borderWidth: 1, borderColor: '#78350f' },
+  shiftText: { color: '#f59e0b', fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
 
 function LearningProgressCard({ prediction }: { prediction: Prediction }) {
   const TARGET_DAYS = 7;
   const mode = prediction.learningMode;
-  const maxSamples = Math.max(...(Object.values(prediction.apppe?.profileSamples ?? {}) as number[]));
+  const effectiveSamples = prediction.apppe?.effectiveWeightedSamples ?? 0;
+  const maxSamples = effectiveSamples;
   const CYCLES_PER_DAY = 3.5;
-  const estimatedDays = Math.min(TARGET_DAYS, Math.round(maxSamples / CYCLES_PER_DAY * 10) / 10);
+  const estimatedDays = Math.min(TARGET_DAYS, Math.round(effectiveSamples / CYCLES_PER_DAY * 10) / 10);
   const progressPct = Math.min(100, Math.round((estimatedDays / TARGET_DAYS) * 100));
 
   const modeColor = mode === 'learned' ? '#22c55e' : mode === 'hybrid' ? '#38bdf8' : '#f59e0b';
@@ -431,9 +467,9 @@ function LearningProgressCard({ prediction }: { prediction: Prediction }) {
       </View>
 
       <Text style={lpStyles.modeDesc}>{modeDesc}</Text>
-      {maxSamples > 0 && (
+      {effectiveSamples > 0 && (
         <Text style={lpStyles.sampleNote}>
-          {maxSamples} {maxSamples === 1 ? AR.cycleWord : AR.cyclesWord} — {AR.totalCycles}
+          {effectiveSamples.toFixed(1)} {AR.cyclesWord} — {AR.totalCycles}
         </Text>
       )}
     </View>
