@@ -16,7 +16,7 @@
     },
     "android": {
       "package": "com.onspace.utilitypower",
-      "googleServicesFile": "./google-services.json", // Tells Expo where to find your config file
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/logo.png",
         "backgroundColor": "#ffffff"
