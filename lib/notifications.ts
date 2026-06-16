@@ -111,14 +111,32 @@ export async function registerPushToken(): Promise<void> {
 
     const projectId =
       Constants.expoConfig?.extra?.eas?.projectId ??
-      (Constants as any).easConfig?.projectId;
+      (Constants as any).easConfig?.projectId ??
+      (Constants as any).manifest?.extra?.eas?.projectId;
 
-    if (!projectId) {
-      console.warn('[notifications] No EAS projectId found — token skipped');
+    if (!projectId || projectId === 'your-eas-project-id') {
+      console.warn('[notifications] No valid EAS projectId found — token skipped');
+      // Don't show an error alert here — this is a dev/config issue, not a user error.
+      // The app works fine without push tokens; Growatt state still updates via real-time.
       return;
     }
 
-    const tokenData = await Notifications.getExpoPushTokenAsync({ projectId });
+    let tokenData: { data: string };
+    try {
+      tokenData = await Notifications.getExpoPushTokenAsync({ projectId });
+    } catch (tokenErr: any) {
+      // On Android APK builds without google-services.json (FCM not initialized),
+      // getExpoPushTokenAsync throws "Default FirebaseApp is not initialized".
+      // Catch this gracefully so the rest of the app works normally.
+      const msg: string = tokenErr?.message ?? String(tokenErr);
+      if (msg.includes('FirebaseApp') || msg.includes('Firebase') || msg.includes('FCM')) {
+        console.warn('[notifications] FCM not configured — push tokens disabled:', msg);
+        // No user-facing error: the app functions normally, just without push
+      } else {
+        console.error('[notifications] getExpoPushTokenAsync error:', msg);
+      }
+      return;
+    }
     const token = tokenData.data;
 
     // Check if current user is admin to tag the token accordingly

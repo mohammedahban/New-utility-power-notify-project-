@@ -198,12 +198,17 @@ function usePowerEventsHistory(limit = 20) {
       .then(({ data }) => {
         if (cancelled || !data) return;
         const withDuration: PowerEvent[] = data.slice(0, limit).map((ev: any, i: number) => {
-          const nextEv = data[i + 1];
+          // data is sorted newest-first.
+          // data[i-1] is the event that occurred AFTER ev (more recent),
+          // meaning it marks when THIS state ended — so the duration is:
+          //   data[i-1].occurred_at − ev.occurred_at
+          // This shows "how long did THIS state last" on the badge.
+          const endEv = data[i - 1];
           let durationLabel: string | undefined;
-          if (nextEv) {
-            const evMs   = new Date(ev.occurred_at).getTime();
-            const prevMs = new Date(nextEv.occurred_at).getTime();
-            const durMin = Math.round(Math.abs(evMs - prevMs) / 60_000);
+          if (endEv) {
+            const endMs  = new Date(endEv.occurred_at).getTime();
+            const startMs = new Date(ev.occurred_at).getTime();
+            const durMin = Math.round(Math.abs(endMs - startMs) / 60_000);
             const h = Math.floor(durMin / 60);
             const m = durMin % 60;
             if (h === 0) durationLabel = `${m} دقيقة`;
