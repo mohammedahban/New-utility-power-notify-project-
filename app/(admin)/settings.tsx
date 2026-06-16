@@ -251,7 +251,16 @@ export default function AdminSettings() {
         Alert.alert(AR.ok, AR.adminTokenOk);
       }
     } catch (err: any) {
-      Alert.alert(AR.error, err?.message ?? 'Failed');
+      const msg: string = err?.message ?? String(err);
+      if (msg.includes('FIS_AUTH') || msg.includes('FirebaseApp') || msg.includes('Firebase') || msg.includes('FIS')) {
+        // FCM/Firebase auth error — token fetch failed but app works normally
+        Alert.alert(
+          'تعذّر جلب الرمز',
+          'تعذّر تسجيل رمز الإشعار. تأكد من أن اسم حزمة التطبيق مسجّل في Firebase Console ثم أعد المحاولة.',
+        );
+      } else {
+        Alert.alert(AR.error, msg);
+      }
     }
     setMarkingAdmin(false);
   };
