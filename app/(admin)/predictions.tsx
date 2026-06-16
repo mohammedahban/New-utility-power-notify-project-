@@ -516,6 +516,157 @@ const pqStyles = StyleSheet.create({
   footerNote: { color: '#334155', fontSize: 10, textAlign: 'right', lineHeight: 15 },
 });
 
+// ── Prediction Quality History Sparkline ────────────────────────────────────
+interface DailyAccuracyPoint {
+  date: string;
+  label: string;
+  avgScore: number;
+  avgOnScore: number;
+  avgOffScore: number;
+  count: number;
+  avgErrorMin: number;
+}
+
+function usePredictionQualityHistory() {
+  const [points, setPoints] = React.useState<DailyAccuracyPoint[]>([]);
+  const [loading, setLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const since = new Date(Date.now() - 7 * 86400000).toISOString();
+        const { data } = await supabase
+          .from('prediction_accuracy_logs')
+          .select('accuracy_score, error_minutes, predicted_state, created_at')
+          .gte('created_at', since)
+          .order('created_at', { ascending: true });
+        if (cancelled || !data) return;
+
+        const pts: DailyAccuracyPoint[] = [];
+        for (let d = 6; d >= 0; d--) {
+          const dayStart = Date.now() - (d + 1) * 86400000;
+          const dayEnd   = Date.now() - d * 86400000;
+          const dayLogs  = (data as any[]).filter((l) => {
+            const t = new Date(l.created_at).getTime();
+            return t >= dayStart && t < dayEnd;
+          });
+
+          const onLogs  = dayLogs.filter((l) => l.predicted_state === 'UTILITY_ON');
+          const offLogs = dayLogs.filter((l) => l.predicted_state === 'UTILITY_OFF');
+
+          const avg = (arr: any[]) =>
+            arr.length === 0 ? 0 :
+            Math.round(arr.reduce((s: number, l: any) => s + l.accuracy_score, 0) / arr.length);
+          const avgErr = (arr: any[]) =>
+            arr.length === 0 ? 0 :
+            Math.round(arr.reduce((s: number, l: any) => s + Math.abs(l.error_minutes), 0) / arr.length);
+
+          const date = new Date(dayStart + 43200000);
+          const label = d === 0 ? 'اليوم' : d === 1 ? 'أمس'
+            : date.toLocaleDateString('ar-SA', { timeZone: 'Asia/Aden', weekday: 'short' });
+
+          pts.push({
+            date: date.toISOString().slice(0, 10),
+            label,
+            avgScore:    avg(dayLogs),
+            avgOnScore:  avg(onLogs),
+            avgOffScore: avg(offLogs),
+            count:       dayLogs.length,
+            avgErrorMin: avgErr(dayLogs),
+          });
+        }
+        if (!cancelled) setPoints(pts);
+      } catch { /* non-fatal */ }
+      if (!cancelled) setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  return { points, loading };
+}
+
+function PredictionQualityHistory() {
+  const { points, loading } = usePredictionQualityHistory();
+
+  if (loading) {
+    return (
+      <View style={pqhStyles.card}>
+        <Text style={pqhStyles.title}>📉 سجل دقة التوقعات — آخر 7 أيام</Text>
+        <ActivityIndicator size="small" color="#64748b" style={{ marginTop: 12 }} />
+      </View>
+    );
+  }
+
+  const hasData = points.some((p) => p.count > 0);
+
+  return (
+    <View style={pqhStyles.card}>
+      <Text style={pqhStyles.title}>📉 سجل دقة التوقعات — آخر 7 أيام</Text>
+      {!hasData ? (
+        <Text style={pqhStyles.empty}>لا توجد بيانات دقة بعد</Text>
+      ) : (
+        points.map((p, i) => {
+          const barColor = p.count === 0 ? '#1e293b'
+            : p.avgScore >= 85 ? '#22c55e'
+            : p.avgScore >= 65 ? '#f59e0b' : '#ef4444';
+          const onColor  = p.avgOnScore  >= 85 ? '#22c55e' : p.avgOnScore  >= 65 ? '#f59e0b' : '#ef4444';
+          const offColor = p.avgOffScore >= 85 ? '#22c55e' : p.avgOffScore >= 65 ? '#f59e0b' : '#ef4444';
+          const barW     = p.count === 0 ? '0%' : `${Math.min(100, p.avgScore)}%`;
+          return (
+            <View key={i} style={pqhStyles.row}>
+              <View style={pqhStyles.metaCol}>
+                <Text style={pqhStyles.dayLabel}>{p.label}</Text>
+                {p.count > 0 && (
+                  <Text style={pqhStyles.countLabel}>{p.count} قياس · ±{p.avgErrorMin}د</Text>
+                )}
+              </View>
+              <View style={pqhStyles.barCol}>
+                <View style={pqhStyles.barTrack}>
+                  <View style={[pqhStyles.barFill, { width: barW as any, backgroundColor: barColor }]} />
+                </View>
+                {p.count > 0 && (
+                  <View style={pqhStyles.subBarsRow}>
+                    <View style={pqhStyles.subBar}>
+                      <View style={[pqhStyles.subBarFill, { width: `${p.avgOnScore}%` as any, backgroundColor: onColor + 'aa' }]} />
+                    </View>
+                    <Text style={[pqhStyles.subLabel, { color: onColor }]}>⚡{p.avgOnScore}%</Text>
+                    <View style={pqhStyles.subBar}>
+                      <View style={[pqhStyles.subBarFill, { width: `${p.avgOffScore}%` as any, backgroundColor: offColor + 'aa' }]} />
+                    </View>
+                    <Text style={[pqhStyles.subLabel, { color: offColor }]}>🔴{p.avgOffScore}%</Text>
+                  </View>
+                )}
+              </View>
+              <Text style={[pqhStyles.scoreLabel, { color: barColor }]}>
+                {p.count === 0 ? '—' : `${p.avgScore}%`}
+              </Text>
+            </View>
+          );
+        })
+      )}
+    </View>
+  );
+}
+
+const pqhStyles = StyleSheet.create({
+  card: { backgroundColor: '#1e293b', borderRadius: 16, padding: 18, marginBottom: 12, borderRightWidth: 3, borderRightColor: '#38bdf8' },
+  title: { color: '#94a3b8', fontSize: 11, fontWeight: '700', letterSpacing: 1, textAlign: 'right', marginBottom: 14 },
+  empty: { color: '#475569', fontSize: 12, textAlign: 'center', paddingVertical: 8 },
+  row: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 10, paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#0f172a' },
+  metaCol: { minWidth: 52, alignItems: 'flex-end' },
+  dayLabel: { color: '#94a3b8', fontSize: 11, fontWeight: '700', textAlign: 'right' },
+  countLabel: { color: '#475569', fontSize: 9, textAlign: 'right', marginTop: 2 },
+  barCol: { flex: 1, gap: 4 },
+  barTrack: { height: 10, backgroundColor: '#0f172a', borderRadius: 5, overflow: 'hidden' },
+  barFill: { height: 10, borderRadius: 5 },
+  subBarsRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5 },
+  subBar: { flex: 1, height: 4, backgroundColor: '#0f172a', borderRadius: 2, overflow: 'hidden' },
+  subBarFill: { height: 4, borderRadius: 2 },
+  subLabel: { fontSize: 9, fontWeight: '700', minWidth: 36, textAlign: 'right' },
+  scoreLabel: { fontSize: 14, fontWeight: '900', minWidth: 36, textAlign: 'left' },
+});
+
 function LearningProgressCard({ prediction }: { prediction: Prediction }) {
   const TARGET_DAYS = 7;
   const mode = prediction.learningMode;
@@ -714,6 +865,8 @@ export default function AdminPredictions() {
       <ATCSystemIndicator prediction={prediction} />
 
       <LearningProgressCard prediction={prediction} />
+
+      <PredictionQualityHistory />
 
       <Card title={AR.analysisReasoning}>
         {prediction.reasoning.map((r, i) => (

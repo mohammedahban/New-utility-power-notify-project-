@@ -11,6 +11,7 @@ import {
   setupNotificationResponseHandler,
   setupForegroundNotificationHandler,
 } from '../lib/notifications';
+import { useActivityLog } from '../hooks/useActivityLog';
 import { ONBOARDING_KEY } from './onboarding';
 
 function AuthGate() {
@@ -69,6 +70,9 @@ function AuthGate() {
 
 function RootNavigator() {
   const { session } = useAuth();
+
+  // Track user session activity for analytics (non-admin users only)
+  useActivityLog();
 
   useEffect(() => {
     if (!session) return;

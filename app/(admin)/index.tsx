@@ -459,6 +459,17 @@ export default function AdminDashboard() {
             <Text style={styles.analyticsSub}>توزيع فوارق المستخدمين والتجمعات الجغرافية</Text>
           </TouchableOpacity>
         </View>
+        <View style={styles.analyticsRow}>
+          <TouchableOpacity
+            style={[styles.analyticsCard, { borderColor: '#a78bfa44' }]}
+            onPress={() => router.push('/(admin)/users')}
+            activeOpacity={0.75}
+          >
+            <Text style={styles.analyticsIcon}>👥</Text>
+            <Text style={[styles.analyticsTitle, { color: '#a78bfa' }]}>إحصاءات المستخدمين</Text>
+            <Text style={styles.analyticsSub}>نشاط يومي، جلسات، وساعات الاستخدام</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <View style={styles.navRow}>
