@@ -187,8 +187,11 @@ export default function AdminSettings() {
   const checkAdminTokenStatus = async () => {
     if (Platform.OS === 'web') return;
     try {
-      const projectId = Constants.expoConfig?.extra?.eas?.projectId ?? (Constants as any).easConfig?.projectId;
-      if (!projectId) return;
+      const projectId =
+        Constants.expoConfig?.extra?.eas?.projectId ??
+        (Constants as any).easConfig?.projectId ??
+        (Constants as any).manifest?.extra?.eas?.projectId ??
+        '2ef3abec-5b06-4be3-9dd0-4dbacf35957d';
       const tokenData = await Notifications.getExpoPushTokenAsync({ projectId });
       const token = tokenData.data;
       const { data } = await supabase.from('push_tokens').select('is_admin, token').eq('token', token).maybeSingle();
@@ -230,12 +233,11 @@ export default function AdminSettings() {
         return;
       }
 
-      const projectId = Constants.expoConfig?.extra?.eas?.projectId ?? (Constants as any).easConfig?.projectId;
-      if (!projectId) {
-        Alert.alert(AR.noProjectId, 'EAS projectId not found in app.json');
-        setMarkingAdmin(false);
-        return;
-      }
+      const projectId =
+        Constants.expoConfig?.extra?.eas?.projectId ??
+        (Constants as any).easConfig?.projectId ??
+        (Constants as any).manifest?.extra?.eas?.projectId ??
+        '2ef3abec-5b06-4be3-9dd0-4dbacf35957d'; // hardcoded fallback — same as app.json
 
       const tokenData = await Notifications.getExpoPushTokenAsync({ projectId });
       const token = tokenData.data;

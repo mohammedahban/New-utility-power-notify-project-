@@ -112,12 +112,11 @@ export async function registerPushToken(): Promise<void> {
     const projectId =
       Constants.expoConfig?.extra?.eas?.projectId ??
       (Constants as any).easConfig?.projectId ??
-      (Constants as any).manifest?.extra?.eas?.projectId;
+      (Constants as any).manifest?.extra?.eas?.projectId ??
+      '2ef3abec-5b06-4be3-9dd0-4dbacf35957d'; // hardcoded fallback — same as app.json
 
     if (!projectId || projectId === 'your-eas-project-id') {
       console.warn('[notifications] No valid EAS projectId found — token skipped');
-      // Don't show an error alert here — this is a dev/config issue, not a user error.
-      // The app works fine without push tokens; Growatt state still updates via real-time.
       return;
     }
 
