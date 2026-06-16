@@ -252,15 +252,16 @@ export default function AdminSettings() {
       }
     } catch (err: any) {
       const msg: string = err?.message ?? String(err);
-      if (msg.includes('FIS_AUTH') || msg.includes('FirebaseApp') || msg.includes('Firebase') || msg.includes('FIS')) {
-        // FCM/Firebase auth error — token fetch failed but app works normally
-        Alert.alert(
-          'تعذّر جلب الرمز',
-          'تعذّر تسجيل رمز الإشعار. تأكد من أن اسم حزمة التطبيق مسجّل في Firebase Console ثم أعد المحاولة.',
-        );
+      const isFcmError = msg.includes('FIS_AUTH') || msg.includes('FirebaseApp') || msg.includes('Firebase') || msg.includes('FIS') || msg.includes('ExecutionException') || msg.includes('IOException');
+      if (isFcmError) {
+        // FCM/Firebase auth error — show inline status only, no blocking dialog
+        // This usually means the APK was built before google-services.json was updated.
+        setAdminTokenStatus('⚠️ يلزم إعادة بناء APK لتطبيق إعدادات Firebase. حالياً: FCM غير مُهيَّأ.');
       } else {
-        Alert.alert(AR.error, msg);
+        // Non-FCM error — show inline only, no blocking dialog
+        setAdminTokenStatus('خطأ: ' + msg.slice(0, 80));
       }
+      console.warn('[AdminSettings] handleMarkAsAdmin error:', msg);
     }
     setMarkingAdmin(false);
   };
@@ -302,10 +303,15 @@ export default function AdminSettings() {
       <View style={styles.card}>
         <Text style={styles.cardTitle}>{AR.pushTokenAdmin}</Text>
         {adminTokenStatus ? (
-          <View style={[styles.statusBanner, adminTokenStatus.includes('ADMIN') || adminTokenStatus.includes('مشرف') ? styles.statusBannerOk : styles.statusBannerWarn]}>
-            <Text style={[styles.statusBannerText, adminTokenStatus.includes('مشرف') ? { color: '#4ade80' } : { color: '#fbbf24' }]}>
+          <View style={[styles.statusBanner, (adminTokenStatus.includes('ADMIN') || adminTokenStatus.includes('مشرف ✓') || adminTokenStatus.includes('مسجّل')) ? styles.statusBannerOk : styles.statusBannerWarn]}>
+            <Text style={[styles.statusBannerText, (adminTokenStatus.includes('مشرف ✓') || adminTokenStatus.includes('مسجّل')) ? { color: '#4ade80' } : adminTokenStatus.startsWith('⚠️') ? { color: '#f59e0b' } : { color: '#ef4444' }]}>
               {adminTokenStatus}
             </Text>
+            {adminTokenStatus.startsWith('⚠️') ? (
+              <Text style={{ color: '#94a3b8', fontSize: 11, marginTop: 6, lineHeight: 17, textAlign: 'right' }}>
+                بعد تحديث google-services.json يجب تنزيل APK جديد من OnSpace لكي تُطبَّق تغييرات Firebase.
+              </Text>
+            ) : null}
           </View>
         ) : null}
         <Text style={[styles.rowDesc, { marginTop: 8, marginBottom: 12, textAlign: 'right' }]}>{AR.markAdminDesc}</Text>
