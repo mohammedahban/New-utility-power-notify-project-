@@ -56,30 +56,28 @@ function AuthGate() {
   }, [session, profile, loading, segments, onboardingChecked]);
 
   // Show loading only during initial auth check, not indefinitely
-  
-
-  return null;
-}
-
-function RootNavigator() {
-  const { session, loading } = useAuth(); // قمنا باستدعاء loading هنا
-
-  useEffect(() => {
-    if (!session) return;
-    registerPushToken();
-    const c1 = setupNotificationResponseHandler();
-    const c2 = setupForegroundNotificationHandler();
-    return () => { c1(); c2(); };
-  }, [session]);
-
-  // ── الإضافة الجديدة: إيقاف تحميل الشاشات بالكامل حتى ينتهي التحقق ──
-  if (loading) {
+  if (loading && !onboardingChecked) {
     return (
       <View style={{ flex: 1, backgroundColor: '#060d1a', alignItems: 'center', justifyContent: 'center' }}>
         <ActivityIndicator size="large" color="#38bdf8" />
       </View>
     );
   }
+
+  return null;
+}
+
+function RootNavigator() {
+  const { session } = useAuth();
+
+  useEffect(() => {
+    if (!session) return;
+    // Re-register token on each login to keep is_admin flag current
+    registerPushToken();
+    const c1 = setupNotificationResponseHandler();
+    const c2 = setupForegroundNotificationHandler();
+    return () => { c1(); c2(); };
+  }, [session]);
 
   return (
     <>
