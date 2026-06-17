@@ -45,24 +45,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   useEffect(() => {
-    // Track whether the initial getSession has completed so we never
-    // call setLoading(false) before we know if a session exists.
-    let initialCheckDone = false;
-
-    // Initial session recovery — keep loading=true until profile is fetched
-    supabase.auth.getSession().then(async ({ data: { session: s } }) => {
-      setSession(s);
-      setUser(s?.user ?? null);
-      if (s?.user) {
-        // Fetch profile before clearing loading so AuthGate never sees
-        // session=truthy but profile=null as a transient state.
-        await fetchProfile(s.user.id);
+    // Use onAuthStateChange as the single source of truth.
+    // INITIAL_SESSION fires once on startup (with the restored/refreshed
+    // session), TOKEN_REFRESHED fires when an expired token is silently
+    // renewed — both are the signal that auth state is fully known.
+    // We avoid calling setLoading(false) from getSession() directly because
+    // when the stored token is expired, getSession() can return null while
+    // TOKEN_REFRESHED is about to fire moments later, causing a false
+    // "not logged in" redirect.
+    let loadingCleared = false;
+    const clearLoading = () => {
+      if (!loadingCleared) {
+        loadingCleared = true;
+        setLoading(false);
       }
-      initialCheckDone = true;
-      setLoading(false);
-    });
+    };
 
-    // Auth state changes
+    // Auth state changes (covers INITIAL_SESSION, TOKEN_REFRESHED, SIGNED_IN, SIGNED_OUT)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, s) => {
       setSession(s);
       setUser(s?.user ?? null);
@@ -71,14 +70,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else {
         setProfile(null);
       }
-      // Only clear loading after the initial check is done to avoid
-      // a race where onAuthStateChange fires before getSession resolves.
-      if (initialCheckDone) {
-        if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'SIGNED_OUT') {
-          setLoading(false);
-        }
+      // Clear loading on any definitive auth event
+      if (
+        event === 'INITIAL_SESSION' ||
+        event === 'SIGNED_IN' ||
+        event === 'SIGNED_OUT' ||
+        event === 'TOKEN_REFRESHED'
+      ) {
+        clearLoading();
       }
     });
+
+    // Safety fallback: if onAuthStateChange never fires within 5 s
+    // (e.g. no network on first cold start), unblock the UI so the
+    // user isn't stuck on a spinner forever.
+    const fallbackTimer = setTimeout(() => {
+      clearLoading();
+    }, 5000);
 
     // App state for token refresh
     const appStateSub = AppState.addEventListener('change', (state) => {
@@ -92,6 +100,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       subscription.unsubscribe();
       appStateSub.remove();
+      clearTimeout(fallbackTimer);
     };
   }, []);
 
