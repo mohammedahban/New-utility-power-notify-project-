@@ -43,6 +43,7 @@
       ],
       "expo-location",
       "expo-web-browser",
+      "expo-video",
       [
         "expo-notifications",
         {
