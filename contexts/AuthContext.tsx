@@ -45,14 +45,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   useEffect(() => {
-    // Use onAuthStateChange as the single source of truth.
-    // INITIAL_SESSION fires once on startup (with the restored/refreshed
-    // session), TOKEN_REFRESHED fires when an expired token is silently
-    // renewed — both are the signal that auth state is fully known.
-    // We avoid calling setLoading(false) from getSession() directly because
-    // when the stored token is expired, getSession() can return null while
-    // TOKEN_REFRESHED is about to fire moments later, causing a false
-    // "not logged in" redirect.
+    // Strategy: use getSession() as the authoritative startup source.
+    // Unlike onAuthStateChange(INITIAL_SESSION), getSession() internally
+    // performs a token refresh when the stored token is expired, so it
+    // always returns the real current session (or null if truly logged out).
+    // onAuthStateChange is then used only for subsequent real-time events
+    // (SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED) — not for the initial load.
     let loadingCleared = false;
     const clearLoading = () => {
       if (!loadingCleared) {
@@ -61,8 +59,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    // Auth state changes (covers INITIAL_SESSION, TOKEN_REFRESHED, SIGNED_IN, SIGNED_OUT)
+    // Step 1: get the persisted (and auto-refreshed) session on startup.
+    supabase.auth.getSession().then(async ({ data: { session: s } }) => {
+      if (s?.user) {
+        setSession(s);
+        setUser(s.user);
+        await fetchProfile(s.user.id);
+      } else {
+        setSession(null);
+        setUser(null);
+        setProfile(null);
+      }
+      clearLoading();
+    }).catch(() => {
+      // getSession failed (e.g. no network on first-ever launch)
+      clearLoading();
+    });
+
+    // Step 2: listen for real-time auth changes after startup.
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, s) => {
+      // Ignore INITIAL_SESSION — getSession() already handled it above
+      // and firing clearLoading() here a second time is harmless, but
+      // acting on a stale null-session INITIAL_SESSION event before
+      // TOKEN_REFRESHED arrives is what caused the regression.
+      if (event === 'INITIAL_SESSION') return;
+
       setSession(s);
       setUser(s?.user ?? null);
       if (s?.user) {
@@ -70,23 +91,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else {
         setProfile(null);
       }
-      // Clear loading on any definitive auth event
-      if (
-        event === 'INITIAL_SESSION' ||
-        event === 'SIGNED_IN' ||
-        event === 'SIGNED_OUT' ||
-        event === 'TOKEN_REFRESHED'
-      ) {
+      // Also clear loading in case getSession() hasn't resolved yet
+      // (e.g. slow network and TOKEN_REFRESHED arrives first).
+      if (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'SIGNED_OUT') {
         clearLoading();
       }
     });
 
-    // Safety fallback: if onAuthStateChange never fires within 5 s
-    // (e.g. no network on first cold start), unblock the UI so the
-    // user isn't stuck on a spinner forever.
-    const fallbackTimer = setTimeout(() => {
-      clearLoading();
-    }, 5000);
+    // Safety fallback: unblock UI after 8 s in case both getSession() and
+    // onAuthStateChange are delayed by network issues on cold start.
+    const fallbackTimer = setTimeout(clearLoading, 8000);
 
     // App state for token refresh
     const appStateSub = AppState.addEventListener('change', (state) => {
