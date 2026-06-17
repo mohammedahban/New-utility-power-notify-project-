@@ -609,19 +609,54 @@ function buildNextTransition(
   let maxRemaining = Math.max(minRemaining + 5, pHigh - currentStateDurationMin);
   let midRemaining = Math.max(0, totalExp - currentStateDurationMin);
 
-  // ── Step 4: widen ranges for instability/volatility/crisis (in that order,
-  // AFTER recentering — never widen around an outdated median) ──────────────
-  if (stats.stabilityScore < 0.45) {
-    minRemaining = Math.max(0, minRemaining * 0.7);
-    maxRemaining = maxRemaining * 1.4;
-  }
-  if (volatilityEMA >= 35) {
-    const volFactor = volatilityEMA >= 70 ? 1.5 : 1.25;
-    maxRemaining = maxRemaining * volFactor;
-  }
-  if (crisis.active) {
-    minRemaining = Math.max(0, minRemaining * 0.6);
-    maxRemaining = maxRemaining * 1.6;
+  // ── Step 4: widen ranges for instability/volatility/crisis ────────────────
+  // BUG FIX: previously each condition multiplied maxRemaining/minRemaining
+  // independently and in sequence (stability x1.4, then volatility x1.25,
+  // then crisis x1.6 — a combined ~x2.8 on the high end and ~x0.42 on the
+  // low end). Because these conditions overlap often (a thin-data, slightly
+  // unstable grid easily trips two or three at once), a 28-minute base range
+  // could balloon past 4 hours — turning a usable prediction into a window
+  // too wide to plan around, which defeats the app's purpose.
+  //
+  // Fix: compute one combined "uncertainty multiplier" from whichever
+  // conditions are active, using a square-root combination instead of
+  // straight multiplication so multiple simultaneous signals don't compound
+  // linearly, then apply it once and cap the total widening.
+  const stabilityWidenFactor = stats.stabilityScore < 0.45 ? 1.4 : 1.0;
+  const volatilityWidenFactor = volatilityEMA >= 70 ? 1.5 : volatilityEMA >= 35 ? 1.25 : 1.0;
+  const crisisWidenFactor = crisis.active ? 1.6 : 1.0;
+
+  // sqrt-combination: if all three factors-above-1 are present, the combined
+  // effect is much less than their product, while still being more than any
+  // single factor alone. Equivalent to treating each "excess uncertainty"
+  // contribution as adding in quadrature rather than multiplying serially.
+  const excessSq =
+    Math.pow(stabilityWidenFactor - 1, 2) +
+    Math.pow(volatilityWidenFactor - 1, 2) +
+    Math.pow(crisisWidenFactor - 1, 2);
+  const combinedWidenFactor = Math.min(1.8, 1 + Math.sqrt(excessSq)); // hard cap: never more than 1.8x the base spread
+
+  // Narrowing on the low end uses the inverse of the same combined factor,
+  // also capped, so the window doesn't collapse toward zero at the same
+  // time the high end balloons.
+  const combinedNarrowFactor = Math.max(0.55, 1 / combinedWidenFactor);
+
+  maxRemaining = maxRemaining * combinedWidenFactor;
+  minRemaining = Math.max(0, minRemaining * combinedNarrowFactor);
+
+  // Absolute safety cap: regardless of how the math above works out, the
+  // total displayed range must stay within something a user can actually
+  // plan around (e.g. "wait or go run an errand"). 90 minutes was chosen as
+  // the ceiling — beyond that, a range stops being a usable prediction and
+  // starts looking like the app doesn't know what it's doing, which erodes
+  // trust faster than an honest "Low confidence" label does.
+  const MAX_RANGE_WIDTH_MIN = 90; // 1.5 hours
+  let rangeWasClamped = false;
+  if (maxRemaining - minRemaining > MAX_RANGE_WIDTH_MIN) {
+    const center = (minRemaining + maxRemaining) / 2;
+    minRemaining = Math.max(0, center - MAX_RANGE_WIDTH_MIN / 2);
+    maxRemaining = center + MAX_RANGE_WIDTH_MIN / 2;
+    rangeWasClamped = true;
   }
 
   // Apply drift offset additively to the predicted timestamp (in minutes-from-now terms).
@@ -652,6 +687,7 @@ function buildNextTransition(
     maxFromNowMin: Math.round(maxRemaining),
     rangeLabel: `${fmtYemen(earliest)} → ${fmtYemen(latest)}`,
     waitLabel,
+    rangeWasClamped, // true if the 90-min cap had to compress an otherwise wider range — signals reduced trust even though the displayed window looks tight
   };
 }
 
@@ -925,6 +961,15 @@ Deno.serve(async (req) => {
   const stabilityScore = Math.round(stabilityRaw * 100);
   const stabLabel = stabilityRaw >= 0.75 ? "Stable" : stabilityRaw >= 0.45 ? "Slightly Unstable" : "Unstable";
 
+  // ── Next transition — the authoritative forecast (Phase 9) ────────────────
+  // Built before final confidence so a clamped range can demote confidence.
+  let nextTransition: (ReturnType<typeof buildNextTransition>) | null = null;
+  if (!isUnstable || cycles.length >= 2) {
+    nextTransition = buildNextTransition(
+      now, currentlyOn, currentStateDurationMin, stats, crisis, biasRatio, driftOffset, volatilityEMA,
+    );
+  }
+
   // Confidence inputs per Phase 11: data quantity/recency, drift stability,
   // bias stability, MAD stability, volatility, crisis state, error history.
   // Use the WEAKER of OFF/ON effective samples — confidence shouldn't be
@@ -948,17 +993,19 @@ Deno.serve(async (req) => {
   confidenceRaw = Math.min(0.97, confidenceRaw);
   if (isUnstable) confidenceRaw = Math.min(confidenceRaw, 0.30);
 
+  // BUG FIX (range-width vs. confidence mismatch): if the 90-minute range
+  // cap had to compress what would otherwise have been a much wider window,
+  // the displayed range looks deceptively tight unless confidence reflects
+  // that compression. Without this, a user could see "9:00–10:30am, High
+  // confidence" when the underlying uncertainty was actually enormous.
+  if (nextTransition?.rangeWasClamped) {
+    confidenceRaw = Math.min(confidenceRaw, 0.35);
+  }
+
   const confidence = Math.round(confidenceRaw * 100);
   const confLabel = confidence >= 88 ? "Very High" : confidence >= 72 ? "High" :
     confidence >= 52 ? "Medium" : confidence >= 35 ? "Low" : "Very Low";
 
-  // ── Next transition — the authoritative forecast (Phase 9) ────────────────
-  let nextTransition: object | null = null;
-  if (!isUnstable || cycles.length >= 2) {
-    nextTransition = buildNextTransition(
-      now, currentlyOn, currentStateDurationMin, stats, crisis, biasRatio, driftOffset, volatilityEMA,
-    );
-  }
 
   // ── Expected ranges (bias + crisis corrected, for display) ────────────────
   const correctedP25Off = (stats.p25Off + (crisis.active ? crisis.offShift : 0)) * biasRatio.ratio;
@@ -1040,6 +1087,10 @@ Deno.serve(async (req) => {
     reasoning.push("High volatility or crisis conditions detected — prediction ranges are wider than usual.");
   }
 
+  if (nextTransition?.rangeWasClamped) {
+    reasoning.push("⚠️ Underlying uncertainty was very high — the displayed window was compressed to stay usable, but treat this prediction as Low confidence rather than precise.");
+  }
+
   // ── Learning mode (kept for legacy UI, now driven by the weaker of the
   // two effective sample counts since OFF/ON now learn independently) ──────
   const minEffectiveSamples = Math.min(stats.effectiveWeightedSamples, stats.effectiveWeightedSamplesOn);
@@ -1106,6 +1157,7 @@ Deno.serve(async (req) => {
         crisisFactor: Math.round(crisisFactor * 100),
       },
       historySource: HISTORY_SOURCE,
+      rangeWasClamped: nextTransition?.rangeWasClamped ?? false,
     },
   };
 
