@@ -15,7 +15,7 @@
       }
     },
     "android": {
-      "package": "com.onspace.utilitypower",
+      "package": "com.onspace.appfea5cdd7",
       "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/logo.png",
