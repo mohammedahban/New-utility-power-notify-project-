@@ -26,6 +26,23 @@ const T = {
   success: '#22c55e', warning: '#f59e0b', danger: '#ef4444',
 };
 
+// Translate APPPE v4 crisis reason from English to Arabic
+function translateCrisisReason(reason: string): string {
+  if (!reason) return reason;
+  let r = reason;
+  r = r.replace(/Outage durations increased by (\d+)% vs baseline/,
+    'مدد الانقطاع ارتفعت بنسبة $1% مقارنةً بالأساس');
+  r = r.replace(/possible fuel shortage or schedule change/,
+    'ربما بسبب نقص وقود أو تغيير في الجدول');
+  r = r.replace(/Prediction center shifted by ([^.]+)/,
+    'تم ضبط مركز التوقع بمقدار $1');
+  r = r.replace(/ON durations decreased by (\d+)% vs baseline/,
+    'مدد التشغيل انخفضت بنسبة $1% مقارنةً بالأساس');
+  r = r.replace(/possible generator capacity issue/,
+    'ربما بسبب مشكلة في سعة المولد');
+  return r;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TRANSITION MODE TOGGLE — TMMS
 // Placed at the top of the Home screen (spec: §TRANSITION MODES).
@@ -144,9 +161,9 @@ function fmtTimeAr(iso: string): string {
 // Spec §POSITIVE OFFSET BEHAVIOR: "سيتم تغيير حالتك تلقائياً في الساعة [HH:MM]"
 // ─────────────────────────────────────────────────────────────────────────────
 function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPrediction | null }) {
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 30000);
+    const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
   }, []);
 
@@ -155,12 +172,25 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
   if (atcMode !== 'POSITIVE_OFFSET_PENDING' || !scheduledIso) return null;
 
   const scheduledMs = new Date(scheduledIso).getTime();
-  const minutesLeft = Math.max(0, Math.round((scheduledMs - Date.now()) / 60_000));
+  const nowMs = Date.now();
+  const totalSecondsLeft = Math.max(0, Math.round((scheduledMs - nowMs) / 1000));
+  const hLeft = Math.floor(totalSecondsLeft / 3600);
+  const mLeft = Math.floor((totalSecondsLeft % 3600) / 60);
+  const sLeft = totalSecondsLeft % 60;
+  const countdownLabel = totalSecondsLeft > 0
+    ? `${String(hLeft).padStart(2,'0')}:${String(mLeft).padStart(2,'0')}:${String(sLeft).padStart(2,'0')}`
+    : 'الآن';
+
+  // Progress bar: from Growatt transition time to scheduledIso
+  const growattTransitionMs = scheduledMs - (prediction?.offsetMinutes ?? 0) * 60_000;
+  const totalDurationMs = scheduledMs - growattTransitionMs;
+  const elapsedMs = Math.max(0, nowMs - growattTransitionMs);
+  const progressPct = totalDurationMs > 0 ? Math.min(1, elapsedMs / totalDurationMs) : 0;
+
   const isOn = prediction?.currentState === 'ON';
   const nextStateLabel = isOn ? 'طافية' : 'شغالة';
   const nextStateEmoji = isOn ? '🔴' : '⚡';
 
-  // Format the scheduled time in Arabic
   const scheduledTimeLabel = new Date(scheduledIso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
   }).replace('AM', 'ص').replace('PM', 'م');
@@ -179,8 +209,21 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
           </Text>
           {' '}تلقائياً في الساعة{' '}
           <Text style={{ fontWeight: '800', color: T.accent }}>{scheduledTimeLabel}</Text>
-          {minutesLeft > 0 ? ` · بعد ${minutesLeft} دقيقة` : ' · الآن'}
         </Text>
+        {/* Countdown */}
+        <View style={popStyles.countdownRow}>
+          <Text style={popStyles.countdownLabel}>الوقت المتبقي:</Text>
+          <Text style={popStyles.countdownValue}>{countdownLabel}</Text>
+        </View>
+        {/* Progress bar */}
+        <View style={popStyles.progressTrack}>
+          <View style={[popStyles.progressFill, { width: `${Math.round(progressPct * 100)}%` }]} />
+        </View>
+        <View style={popStyles.progressLabels}>
+          <Text style={popStyles.progressLabelRight}>تحويل Growatt</Text>
+          <Text style={popStyles.progressPct}>{Math.round(progressPct * 100)}%</Text>
+          <Text style={popStyles.progressLabelLeft}>وقتك المجدول</Text>
+        </View>
         <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {prediction?.offsetMinutes ?? 0} دقيقة</Text>
       </View>
     </View>
@@ -195,8 +238,17 @@ const popStyles = StyleSheet.create({
   },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   title: { color: T.accent, fontSize: 11, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 4 },
-  sub: { color: T.textMuted, fontSize: 10, textAlign: 'right' },
+  body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 8 },
+  sub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginTop: 6 },
+  countdownRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 8 },
+  countdownLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
+  countdownValue: { color: T.accent, fontSize: 18, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
+  progressTrack: { height: 6, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden', marginBottom: 4 },
+  progressFill: { height: 6, backgroundColor: T.accent, borderRadius: 3 },
+  progressLabels: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2 },
+  progressLabelRight: { color: T.textMuted, fontSize: 9 },
+  progressLabelLeft: { color: T.accent + 'aa', fontSize: 9 },
+  progressPct: { color: T.accent, fontSize: 10, fontWeight: '700' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -484,7 +536,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
             <Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text>
           </View>
         ) : null}
-        {remainLabel && !showATCBadge ? (
+        {remainLabel ? (
           <View style={[psStyles.timeBlock, { borderColor: color + '30', borderWidth: 1 }]}>
             <Text style={psStyles.timeLabel}>متبقي تقريباً:</Text>
             <Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text>
@@ -597,6 +649,33 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   if (!prediction) return null;
 
+  // CRITICAL: For POSITIVE_OFFSET_PENDING, build an nt from the scheduled transition time
+  // even if prediction.isUnstable=true (which forces nextTransition=null in the hook).
+  // This ensures the hold card always renders instead of the unstable-message card.
+  const effectiveNt = (() => {
+    if (
+      isHolding &&
+      atcMode === 'POSITIVE_OFFSET_PENDING' &&
+      !nt &&
+      prediction?.atc?.scheduledAutoTransitionIso
+    ) {
+      const scheduledIso = prediction.atc.scheduledAutoTransitionIso;
+      const scheduledMs = new Date(scheduledIso).getTime();
+      const minFromNow = Math.max(0, (scheduledMs - Date.now()) / 60_000);
+      return {
+        type: (prediction.currentState === 'ON' ? 'UTILITY_OFF' : 'UTILITY_ON') as 'UTILITY_ON' | 'UTILITY_OFF',
+        rangeStartIso: scheduledIso,
+        rangeEndIso: scheduledIso,
+        rangeLabel: fmtTimeAr(scheduledIso),
+        minFromNowMin: minFromNow,
+        maxFromNowMin: minFromNow,
+        waitLabel: '',
+        inRangeWindow: minFromNow <= 0,
+      };
+    }
+    return nt;
+  })();
+
   // ATC hold card — MUST be checked before isUnstable to avoid showing wrong message
   if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
     const isCurrentOn = prediction.currentState === 'ON';
@@ -647,15 +726,19 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
             <Text style={utStyles.communityPrioText}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — شارك بملاحظاتك</Text>
           </View>
         )}
-        {nt && (
+        {effectiveNt && (
           <View style={utStyles.rangeBox}>
             <Text style={[utStyles.rangeBoxLabel, { color: isCurrentOn ? T.danger : T.success }]}>
-              {nt.type === 'UTILITY_ON' ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
+              {effectiveNt.type === 'UTILITY_ON' ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
             </Text>
             <View style={utStyles.rangeTimeStack} dir="ltr">
-              <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(nt.rangeStartIso)}</Text>
-              <Text style={utStyles.rangeSep}>و</Text>
-              <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(nt.rangeEndIso)}</Text>
+              <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeStartIso)}</Text>
+              {effectiveNt.rangeStartIso !== effectiveNt.rangeEndIso && (
+                <>
+                  <Text style={utStyles.rangeSep}>و</Text>
+                  <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeEndIso)}</Text>
+                </>
+              )}
             </View>
           </View>
         )}
@@ -828,11 +911,23 @@ function TodayTimeline({ prediction, anchorStartIso }: {
 
   const slots = prediction?.daySchedule ?? [];
   const nowMs = Date.now();
-  const activeIdx = slots.findIndex(s => {
-    const start = new Date(s.startIso).getTime();
-    const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-    return nowMs >= start && nowMs < end;
-  });
+  // For POSITIVE_OFFSET_PENDING: the synthetic slot (injected at front) IS the active slot
+  const atcMode = prediction?.atc?.mode;
+  const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+
+  const activeIdx = (() => {
+    // Synthetic lingering slot is always at index 0 when POSITIVE_OFFSET_PENDING
+    if (isPositiveOffsetPending && slots.length > 0) {
+      // The first slot is synthetic (current held state ending at scheduledAutoTransitionIso)
+      return 0;
+    }
+    return slots.findIndex(s => {
+      const start = new Date(s.startIso).getTime();
+      const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+      return nowMs >= start && nowMs < end;
+    });
+  })();
+
   const startIdx = activeIdx >= 0 ? activeIdx : slots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
   const displaySlots = startIdx >= 0 ? slots.slice(startIdx, startIdx + 4) : slots.slice(0, 4);
   if (displaySlots.length === 0) return null;
@@ -845,17 +940,30 @@ function TodayTimeline({ prediction, anchorStartIso }: {
         const isOn = slot.state === 'ON';
         const color = isOn ? T.success : T.danger;
         const slotKey = `${slot.state}|${Math.round(new Date(slot.startIso).getTime() / 60_000)}`;
-        const currentStartF = slot.shiftedStartFormatted ?? slot.startFormatted;
+
+        // For active POSITIVE_OFFSET_PENDING slot: use anchorStartIso for start time
+        let currentStartF: string;
+        if (isActive && isPositiveOffsetPending && anchorStartIso) {
+          currentStartF = new Date(anchorStartIso).toLocaleString('en-US', {
+            timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+          }).replace('AM', ' ص').replace('PM', ' م');
+        } else {
+          currentStartF = slot.shiftedStartFormatted ?? slot.startFormatted;
+        }
+
         if (!stableStartMapRef.current[slotKey] && currentStartF) {
           stableStartMapRef.current[slotKey] = currentStartF;
         }
-        const startF = stableStartMapRef.current[slotKey] ?? currentStartF;
+        const startF = isActive && isPositiveOffsetPending && anchorStartIso
+          ? currentStartF  // always use fresh anchor for active pending slot
+          : (stableStartMapRef.current[slotKey] ?? currentStartF);
+
         const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
         if (!stableEndMapRef.current[slotKey] && currentEndF) {
           stableEndMapRef.current[slotKey] = currentEndF;
         }
         const endF = stableEndMapRef.current[slotKey] ?? currentEndF;
-        const isFuture = new Date(slot.startIso).getTime() > nowMs;
+        const isFuture = !isActive && new Date(slot.startIso).getTime() > nowMs;
         return (
           <View key={i} style={[tlStyles.row, i < displaySlots.length - 1 && tlStyles.rowBorder]}>
             <View style={tlStyles.timelineCol}>
@@ -882,19 +990,8 @@ function TodayTimeline({ prediction, anchorStartIso }: {
                 </Text>
               </View>
                             {/* تم التعديل: قمنا بحقن التوقيت المصحح داخل الـ Ref لمنع زحزحة الوقت للأمام */}
-              {(() => {
-                if (isActive && anchorStartIso && !stableStartMapRef.current[slotKey]) {
-                  stableStartMapRef.current[slotKey] = new Date(anchorStartIso).toLocaleString('en-US', { 
-                    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true 
-                  }).replace('AM', 'ص').replace('PM', 'م');
-                }
-              })()}
-
-                <Text style={tlStyles.timeText}>
-                {isActive && anchorStartIso 
-                  ? new Date(anchorStartIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true }).replace('AM', ' ص ').replace('PM', ' م ') 
-                  : startF}
-                {endF ? ` → ${endF}` : ' → …'}
+              <Text style={tlStyles.timeText}>
+                {startF}{endF ? ` → ${endF}` : ' → …'}
               </Text>
 
 
@@ -1285,8 +1382,8 @@ export default function Home() {
         <View style={styles.crisisBanner}>
           <View style={styles.crisisIconWrap}><Text style={{ fontSize: 20 }}>⚠️</Text></View>
           <View style={{ flex: 1 }}>
-            <Text style={styles.crisisTitle}>تغيّر في النمط</Text>
-            <Text style={styles.crisisBody}>{userPrediction.crisisReason}</Text>
+            <Text style={styles.crisisTitle}>تغيّر ملحوظ في نمط التيار</Text>
+            <Text style={styles.crisisBody}>{translateCrisisReason(userPrediction.crisisReason)}</Text>
           </View>
         </View>
       ) : null}

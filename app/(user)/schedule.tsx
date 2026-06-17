@@ -76,10 +76,11 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
           )}
           {isActive && isHolding && atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && (() => {
             const atcCfg: Record<string, { label: string; bg: string; border: string; color: string }> = {
-              UNCERTAIN_ZONE:      { label: '⚠ بانتظار تأكيد', bg: '#1a0e00', border: '#f59e0b66', color: '#f59e0b' },
-              WAITING_FOR_GROWATT: { label: '⏳ بانتظار Growatt', bg: '#001020', border: '#38bdf866', color: '#38bdf8' },
-              PREDICTION_RANGE:    { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
-              GRACE_MODE:          { label: '⏳ تأخر غير معتاد — مهلة المزامنة', bg: '#1a0e00', border: '#f9731666', color: '#f97316' },
+              UNCERTAIN_ZONE:        { label: '⚠ بانتظار تأكيد', bg: '#1a0e00', border: '#f59e0b66', color: '#f59e0b' },
+              WAITING_FOR_GROWATT:   { label: '⏳ بانتظار Growatt', bg: '#001020', border: '#38bdf866', color: '#38bdf8' },
+              PREDICTION_RANGE:      { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
+              GRACE_MODE:            { label: '⏳ تأخر غير معتاد — مهلة المزامنة', bg: '#1a0e00', border: '#f9731666', color: '#f97316' },
+              POSITIVE_OFFSET_PENDING: { label: '⏰ تغيير تلقائي مجدول', bg: '#001a2e', border: '#38bdf866', color: '#38bdf8' },
             };
             const cfg = atcCfg[atcMode];
             if (!cfg) return null;
@@ -365,11 +366,23 @@ export default function ScheduleScreen() {
 
   const currentOffset   = offset?.offset_minutes ?? 0;
   const offsetMs = currentOffset * 60_000;
-  const mathematicalActiveStartIso = userPrediction?.isResynced && userPrediction.resyncedAtIso
-    ? userPrediction.resyncedAtIso
-    : (anchor && userPrediction && anchor.state === userPrediction.currentState
-        ? new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString()
-        : null);
+  const atcMode = userPrediction?.atc?.mode;
+  const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+
+  // For POSITIVE_OFFSET_PENDING: use currentStateStartIso as the actual start
+  // For others: use anchor + offset or resync
+  const mathematicalActiveStartIso = (() => {
+    if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
+      return userPrediction.resyncedAtIso;
+    }
+    if (isPositiveOffsetPending) {
+      return userPrediction?.currentStateStartIso ?? null;
+    }
+    if (anchor && userPrediction && anchor.state === userPrediction.currentState) {
+      return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
+    }
+    return userPrediction?.currentStateStartIso ?? null;
+  })();
 
   const currentResyncIso = resyncPoint?.syncedAtIso ?? null;
 
@@ -389,11 +402,15 @@ export default function ScheduleScreen() {
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();
 
-  const activeIdx = allSlots.findIndex(s => {
-    const start = new Date(s.startIso).getTime();
-    const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-    return nowMs >= start && nowMs < end;
-  });
+  // For POSITIVE_OFFSET_PENDING: the synthetic slot (at index 0) is the active slot
+  const activeIdx = (() => {
+    if (isPositiveOffsetPending && allSlots.length > 0) return 0;
+    return allSlots.findIndex(s => {
+      const start = new Date(s.startIso).getTime();
+      const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+      return nowMs >= start && nowMs < end;
+    });
+  })();
 
   const startIdx = activeIdx >= 0 ? activeIdx
     : allSlots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
@@ -479,35 +496,41 @@ export default function ScheduleScreen() {
           {slots.map((slot, i) => {
             const slotStartMs = new Date(slot.startIso).getTime();
             const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
-            const isActive = nowMs >= slotStartMs && nowMs < slotEndMs;
+            // For POSITIVE_OFFSET_PENDING: first slot is always active
+            const isActive = isPositiveOffsetPending ? i === 0 : (nowMs >= slotStartMs && nowMs < slotEndMs);
             const slotKey = `${slot.state}|${Math.round(slotStartMs / 60_000)}`;
 
-            const currentFormatted = slot.shiftedStartFormatted ?? slot.startFormatted;
+            // Active start: use mathematicalActiveStartIso for the active slot
+            let activeStartFormatted: string | undefined;
+            if (isActive && mathematicalActiveStartIso) {
+              activeStartFormatted = new Date(mathematicalActiveStartIso).toLocaleString('en-US', {
+                timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+              }).replace('AM', ' ص').replace('PM', ' م');
+            }
+
+            const currentFormatted = activeStartFormatted ?? slot.shiftedStartFormatted ?? slot.startFormatted;
             if (!stableStartMapRef.current[slotKey] && currentFormatted) {
               stableStartMapRef.current[slotKey] = currentFormatted;
             }
-            const stableStart = stableStartMapRef.current[slotKey];
+            // For active POSITIVE_OFFSET_PENDING slot always show fresh anchor time
+            const stableStart = (isActive && isPositiveOffsetPending && activeStartFormatted)
+              ? activeStartFormatted
+              : (stableStartMapRef.current[slotKey] ?? currentFormatted);
 
             const currentEndFormatted = slot.shiftedEndFormatted ?? slot.endFormatted;
             if (!stableEndMapRef.current[slotKey] && currentEndFormatted) {
               stableEndMapRef.current[slotKey] = currentEndFormatted;
             }
-            const stableEnd = stableEndMapRef.current[slotKey];
+            const stableEnd = stableEndMapRef.current[slotKey] ?? currentEndFormatted;
 
             return (
               <ScheduleBlock
                 key={i} slot={slot} index={i}
                 resyncEvents={resyncHistory}
                 isActive={isActive}
-                atcMode={userPrediction?.atc?.mode}
+                atcMode={atcMode}
                 isHolding={userPrediction?.isHoldingState}
-                stableStartFormatted={
-                  isActive && (mathematicalActiveStartIso ?? slot.startIso)
-                    ? new Date(mathematicalActiveStartIso ?? slot.startIso).toLocaleString('en-US', {
-                        timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: true,
-                      }).replace('AM', ' ص').replace('PM', ' م')
-                    : stableStart
-                }
+                stableStartFormatted={stableStart}
                 stableEndFormatted={stableEnd}
               />
             );
