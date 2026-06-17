@@ -72,14 +72,39 @@ export interface Prediction {
   dataWindowHours: number;
   computedAt: string;
 
-  // APPPE v3.0 metadata
+  // APPPE v4.0 metadata
   apppe?: {
     version: string;
-    dominantProfile: string;
-    crisisMode: boolean;
+    // v4 fields
+    crisisActive: boolean;
     crisisReason: string | null;
-    profileBlend: Record<string, number>;   // profile name → percentage (0–100)
-    profileSamples: Record<string, number>; // profile name → sample count
+    driftOffset: number;
+    driftSampleCount: number;
+    biasRatio: number;
+    biasSampleCount: number;
+    volatilityEMA: number;
+    volatilityLabel: string;
+    crisisShift: { off: number; on: number };
+    learningStrength: number;
+    effectiveWeightedSamples: number;
+    effectiveWeightedSamplesOn: number;
+    madOff: number;
+    madOn: number | null;
+    predictionQuality: {
+      dataQuantityFactor: number;
+      stabilityFactor: number;
+      driftStabilityFactor: number;
+      biasStabilityFactor: number;
+      volatilityFactor: number;
+      crisisFactor: number;
+    };
+    historySource: string;
+    rangeWasClamped: boolean;
+    // v3 compat fields (kept for backward compat, may be absent in v4)
+    crisisMode?: boolean;
+    dominantProfile?: string;
+    profileBlend?: Record<string, number>;
+    profileSamples?: Record<string, number>;
   };
 }
 

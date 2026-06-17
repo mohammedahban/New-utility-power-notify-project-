@@ -995,7 +995,7 @@ export function applyOffsetToPrediction(
     learningMode: prediction.learningMode ?? 'prior_only',
     computedAt: prediction.computedAt ?? null,
     offsetMinutes,
-    crisisMode: prediction.apppe?.crisisMode ?? false,
+    crisisMode: prediction.apppe?.crisisActive ?? prediction.apppe?.crisisMode ?? false,
     crisisReason: prediction.apppe?.crisisReason ?? null,
     isResynced: hasResync,
     resyncedAtIso: resyncPoint?.syncedAtIso ?? null,

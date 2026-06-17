@@ -597,7 +597,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   if (!prediction) return null;
 
-  // ATC hold card
+  // ATC hold card — MUST be checked before isUnstable to avoid showing wrong message
   if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
     const isCurrentOn = prediction.currentState === 'ON';
     const tMode = prediction.atc.transitionMode ?? 'AUTO';
@@ -1184,11 +1184,22 @@ export default function Home() {
   // Priority 3: userPrediction.currentStateStartIso — schedule-derived start.
     // ── Mathematical Anchor: Bulletproof start time calculation ──────────
   const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
-  const anchorStartIso = userPrediction?.isResynced && userPrediction.resyncedAtIso
-    ? userPrediction.resyncedAtIso
-    : (anchor && userPrediction && anchor.state === userPrediction.currentState
-        ? new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString()
-        : userPrediction?.currentStateStartIso);
+  const anchorStartIso = (() => {
+    if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
+      return userPrediction.resyncedAtIso;
+    }
+    // For POSITIVE_OFFSET_PENDING: anchor.state is the HELD state (before Growatt flipped)
+    // currentState is also the HELD state — but anchor.state may differ if Growatt already flipped.
+    // Use currentStateStartIso directly so it reflects the correct schedule slot start.
+    const atcMode = userPrediction?.atc?.mode;
+    if (atcMode === 'POSITIVE_OFFSET_PENDING') {
+      return userPrediction?.currentStateStartIso ?? null;
+    }
+    if (anchor && userPrediction && anchor.state === userPrediction.currentState) {
+      return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
+    }
+    return userPrediction?.currentStateStartIso ?? null;
+  })();
 
   const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
   const stablePrediction = userPrediction
