@@ -53,7 +53,18 @@ const CRISIS_ON_DECREASE_PCT = 0.20;
 const VOLATILITY_EMA_ALPHA = 0.3;
 
 // Phase 8 — Adaptive learning trust
-const EFFECTIVE_SAMPLES_FOR_FULL_TRUST = 15;
+//
+// IMPORTANT: this threshold is compared against the SUM of exponentially
+// decayed weights (weight = 0.5^(ageHours/24)), not a raw cycle count.
+// With a 7-day window and cycles spaced a few hours apart, that sum
+// saturates low — a realistic 19-cycle week sums to ~4-5, never near 15 —
+// because anything older than ~2 days contributes almost nothing. Setting
+// this too high means the model can NEVER reach full trust in real data,
+// permanently blending in the cold-start prior regardless of how much
+// history accumulates. Calibrated instead against "how much does a single
+// very recent day's worth of cycles sum to" (roughly 3-6 cycles at
+// near-1.0 weight), so a normal day or two of real data earns full trust.
+const EFFECTIVE_SAMPLES_FOR_FULL_TRUST = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
@@ -70,8 +81,10 @@ interface Cycle {
   offDurMin: number;
   onDurMin: number | null;
   yemenHourAtStart: number;
-  ageHours: number;       // Phase 3 — replaces ageDays for exponential weighting
-  recencyWeight: number;  // exponential weight, assigned after extraction
+  ageHours: number;         // age of the OFF period (when OFF started) — used for offDurMin weighting
+  recencyWeight: number;    // exponential weight for offDurMin, derived from ageHours
+  onAgeHours: number | null;      // age of the ON period itself (when ON started) — NOT the same as ageHours
+  onRecencyWeight: number | null; // exponential weight for onDurMin, derived from onAgeHours
 }
 
 interface HistoryRow {
@@ -87,7 +100,8 @@ interface HistoryRow {
 
 interface WeightedDistStats {
   sampleCount: number;
-  effectiveWeightedSamples: number;
+  effectiveWeightedSamples: number;    // OFF-side, kept for backward-compat field naming
+  effectiveWeightedSamplesOn: number;  // ON-side — independent because ON periods now use onAgeHours, not the parent OFF period's age
   medianOff: number;
   medianOn: number | null;
   p25Off: number;
@@ -185,6 +199,15 @@ function extractCycles(events: RawEvent[], now: Date): Cycle[] {
       }
 
       const ageHours = Math.max(0, (nowMs - offStartMs) / 3_600_000);
+      // BUG FIX: onDurMin describes a period that STARTS at onStartMs, not
+      // offStartMs. If OFF periods run long (this grid: 4h+), reusing the
+      // OFF period's age to weight the ON duration systematically
+      // mis-times recent ON samples as if they were hours older than they
+      // really are — discounting fresh ON data and over-trusting stale ON
+      // data. Each duration type must be weighted by ITS OWN start time.
+      const onAgeHours = onDurMin !== null
+        ? Math.max(0, (nowMs - onStartMs) / 3_600_000)
+        : null;
 
       cycles.push({
         offStartIso: offStart,
@@ -194,6 +217,8 @@ function extractCycles(events: RawEvent[], now: Date): Cycle[] {
         yemenHourAtStart: yemenHour(offStart),
         ageHours,
         recencyWeight: recencyWeight(ageHours),
+        onAgeHours,
+        onRecencyWeight: onAgeHours !== null ? recencyWeight(onAgeHours) : null,
       });
 
       offStart = null; // CRITICAL: reset
@@ -279,10 +304,19 @@ function madToStability(mad: number, median: number): number {
 // Yemen-specific fallback when there is no usable history at all (cold start).
 // This is the only place a static prior remains, and it's a single flat
 // estimate rather than five hour-pinned curves.
+//
+// Calibrated to this grid's reported real-world bounds: OFF duration has
+// never been observed under 4h, ON duration has never exceeded 2h20. The
+// median sits comfortably inside those bounds rather than at a generic
+// regional guess, so even a small residual prior-blend (see
+// EFFECTIVE_SAMPLES_FOR_FULL_TRUST) nudges predictions in the right
+// direction instead of away from it. Update these numbers if/when the
+// grid's actual pattern shifts — this is meant to be a starting point for
+// a brand-new install with zero history, not a long-term anchor.
 const COLD_START_PRIOR = {
-  medOff: 330, medOn: 130,
-  p25Off: 180, p75Off: 480,
-  p25On: 80, p75On: 190,
+  medOff: 300, medOn: 100,
+  p25Off: 240, p75Off: 360,
+  p25On: 70, p75On: 130,
 };
 
 function computeWeightedDistStats(cycles: Cycle[]): WeightedDistStats {
@@ -290,6 +324,7 @@ function computeWeightedDistStats(cycles: Cycle[]): WeightedDistStats {
     return {
       sampleCount: 0,
       effectiveWeightedSamples: 0,
+      effectiveWeightedSamplesOn: 0,
       medianOff: COLD_START_PRIOR.medOff,
       medianOn: COLD_START_PRIOR.medOn,
       p25Off: COLD_START_PRIOR.p25Off,
@@ -316,9 +351,13 @@ function computeWeightedDistStats(cycles: Cycle[]): WeightedDistStats {
   let p75On: number | null = null;
   let madOn: number | null = null;
 
+  let onWtsForEffectiveSamples: number[] = [];
   if (onCycles.length >= 2) {
     const onVals = onCycles.map((c) => c.onDurMin as number);
-    const onWts = onCycles.map((c) => c.recencyWeight);
+    // BUG FIX: was c.recencyWeight (the OFF period's weight). ON durations
+    // must be weighted by how recently the ON period itself occurred.
+    const onWts = onCycles.map((c) => c.onRecencyWeight as number);
+    onWtsForEffectiveSamples = onWts;
     medOn = weightedMedian(onVals, onWts);
     p25On = weightedPercentile(onVals, onWts, 25);
     p75On = weightedPercentile(onVals, onWts, 75);
@@ -328,12 +367,14 @@ function computeWeightedDistStats(cycles: Cycle[]): WeightedDistStats {
   // Phase 8 — effective weighted samples instead of raw count, so 5 cycles
   // from the last 12 hours can outweigh 20 cycles from a week ago.
   const effectiveWeightedSamples = offWts.reduce((s, w) => s + w, 0);
+  const effectiveWeightedSamplesOn = onWtsForEffectiveSamples.reduce((s, w) => s + w, 0);
 
   const stabilityScore = madToStability(madOff, medOff);
 
   return {
     sampleCount: cycles.length,
     effectiveWeightedSamples,
+    effectiveWeightedSamplesOn,
     medianOff: Math.round(medOff),
     medianOn: medOn !== null ? Math.round(medOn) : null,
     p25Off: Math.round(p25Off),
@@ -349,22 +390,28 @@ function computeWeightedDistStats(cycles: Cycle[]): WeightedDistStats {
 // Phase 8 — smooth blend between cold-start prior and learned distribution,
 // no abrupt prior_only/hybrid/learned mode switch.
 function blendWithColdStart(stats: WeightedDistStats): WeightedDistStats {
-  const learnTrust = Math.min(1, stats.effectiveWeightedSamples / EFFECTIVE_SAMPLES_FOR_FULL_TRUST);
-  const priorTrust = 1 - learnTrust;
+  const learnTrustOff = Math.min(1, stats.effectiveWeightedSamples / EFFECTIVE_SAMPLES_FOR_FULL_TRUST);
+  const priorTrustOff = 1 - learnTrustOff;
+  // ON now has its own independent trust level — it should NOT inherit the
+  // OFF period's sample count, since onAgeHours/onRecencyWeight are no
+  // longer derived from the same timestamps as the OFF side.
+  const learnTrustOn = Math.min(1, stats.effectiveWeightedSamplesOn / EFFECTIVE_SAMPLES_FOR_FULL_TRUST);
+  const priorTrustOn = 1 - learnTrustOn;
 
   if (stats.sampleCount === 0) return stats; // already pure cold-start
 
-  const blend = (learned: number, prior: number) => learnTrust * learned + priorTrust * prior;
+  const blendOff = (learned: number, prior: number) => learnTrustOff * learned + priorTrustOff * prior;
+  const blendOn = (learned: number, prior: number) => learnTrustOn * learned + priorTrustOn * prior;
 
   return {
     ...stats,
-    medianOff: Math.round(blend(stats.medianOff, COLD_START_PRIOR.medOff)),
-    p25Off: Math.round(blend(stats.p25Off, COLD_START_PRIOR.p25Off)),
-    p75Off: Math.round(blend(stats.p75Off, COLD_START_PRIOR.p75Off)),
-    medianOn: stats.medianOn !== null ? Math.round(blend(stats.medianOn, COLD_START_PRIOR.medOn)) : COLD_START_PRIOR.medOn,
-    p25On: stats.p25On !== null ? Math.round(blend(stats.p25On, COLD_START_PRIOR.p25On)) : COLD_START_PRIOR.p25On,
-    p75On: stats.p75On !== null ? Math.round(blend(stats.p75On, COLD_START_PRIOR.p75On)) : COLD_START_PRIOR.p75On,
-    stabilityScore: blend(stats.stabilityScore, 0.5),
+    medianOff: Math.round(blendOff(stats.medianOff, COLD_START_PRIOR.medOff)),
+    p25Off: Math.round(blendOff(stats.p25Off, COLD_START_PRIOR.p25Off)),
+    p75Off: Math.round(blendOff(stats.p75Off, COLD_START_PRIOR.p75Off)),
+    medianOn: stats.medianOn !== null ? Math.round(blendOn(stats.medianOn, COLD_START_PRIOR.medOn)) : COLD_START_PRIOR.medOn,
+    p25On: stats.p25On !== null ? Math.round(blendOn(stats.p25On, COLD_START_PRIOR.p25On)) : COLD_START_PRIOR.p25On,
+    p75On: stats.p75On !== null ? Math.round(blendOn(stats.p75On, COLD_START_PRIOR.p75On)) : COLD_START_PRIOR.p75On,
+    stabilityScore: blendOff(stats.stabilityScore, 0.5),
   };
 }
 
@@ -382,6 +429,7 @@ interface CrisisResult {
 }
 
 function detectAndRecenterCrisis(cycles: Cycle[]): CrisisResult {
+  // OFF bucketing uses the OFF period's own age — correct as-is.
   const recent = cycles.filter((c) => c.ageHours < 24);
   const baseline = cycles.filter((c) => c.ageHours >= 24 && c.ageHours < 96);
 
@@ -393,8 +441,13 @@ function detectAndRecenterCrisis(cycles: Cycle[]): CrisisResult {
   const baseOffMed = simpleMedian(baseline.map((c) => c.offDurMin));
   const offIncrease = (recentOffMed - baseOffMed) / (baseOffMed || 1);
 
-  const recentOnSamples = recent.filter((c) => c.onDurMin !== null);
-  const baseOnSamples = baseline.filter((c) => c.onDurMin !== null);
+  // BUG FIX: ON samples must be bucketed by the ON period's OWN age
+  // (onAgeHours), not by the preceding OFF period's age. Reusing the OFF
+  // bucket here could put a just-finished ON period into "baseline" simply
+  // because it followed a long-ago OFF start, corrupting the recent-vs-
+  // baseline comparison that crisis recentering depends on.
+  const recentOnSamples = cycles.filter((c) => c.onDurMin !== null && (c.onAgeHours as number) < 24);
+  const baseOnSamples = cycles.filter((c) => c.onDurMin !== null && (c.onAgeHours as number) >= 24 && (c.onAgeHours as number) < 96);
 
   let onDecrease = 0;
   let recentOnMed = 0, baseOnMed = 0;
@@ -874,7 +927,11 @@ Deno.serve(async (req) => {
 
   // Confidence inputs per Phase 11: data quantity/recency, drift stability,
   // bias stability, MAD stability, volatility, crisis state, error history.
-  const dataQuantityFactor = Math.min(1, stats.effectiveWeightedSamples / EFFECTIVE_SAMPLES_FOR_FULL_TRUST);
+  // Use the WEAKER of OFF/ON effective samples — confidence shouldn't be
+  // inflated by a well-learned OFF side while the ON side (or vice versa)
+  // is still thin, since the next-transition forecast can point either way.
+  const effectiveSamplesForConfidence = Math.min(stats.effectiveWeightedSamples, stats.effectiveWeightedSamplesOn || stats.effectiveWeightedSamples);
+  const dataQuantityFactor = Math.min(1, effectiveSamplesForConfidence / EFFECTIVE_SAMPLES_FOR_FULL_TRUST);
   const driftStabilityFactor = driftOffset.sampleCount === 0 ? 0.6 : Math.max(0.2, 1 - Math.abs(driftOffset.offsetMin) / 180);
   const biasStabilityFactor = biasRatio.sampleCount === 0 ? 0.7 : Math.max(0.3, 1 - Math.abs(1 - biasRatio.ratio));
   const volatilityFactor = volatilityEMA < 15 ? 1 : volatilityEMA < 35 ? 0.85 : volatilityEMA < 70 ? 0.55 : 0.25;
@@ -976,16 +1033,18 @@ Deno.serve(async (req) => {
       reasoning.push(`Grid has been ${currentlyOn ? "ON" : "OFF"} for ${fmtMin(currentStateDurationMin)}.`);
     }
 
-    reasoning.push(`Learning strength: ${Math.round(dataQuantityFactor * 100)}% (${stats.effectiveWeightedSamples.toFixed(1)} effective weighted samples).`);
+    reasoning.push(`Learning strength: ${Math.round(dataQuantityFactor * 100)}% (OFF: ${stats.effectiveWeightedSamples.toFixed(1)}, ON: ${stats.effectiveWeightedSamplesOn.toFixed(1)} effective weighted samples).`);
   }
 
   if (isUnstable && cycles.length > 0) {
     reasoning.push("High volatility or crisis conditions detected — prediction ranges are wider than usual.");
   }
 
-  // ── Learning mode (kept for legacy UI, now driven by effective samples) ────
-  const learningMode = stats.effectiveWeightedSamples < 4 ? "prior_only"
-    : stats.effectiveWeightedSamples < 10 ? "hybrid"
+  // ── Learning mode (kept for legacy UI, now driven by the weaker of the
+  // two effective sample counts since OFF/ON now learn independently) ──────
+  const minEffectiveSamples = Math.min(stats.effectiveWeightedSamples, stats.effectiveWeightedSamplesOn);
+  const learningMode = minEffectiveSamples < 4 ? "prior_only"
+    : minEffectiveSamples < 10 ? "hybrid"
     : "learned";
 
   // ── Assemble prediction (Phase 14 — preserve existing response shape) ─────
@@ -1035,6 +1094,7 @@ Deno.serve(async (req) => {
       crisisShift: { off: Math.round(crisis.offShift), on: Math.round(crisis.onShift) },
       learningStrength: Math.round(dataQuantityFactor * 100),
       effectiveWeightedSamples: Math.round(stats.effectiveWeightedSamples * 10) / 10,
+      effectiveWeightedSamplesOn: Math.round(stats.effectiveWeightedSamplesOn * 10) / 10,
       madOff: stats.madOff,
       madOn: stats.madOn,
       predictionQuality: {
