@@ -55,9 +55,8 @@ function AuthGate() {
       if (!inUser) router.replace('/(user)');
     }
   }, [session, profile, loading, segments, onboardingChecked]);
-
-  // Show loading only during initial auth check, not indefinitely
-  if (loading && !onboardingChecked) {
+  // Show loading during initial auth check (including the 2s grace window)
+  if (loading || !onboardingChecked) {
     return (
       <View style={{ flex: 1, backgroundColor: '#060d1a', alignItems: 'center', justifyContent: 'center' }}>
         <ActivityIndicator size="large" color="#38bdf8" />
