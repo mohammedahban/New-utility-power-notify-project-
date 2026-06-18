@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   KeyboardAvoidingView, Platform, ScrollView, ActivityIndicator,
@@ -11,12 +11,19 @@ import { AR } from '../constants/arabic';
 export default function LoginScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { signIn } = useAuth();
+  const { signIn, session, loading } = useAuth();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+    // Auto-redirect if auth recovers while on this screen
+  useEffect(() => {
+    if (!loading && session) {
+      router.replace('/(tabs)');
+    }
+  }, [loading, session]);
 
   const handleLogin = async () => {
     if (!email.trim() || !password.trim()) {
