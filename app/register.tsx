@@ -11,12 +11,12 @@ import { AR } from '../constants/arabic';
 export default function RegisterScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { signUp, session, loading } = useAuth();
+  const { signUp, session, loading: authLoading } = useAuth();
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
 
@@ -33,10 +33,10 @@ export default function RegisterScreen() {
       setError(AR.passwordsNoMatch);
       return;
     }
-    setLoading(true);
+    setSubmitting(true);
     setError('');
     const { error: err } = await signUp(email.trim(), password, username.trim());
-    setLoading(false);
+    setSubmitting(false);
     if (err) {
       setError(err);
     } else {
@@ -147,12 +147,12 @@ export default function RegisterScreen() {
           </View>
 
           <TouchableOpacity
-            style={[styles.btn, loading && { opacity: 0.6 }]}
+            style={[styles.btn, submitting && { opacity: 0.6 }]}
             onPress={handleRegister}
             activeOpacity={0.8}
-            disabled={loading}
+            disabled={submitting}
           >
-            {loading ? (
+            {submitting ? (
               <ActivityIndicator color="#fff" size="small" />
             ) : (
               <Text style={styles.btnText}>{AR.createAccount}</Text>
