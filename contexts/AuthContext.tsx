@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useEffect, useState, ReactNode, useRef } from 'react';
 import { AppState } from 'react-native';
 import { Session, User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
@@ -30,6 +30,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
+  const getSessionReturnedUser = useRef(false);
 
   const fetchProfile = async (uid: string) => {
     const { data, error } = await supabase
@@ -44,13 +45,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  useEffect(() => {
-    // Strategy: use getSession() as the authoritative startup source.
-    // Unlike onAuthStateChange(INITIAL_SESSION), getSession() internally
-    // performs a token refresh when the stored token is expired, so it
-    // always returns the real current session (or null if truly logged out).
-    // onAuthStateChange is then used only for subsequent real-time events
-    // (SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED) — not for the initial load.
+    useEffect(() => {
     let loadingCleared = false;
     const clearLoading = () => {
       if (!loadingCleared) {
@@ -62,27 +57,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Step 1: get the persisted (and auto-refreshed) session on startup.
     supabase.auth.getSession().then(async ({ data: { session: s } }) => {
       if (s?.user) {
+        getSessionReturnedUser.current = true;
         setSession(s);
         setUser(s.user);
         await fetchProfile(s.user.id);
+        clearLoading();
       } else {
+        getSessionReturnedUser.current = false;
         setSession(null);
         setUser(null);
         setProfile(null);
+        // Give onAuthStateChange a short window to deliver a refreshed
+        // session before we tell the router "user is logged out".
+        setTimeout(clearLoading, 2000);
       }
-      clearLoading();
     }).catch(() => {
-      // getSession failed (e.g. no network on first-ever launch)
-      clearLoading();
+      getSessionReturnedUser.current = false;
+      setTimeout(clearLoading, 2000);
     });
 
     // Step 2: listen for real-time auth changes after startup.
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, s) => {
-      // Ignore INITIAL_SESSION — getSession() already handled it above
-      // and firing clearLoading() here a second time is harmless, but
-      // acting on a stale null-session INITIAL_SESSION event before
-      // TOKEN_REFRESHED arrives is what caused the regression.
-      if (event === 'INITIAL_SESSION') return;
+      if (event === 'INITIAL_SESSION') {
+        // If getSession() found nothing, INITIAL_SESSION may be the
+        // late-arriving recovered session. Accept it.
+        if (!getSessionReturnedUser.current && s?.user) {
+          setSession(s);
+          setUser(s.user);
+          await fetchProfile(s.user.id);
+        }
+        clearLoading();
+        return;
+      }
 
       setSession(s);
       setUser(s?.user ?? null);
@@ -91,8 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else {
         setProfile(null);
       }
-      // Also clear loading in case getSession() hasn't resolved yet
-      // (e.g. slow network and TOKEN_REFRESHED arrives first).
+
       if (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'SIGNED_OUT') {
         clearLoading();
       }
@@ -117,6 +122,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       clearTimeout(fallbackTimer);
     };
   }, []);
+ []);
 
   const signIn = async (email: string, password: string) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
