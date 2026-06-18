@@ -41,19 +41,25 @@ function AuthGate() {
 
     if (inOnboarding) return;
 
-    if (!session) {
-      if (!inAuth) router.replace('/login');
+       if (!session) {
+      if (!inAuth) {
+        setTimeout(() => router.replace('/login'), 0);
+      }
       return;
-    }
+       }
 
     // Wait for profile to load before routing
     if (!profile) return;
 
-    if (profile.role === 'admin') {
-      if (!inAdmin) router.replace('/(admin)');
+        if (profile.role === 'admin') {
+      if (!inAdmin) {
+        setTimeout(() => router.replace('/(admin)'), 0);
+      }
     } else {
-      if (!inUser) router.replace('/(user)');
-    }
+      if (!inUser) {
+        setTimeout(() => router.replace('/(user)'), 0);
+      }
+        }
   }, [session, profile, loading, segments, onboardingChecked]);
   // Show loading during initial auth check (including the 2s grace window)
   if (loading || !onboardingChecked) {
