@@ -19,12 +19,17 @@ export default function LoginScreen() {
   const [error, setError] = useState('');
 
   // Auto-redirect if auth recovers while on this screen
+    // Auto-redirect if auth recovers while on this screen
   useEffect(() => {
+    let mounted = true;
     if (!authLoading && session) {
-      router.replace('/(tabs)');
+      // Defer navigation to next frame to avoid native view sync crash
+      setTimeout(() => {
+        if (mounted) router.replace('/(tabs)');
+      }, 0);
     }
+    return () => { mounted = false; };
   }, [authLoading, session]);
-
   const handleLogin = async () => {
     if (!email.trim() || !password.trim()) {
       setError(AR.enterEmailPassword);
