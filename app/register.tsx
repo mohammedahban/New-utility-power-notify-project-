@@ -21,12 +21,16 @@ export default function RegisterScreen() {
   const [success, setSuccess] = useState(false);
 
   // Auto-redirect if auth recovers while on this screen
+    // Auto-redirect if auth recovers while on this screen
   useEffect(() => {
+    let mounted = true;
     if (!authLoading && session) {
-      router.replace('/(tabs)');
+      setTimeout(() => {
+        if (mounted) router.replace('/(tabs)');
+      }, 0);
     }
+    return () => { mounted = false; };
   }, [authLoading, session]);
-
   const handleRegister = async () => {
     if (!username.trim() || !email.trim() || !password.trim()) {
       setError(AR.fillAllFields);
