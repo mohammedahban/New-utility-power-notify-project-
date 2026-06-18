@@ -122,7 +122,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       clearTimeout(fallbackTimer);
     };
   }, []);
- []);
 
   const signIn = async (email: string, password: string) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
