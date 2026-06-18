@@ -21,7 +21,6 @@ export default function RegisterScreen() {
   const [success, setSuccess] = useState(false);
 
   // Auto-redirect if auth recovers while on this screen
-    // Auto-redirect if auth recovers while on this screen
   useEffect(() => {
     let mounted = true;
     if (!authLoading && session) {
