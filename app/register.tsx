@@ -20,6 +20,13 @@ export default function RegisterScreen() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
 
+  // Auto-redirect if auth recovers while on this screen
+  useEffect(() => {
+    if (!authLoading && session) {
+      router.replace('/(tabs)');
+    }
+  }, [authLoading, session]);
+
   const handleRegister = async () => {
     if (!username.trim() || !email.trim() || !password.trim()) {
       setError(AR.fillAllFields);
