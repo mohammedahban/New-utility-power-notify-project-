@@ -11,29 +11,29 @@ import { AR } from '../constants/arabic';
 export default function LoginScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { signIn, session, loading } = useAuth();
+  const { signIn, session, loading: authLoading } = useAuth();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
-    // Auto-redirect if auth recovers while on this screen
+  // Auto-redirect if auth recovers while on this screen
   useEffect(() => {
-    if (!loading && session) {
+    if (!authLoading && session) {
       router.replace('/(tabs)');
     }
-  }, [loading, session]);
+  }, [authLoading, session]);
 
   const handleLogin = async () => {
     if (!email.trim() || !password.trim()) {
       setError(AR.enterEmailPassword);
       return;
     }
-    setLoading(true);
+    setSubmitting(true);
     setError('');
     const { error: err } = await signIn(email.trim(), password);
-    setLoading(false);
+    setSubmitting(false);
     if (err) setError(err);
   };
 
@@ -96,12 +96,12 @@ export default function LoginScreen() {
           </View>
 
           <TouchableOpacity
-            style={[styles.btn, loading && { opacity: 0.6 }]}
+            style={[styles.btn, submitting && { opacity: 0.6 }]}
             onPress={handleLogin}
             activeOpacity={0.8}
-            disabled={loading}
+            disabled={submitting}
           >
-            {loading ? (
+            {submitting ? (
               <ActivityIndicator color="#fff" size="small" />
             ) : (
               <Text style={styles.btnText}>{AR.signIn}</Text>
