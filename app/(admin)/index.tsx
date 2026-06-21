@@ -475,17 +475,16 @@ export default function AdminDashboard() {
       </View>
 
       {/* ── ADDED COMPONENT: TMMS Debug Simulator Wrapper ───────────────────── */}
-      {__DEV__ && (
-        <View style={styles.section}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>⚙️ جهاز محاكاة TMMS (بيئة التطوير)</Text>
-          </View>
-          <View style={styles.simulatorWrapper}>
-            <TMMSDebugSimulator />
-          </View>
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>⚙️ جهاز محاكاة TMMS (بيئة التطوير)</Text>
         </View>
-      )}
+        <View style={styles.simulatorWrapper}>
+          <TMMSDebugSimulator />
+        </View>
+      </View>
       {/* ──────────────────────────────────────────────────────────────────── */}
+
 
       <View style={styles.navRow}>
         <TouchableOpacity style={[styles.navBtn, { flex: 1 }]} onPress={() => router.push('/(admin)/settings')} activeOpacity={0.75}>
