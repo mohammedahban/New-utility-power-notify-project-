@@ -13,20 +13,27 @@ import { corsHeaders } from "../_shared/cors.ts";
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Where do drift/bias history come from?
-//   "accuracy_log"  -> read/write the existing accuracy-log-style table that
-//                       produced your export (predicted_time/actual_time/
+//   "accuracy_log"  -> read/write the real prediction_accuracy_logs table
+//                       used by the app's Accuracy Center screen
+//                       (predicted_event_time/actual_event_time/
 //                       error_minutes/predicted_state/accuracy_score).
 //   "dedicated"      -> read/write a new prediction_history table with a
 //                       richer schema (errorMinutes, biasRatio, durationType,
 //                       crisis flags, etc.) purpose-built for v4.
 //
-// Start with "accuracy_log" since that table already exists and is already
-// being populated by your client (see the client_positive_offset_* slot_id
-// values in the export) — zero migration needed to ship v4. Flip to
-// "dedicated" once you're ready to retire the legacy table.
+// CONFIRMED 2026-06-21 against the real accuracy_tsx.txt screen source:
+// the actual table is "prediction_accuracy_logs" (PLURAL) with columns
+// predicted_event_time / actual_event_time — NOT "prediction_accuracy_log"
+// (singular) with predicted_time / actual_time, which is what this file
+// was querying before. That mismatch likely caused every loadHistory()
+// call to silently fail (Supabase returns an error for a nonexistent
+// table/column) and fall back to an empty array — meaning drift
+// correction, bias correction, and the consecutive-error crisis trigger
+// have likely been running on ZERO real history this whole time, no
+// matter how much data accumulated in the actual table.
 const HISTORY_SOURCE: "accuracy_log" | "dedicated" = "accuracy_log";
 
-const ACCURACY_LOG_TABLE = "prediction_accuracy_log"; // adjust to your real table name
+const ACCURACY_LOG_TABLE = "prediction_accuracy_logs"; // CORRECTED: was "prediction_accuracy_log" (wrong table, singular)
 const DEDICATED_HISTORY_TABLE = "prediction_history";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -416,6 +423,47 @@ function blendWithColdStart(stats: WeightedDistStats): WeightedDistStats {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MODULE 1 — REALITY DURATION CONSTRAINTS (RDC) — APPPE V4.1
+//
+// Independent sanity layer, not a replacement for the MAD-based percentile
+// math above. Purpose: hard-reject durations that are physically impossible
+// given recent reality, even if some upstream blend or correction step
+// would otherwise produce one. learnedMin/learnedMax = median ± 2.5×MAD.
+//
+// This is intentionally a WIDE bound (2.5×MAD), not a tight one — it exists
+// to catch genuinely broken outputs (e.g. a corrected duration that drifted
+// to near-zero or absurdly large), not to override legitimate variance that
+// the MAD-tiered range logic already handles. If this clamp is firing
+// often, that's a signal something upstream is wrong, not that this clamp
+// needs to be tighter.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface RealityBounds {
+  learnedMinOff: number;
+  learnedMaxOff: number;
+  learnedMinOn: number | null;
+  learnedMaxOn: number | null;
+}
+
+function computeRealityBounds(stats: WeightedDistStats): RealityBounds {
+  const learnedMinOff = Math.max(5, stats.medianOff - 2.5 * stats.madOff);
+  const learnedMaxOff = stats.medianOff + 2.5 * stats.madOff;
+
+  const learnedMinOn = stats.medianOn !== null && stats.madOn !== null
+    ? Math.max(5, stats.medianOn - 2.5 * stats.madOn)
+    : null;
+  const learnedMaxOn = stats.medianOn !== null && stats.madOn !== null
+    ? stats.medianOn + 2.5 * stats.madOn
+    : null;
+
+  return { learnedMinOff, learnedMaxOff, learnedMinOn, learnedMaxOn };
+}
+
+function clampToRealityBounds(durationMin: number, min: number, max: number): number {
+  return Math.max(min, Math.min(durationMin, max));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PHASE 5 — CRISIS DETECTION + RECENTERING
 // v3 only widened ranges around a stale median. v4 shifts the median itself
 // toward recent reality, then widens around the NEW center.
@@ -483,6 +531,42 @@ function detectAndRecenterCrisis(cycles: Cycle[]): CrisisResult {
   }
 
   return { active: false, reason: null, offShift: 0, onShift: 0 };
+}
+
+// MODULE 4 (addition) — CRISIS RE-CENTERING ENGINE: consecutive-error
+// trigger. Supplements the duration-percentage trigger above with a second,
+// independent path: if the last 3 completed predictions were all off in the
+// same direction (consistently late, or consistently early), that's a
+// systematic drift pattern even if no single cycle's percentage threshold
+// was crossed. EMA of those errors becomes the recentering shift.
+function detectConsecutiveErrorCrisis(historyNewestFirst: HistoryRow[]): CrisisResult {
+  const lastThree = historyNewestFirst.slice(0, 3);
+  if (lastThree.length < 3) {
+    return { active: false, reason: null, offShift: 0, onShift: 0 };
+  }
+
+  const allLate = lastThree.every((h) => h.errorMinutes > 0);
+  const allEarly = lastThree.every((h) => h.errorMinutes < 0);
+
+  if (!allLate && !allEarly) {
+    return { active: false, reason: null, offShift: 0, onShift: 0 };
+  }
+
+  // EMA of the last 3 errors (oldest -> newest), matching the spec's
+  // "crisisShift = EMA(last prediction errors)".
+  const oldestFirst = [...lastThree].reverse();
+  let ema = oldestFirst[0].errorMinutes;
+  for (let i = 1; i < oldestFirst.length; i++) {
+    ema = VOLATILITY_EMA_ALPHA * oldestFirst[i].errorMinutes + (1 - VOLATILITY_EMA_ALPHA) * ema;
+  }
+
+  const direction = allLate ? "late" : "early";
+  return {
+    active: true,
+    reason: `Last 3 predictions were all ${direction} (consistent directional error) — prediction center shifted by ${fmtSignedMin(Math.round(ema))}.`,
+    offShift: ema,
+    onShift: ema,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -597,9 +681,27 @@ function buildNextTransition(
   const biasAdjPLowOn = pLowOn * biasRatio.ratio;
   const biasAdjPHighOn = pHighOn * biasRatio.ratio;
 
-  const totalExp = currentlyOn ? biasAdjOn : biasAdjOff;
-  const pLow = currentlyOn ? biasAdjPLowOn : biasAdjPLowOff;
-  const pHigh = currentlyOn ? biasAdjPHighOn : biasAdjPHighOff;
+  let totalExp = currentlyOn ? biasAdjOn : biasAdjOff;
+  let pLow = currentlyOn ? biasAdjPLowOn : biasAdjPLowOff;
+  let pHigh = currentlyOn ? biasAdjPHighOn : biasAdjPHighOff;
+
+  // MODULE 1 — REALITY DURATION CONSTRAINTS (APPPE V4.1).
+  // Clamp the corrected duration (and its P25/P75 bounds) to what's
+  // physically realistic given this state's own recent median ± 2.5×MAD.
+  // This is a final sanity layer on top of crisis/bias correction — it only
+  // fires if those upstream corrections pushed the duration outside what
+  // real recent cycles support, which should be rare in normal operation.
+  const realityBounds = computeRealityBounds(stats);
+  const realityMin = currentlyOn ? (realityBounds.learnedMinOn ?? realityBounds.learnedMinOff) : realityBounds.learnedMinOff;
+  const realityMax = currentlyOn ? (realityBounds.learnedMaxOn ?? realityBounds.learnedMaxOff) : realityBounds.learnedMaxOff;
+
+  let realityClamped = false;
+  const clampedTotalExp = clampToRealityBounds(totalExp, realityMin, realityMax);
+  if (clampedTotalExp !== totalExp) realityClamped = true;
+  totalExp = clampedTotalExp;
+  pLow = clampToRealityBounds(pLow, realityMin, realityMax);
+  pHigh = clampToRealityBounds(pHigh, realityMin, realityMax);
+  if (pHigh < pLow) pHigh = pLow; // guard against inverted bounds after clamping
 
   // ── Step 3: drift correction (additive, on the absolute predicted time) ───
   // remaining = (bias-corrected total) - elapsed, then drift is added on top
@@ -610,52 +712,56 @@ function buildNextTransition(
   let midRemaining = Math.max(0, totalExp - currentStateDurationMin);
 
   // ── Step 4: widen ranges for instability/volatility/crisis ────────────────
-  // BUG FIX: previously each condition multiplied maxRemaining/minRemaining
-  // independently and in sequence (stability x1.4, then volatility x1.25,
-  // then crisis x1.6 — a combined ~x2.8 on the high end and ~x0.42 on the
-  // low end). Because these conditions overlap often (a thin-data, slightly
-  // unstable grid easily trips two or three at once), a 28-minute base range
-  // could balloon past 4 hours — turning a usable prediction into a window
-  // too wide to plan around, which defeats the app's purpose.
-  //
-  // Fix: compute one combined "uncertainty multiplier" from whichever
-  // conditions are active, using a square-root combination instead of
-  // straight multiplication so multiple simultaneous signals don't compound
-  // linearly, then apply it once and cap the total widening.
+  // BUG FIX (carried from prior version): previously each condition
+  // multiplied maxRemaining/minRemaining independently and in sequence
+  // (stability x1.4, then volatility x1.25, then crisis x1.6 — a combined
+  // ~x2.8). Combined via quadrature instead so multiple simultaneous
+  // uncertainty signals don't compound linearly.
   const stabilityWidenFactor = stats.stabilityScore < 0.45 ? 1.4 : 1.0;
   const volatilityWidenFactor = volatilityEMA >= 70 ? 1.5 : volatilityEMA >= 35 ? 1.25 : 1.0;
   const crisisWidenFactor = crisis.active ? 1.6 : 1.0;
 
-  // sqrt-combination: if all three factors-above-1 are present, the combined
-  // effect is much less than their product, while still being more than any
-  // single factor alone. Equivalent to treating each "excess uncertainty"
-  // contribution as adding in quadrature rather than multiplying serially.
   const excessSq =
     Math.pow(stabilityWidenFactor - 1, 2) +
     Math.pow(volatilityWidenFactor - 1, 2) +
     Math.pow(crisisWidenFactor - 1, 2);
-  const combinedWidenFactor = Math.min(1.8, 1 + Math.sqrt(excessSq)); // hard cap: never more than 1.8x the base spread
-
-  // Narrowing on the low end uses the inverse of the same combined factor,
-  // also capped, so the window doesn't collapse toward zero at the same
-  // time the high end balloons.
+  const combinedWidenFactor = Math.min(1.8, 1 + Math.sqrt(excessSq));
   const combinedNarrowFactor = Math.max(0.55, 1 / combinedWidenFactor);
 
   maxRemaining = maxRemaining * combinedWidenFactor;
   minRemaining = Math.max(0, minRemaining * combinedNarrowFactor);
 
-  // Absolute safety cap: regardless of how the math above works out, the
-  // total displayed range must stay within something a user can actually
-  // plan around (e.g. "wait or go run an errand"). 90 minutes was chosen as
-  // the ceiling — beyond that, a range stops being a usable prediction and
-  // starts looking like the app doesn't know what it's doing, which erodes
-  // trust faster than an honest "Low confidence" label does.
-  const MAX_RANGE_WIDTH_MIN = 90; // 1.5 hours
+  // MAD-TIERED MAX RANGE WIDTH (APPPE V4.1 — Prediction Range Redesign).
+  // Replaces the prior flat 90-minute cap. A flat cap punished well-learned,
+  // genuinely stable predictions exactly as hard as it punished noisy ones —
+  // confirmed by real usage where Pattern Stability sat at 76% and
+  // Volatility EMA was 0 (no timing drift at all) but the range still got
+  // clamped to the same 90 minutes as a chaotic one. Tying the cap to the
+  // relevant duration's own MAD makes the cap proportional to how
+  // predictable this specific state (ON or OFF) actually is.
+  const relevantMad = currentlyOn ? (stats.madOn ?? stats.madOff) : stats.madOff;
+  let maxAllowedWidth: number;
+  if (relevantMad < 15) maxAllowedWidth = 30;        // Very Stable  → ±15 min
+  else if (relevantMad < 30) maxAllowedWidth = 60;   // Stable       → ±30 min
+  else if (relevantMad < 60) maxAllowedWidth = 90;   // Moderate     → ±45 min
+  else maxAllowedWidth = 180;                         // Unstable     → ±90 min
+
+  // Never allow range width > 50% of the expected duration unless crisis is
+  // active — a tight MAD tier shouldn't force a 30-min window onto a
+  // 20-minute expected duration. Crisis mode is exempted since genuine
+  // schedule upheaval legitimately needs more room regardless of this ratio.
+  if (!crisis.active) {
+    const halfDurationCap = totalExp * 0.5;
+    if (halfDurationCap > 0) {
+      maxAllowedWidth = Math.min(maxAllowedWidth, Math.max(20, halfDurationCap));
+    }
+  }
+
   let rangeWasClamped = false;
-  if (maxRemaining - minRemaining > MAX_RANGE_WIDTH_MIN) {
+  if (maxRemaining - minRemaining > maxAllowedWidth) {
     const center = (minRemaining + maxRemaining) / 2;
-    minRemaining = Math.max(0, center - MAX_RANGE_WIDTH_MIN / 2);
-    maxRemaining = center + MAX_RANGE_WIDTH_MIN / 2;
+    minRemaining = Math.max(0, center - maxAllowedWidth / 2);
+    maxRemaining = center + maxAllowedWidth / 2;
     rangeWasClamped = true;
   }
 
@@ -687,7 +793,8 @@ function buildNextTransition(
     maxFromNowMin: Math.round(maxRemaining),
     rangeLabel: `${fmtYemen(earliest)} → ${fmtYemen(latest)}`,
     waitLabel,
-    rangeWasClamped, // true if the 90-min cap had to compress an otherwise wider range — signals reduced trust even though the displayed window looks tight
+    rangeWasClamped, // true if the MAD-tiered max-width cap compressed the range. Display-only — no longer auto-demotes confidence; see Confidence Consistency Model.
+    realityClamped, // true if Reality Duration Constraints had to override an unrealistic corrected duration
   };
 }
 
@@ -783,32 +890,102 @@ async function loadHistory(
   supabase: ReturnType<typeof createClient>,
   now: Date,
 ): Promise<HistoryRow[]> {
+  // Real duplicate-logging bug discovered in production data (2026-06-20
+  // export): the CLIENT app re-writes the same resolved prediction outcome
+  // to this table every time it polls/refreshes, instead of writing it
+  // once. Confirmed example: one real event (predicted 08:40, actual 07:40,
+  // 60min error) was logged 107 separate times with identical
+  // predicted_time/actual_time/error_minutes, differing only in created_at.
+  // Across the 7-day export, 547 of 587 rows (93%) were these duplicates,
+  // dragging the reported accuracy down to 62% when the true de-duplicated
+  // figure was ~72%. This is a CLIENT-SIDE bug — fix the actual write path
+  // there too — but this reader defends against it either way so drift/bias
+  // correction can't be skewed by duplicate-weighted history even before
+  // the client is fixed.
+  //
+  // Because duplicates can dominate a small `.limit()` window (in the worst
+  // case, the most recent ~100+ rows were ALL the same single event), the
+  // initial fetch is widened well past what DRIFT/BIAS_HISTORY_SIZE need,
+  // dedup happens first, then the deduped list is what downstream slicing
+  // operates on.
+  const FETCH_MULTIPLIER = 8; // generous headroom against duplicate runs
+  const fetchLimit = Math.max(DRIFT_HISTORY_SIZE, BIAS_HISTORY_SIZE) * FETCH_MULTIPLIER;
+
+  function dedupeByPredictedActualPair(rows: HistoryRow[]): HistoryRow[] {
+    const seen = new Set<string>();
+    const result: HistoryRow[] = [];
+    for (const row of rows) {
+      const key = `${row.predictedTimeIso}|${row.actualTimeIso}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(row);
+    }
+    return result;
+  }
+
   if (HISTORY_SOURCE === "accuracy_log") {
-    // Read from the existing log table — same shape as your accuracy export:
-    // predicted_state, predicted_time, actual_time, error_minutes.
-    // Duration-specific fields (predicted_duration_min/actual_duration_min)
-    // are optional columns; if absent, bias correction simply sees 0 samples
-    // and falls back to ratio=1 (no-op) until you add them.
+    // CORRECTED column names — confirmed against the real AccuracyLog
+    // interface in accuracy_tsx.txt: predicted_event_time / actual_event_time,
+    // not predicted_time / actual_time. duration_type /
+    // predicted_duration_min / actual_duration_min do NOT exist on this
+    // table at all (confirmed: zero references in the real screen source) —
+    // selecting them would make PostgREST error the whole query out,
+    // meaning loadHistory() would have been returning [] unconditionally.
+    // Bias correction (Module/Phase 4) has no data source until those
+    // columns are added to the table; it intentionally stays a no-op
+    // (ratio=1) rather than guessing at columns that don't exist.
     const { data, error } = await supabase
       .from(ACCURACY_LOG_TABLE)
-      .select("predicted_state, predicted_time, actual_time, error_minutes, predicted_duration_min, actual_duration_min, duration_type")
-      .order("actual_time", { ascending: false })
-      .limit(Math.max(DRIFT_HISTORY_SIZE, BIAS_HISTORY_SIZE) * 2); // headroom before filtering
+      .select("predicted_state, predicted_event_time, actual_event_time, error_minutes")
+      .order("actual_event_time", { ascending: false })
+      .limit(fetchLimit);
 
     if (error || !data) return [];
 
-    return data.map((row: any) => ({
-      predictedType: row.predicted_state,
-      predictedTimeIso: row.predicted_time,
-      actualTimeIso: row.actual_time,
-      errorMinutes: row.error_minutes != null
-        ? (new Date(row.actual_time).getTime() > new Date(row.predicted_time).getTime() ? 1 : -1) * Math.abs(row.error_minutes)
-        : (new Date(row.actual_time).getTime() - new Date(row.predicted_time).getTime()) / 60000,
-      ageHours: Math.max(0, (now.getTime() - new Date(row.actual_time).getTime()) / 3_600_000),
-      durationType: row.duration_type ?? null,
-      predictedDurationMin: row.predicted_duration_min ?? null,
-      actualDurationMin: row.actual_duration_min ?? null,
-    }));
+    // BUG FIX: the previous version derived the error's SIGN by comparing
+    // actual vs predicted timestamps as JS Dates. If either is null,
+    // malformed, or otherwise unparseable, `new Date(x).getTime()` returns
+    // NaN, and ANY comparison against NaN (including `>`) silently
+    // evaluates to false — which means the sign would default to -1
+    // ("early") for every such row, regardless of what actually happened.
+    // Rows with unparseable timestamps are now skipped entirely rather
+    // than silently mis-signed.
+    const rows: HistoryRow[] = [];
+    for (const row of data as any[]) {
+      if (row.predicted_event_time == null || row.actual_event_time == null) continue;
+
+      const actualMs = new Date(row.actual_event_time).getTime();
+      const predictedMs = new Date(row.predicted_event_time).getTime();
+      if (!Number.isFinite(actualMs) || !Number.isFinite(predictedMs)) continue; // unparseable — skip, don't guess
+
+      const signedErrorFromTimestamps = (actualMs - predictedMs) / 60000;
+
+      // If error_minutes is present, trust its MAGNITUDE (it's the
+      // authoritative accuracy-log figure) but always derive the SIGN from
+      // the timestamps directly above, now that we've confirmed both
+      // parsed successfully — never from a fallback default.
+      const errorMinutes = row.error_minutes != null
+        ? Math.sign(signedErrorFromTimestamps || 1) * Math.abs(row.error_minutes)
+        : signedErrorFromTimestamps;
+
+      rows.push({
+        predictedType: row.predicted_state,
+        predictedTimeIso: row.predicted_event_time,
+        actualTimeIso: row.actual_event_time,
+        errorMinutes,
+        ageHours: Math.max(0, (now.getTime() - actualMs) / 3_600_000),
+        durationType: null,        // column does not exist on this table
+        predictedDurationMin: null, // column does not exist on this table
+        actualDurationMin: null,    // column does not exist on this table
+      });
+    }
+    // DEDUP FIX: collapse repeated re-logs of the same (predicted_event_time,
+    // actual_event_time) pair down to one row. Rows arrive newest-`created_at`
+    // first is NOT guaranteed by this query (it's ordered by actual_event_time),
+    // but since every duplicate in the confirmed bug has identical
+    // error_minutes regardless of which copy is kept, which copy survives
+    // doesn't affect the resulting statistics.
+    return dedupeByPredictedActualPair(rows);
   }
 
   // "dedicated" — new purpose-built table.
@@ -816,59 +993,69 @@ async function loadHistory(
     .from(DEDICATED_HISTORY_TABLE)
     .select("predicted_type, predicted_time, actual_time, error_minutes, duration_type, predicted_duration_min, actual_duration_min")
     .order("actual_time", { ascending: false })
-    .limit(Math.max(DRIFT_HISTORY_SIZE, BIAS_HISTORY_SIZE) * 2);
+    .limit(fetchLimit);
 
   if (error || !data) return [];
 
-  return data.map((row: any) => ({
-    predictedType: row.predicted_type,
-    predictedTimeIso: row.predicted_time,
-    actualTimeIso: row.actual_time,
-    errorMinutes: row.error_minutes,
-    ageHours: Math.max(0, (now.getTime() - new Date(row.actual_time).getTime()) / 3_600_000),
-    durationType: row.duration_type ?? null,
-    predictedDurationMin: row.predicted_duration_min ?? null,
-    actualDurationMin: row.actual_duration_min ?? null,
-  }));
+  const dedicatedRows: HistoryRow[] = data
+    .filter((row: any) => row.predicted_time != null && row.actual_time != null && Number.isFinite(new Date(row.actual_time).getTime()))
+    .map((row: any) => ({
+      predictedType: row.predicted_type,
+      predictedTimeIso: row.predicted_time,
+      actualTimeIso: row.actual_time,
+      errorMinutes: row.error_minutes,
+      ageHours: Math.max(0, (now.getTime() - new Date(row.actual_time).getTime()) / 3_600_000),
+      durationType: row.duration_type ?? null,
+      predictedDurationMin: row.predicted_duration_min ?? null,
+      actualDurationMin: row.actual_duration_min ?? null,
+    }));
+  return dedupeByPredictedActualPair(dedicatedRows);
 }
 
 // Writes this cycle's completed-prediction outcome back to history once we
 // can observe what actually happened (called from the polling/event-ingest
 // function, NOT from analyze-patterns itself — analyze-patterns only reads).
 // Included here for reference / so the schema lives next to the reader.
+//
+// CORRECTED against the real prediction_accuracy_logs schema (confirmed via
+// accuracy_tsx.txt's AccuracyLog interface and runBackfill()'s insert
+// shape): predicted_event_time / actual_event_time / actual_state, not
+// predicted_time / actual_time. accuracy_score is also a real column the
+// existing app computes and relies on (see computeStats in the Accuracy
+// Center screen) — it's included here so this reference writer doesn't
+// produce rows the existing dashboard can't score. duration_type /
+// predicted_duration_min / actual_duration_min do not exist on this table;
+// removed rather than writing columns that don't exist.
 async function recordCompletedPrediction(
   supabase: ReturnType<typeof createClient>,
   row: {
     predictedType: "UTILITY_ON" | "UTILITY_OFF";
     predictedTimeIso: string;
     actualTimeIso: string;
-    durationType?: "OFF" | "ON";
-    predictedDurationMin?: number;
-    actualDurationMin?: number;
   },
 ) {
   const errorMinutes = (new Date(row.actualTimeIso).getTime() - new Date(row.predictedTimeIso).getTime()) / 60000;
+  const MAX_ALLOWED_ERROR_MIN = 150; // matches runBackfill()'s scoring scale, for consistency with existing dashboard math
+  const accuracyScore = Math.max(0, 100 - (Math.abs(errorMinutes) / MAX_ALLOWED_ERROR_MIN) * 100);
 
   if (HISTORY_SOURCE === "accuracy_log") {
     return supabase.from(ACCURACY_LOG_TABLE).insert({
       predicted_state: row.predictedType,
-      predicted_time: row.predictedTimeIso,
-      actual_time: row.actualTimeIso,
-      error_minutes: Math.abs(errorMinutes),
-      duration_type: row.durationType ?? null,
-      predicted_duration_min: row.predictedDurationMin ?? null,
-      actual_duration_min: row.actualDurationMin ?? null,
+      actual_state: row.predictedType, // matches runBackfill()'s convention of mirroring the observed event type
+      predicted_event_time: row.predictedTimeIso,
+      actual_event_time: row.actualTimeIso,
+      error_minutes: Math.round(Math.abs(errorMinutes) * 100) / 100,
+      accuracy_score: Math.round(accuracyScore * 100) / 100,
     });
   }
 
+  // "dedicated" branch keeps the original richer schema design (this table
+  // doesn't exist yet — build it with whatever columns you actually want).
   return supabase.from(DEDICATED_HISTORY_TABLE).insert({
     predicted_type: row.predictedType,
     predicted_time: row.predictedTimeIso,
     actual_time: row.actualTimeIso,
     error_minutes: errorMinutes,
-    duration_type: row.durationType ?? null,
-    predicted_duration_min: row.predictedDurationMin ?? null,
-    actual_duration_min: row.actualDurationMin ?? null,
   });
 }
 
@@ -935,11 +1122,28 @@ Deno.serve(async (req) => {
   const rawStats = computeWeightedDistStats(cycles);
   const stats = blendWithColdStart(rawStats); // Phase 8 — smooth trust transition
 
-  // ── Crisis detection + recentering (Phase 5) ───────────────────────────────
-  const crisis = detectAndRecenterCrisis(cycles);
-
   // ── History for drift/bias engines (Phase 13, behind HISTORY_SOURCE flag) ──
+  // Loaded before crisis detection now, since Module 4's consecutive-error
+  // trigger needs the prediction error log.
   const history = await loadHistory(supabase, now); // already sorted newest-first
+
+  // ── Crisis detection + recentering (Phase 5 + Module 4 addition) ──────────
+  // Two independent trigger paths, either of which can activate crisis mode:
+  //   1. Duration-percentage trigger (existing): recent OFF/ON durations
+  //      deviated >20% from baseline.
+  //   2. Consecutive-error trigger (new): last 3 completed predictions were
+  //      all off in the same direction, even if no single one crossed 20%.
+  // If both fire, the one with the larger magnitude shift wins, since that
+  // represents the more urgent correction.
+  const durationCrisis = detectAndRecenterCrisis(cycles);
+  const errorCrisis = detectConsecutiveErrorCrisis(history);
+  const crisis = !durationCrisis.active && !errorCrisis.active
+    ? durationCrisis // both inactive — shape doesn't matter, return either
+    : !errorCrisis.active
+    ? durationCrisis
+    : !durationCrisis.active
+    ? errorCrisis
+    : (Math.abs(durationCrisis.offShift) >= Math.abs(errorCrisis.offShift) ? durationCrisis : errorCrisis);
 
   // ── Bias correction (Phase 4) — applied before drift, per spec ────────────
   const biasOff = computeBiasRatio(history, "OFF");
@@ -993,13 +1197,25 @@ Deno.serve(async (req) => {
   confidenceRaw = Math.min(0.97, confidenceRaw);
   if (isUnstable) confidenceRaw = Math.min(confidenceRaw, 0.30);
 
-  // BUG FIX (range-width vs. confidence mismatch): if the 90-minute range
-  // cap had to compress what would otherwise have been a much wider window,
-  // the displayed range looks deceptively tight unless confidence reflects
-  // that compression. Without this, a user could see "9:00–10:30am, High
-  // confidence" when the underlying uncertainty was actually enormous.
-  if (nextTransition?.rangeWasClamped) {
-    confidenceRaw = Math.min(confidenceRaw, 0.35);
+  // CONFIDENCE CONSISTENCY MODEL (APPPE V4.1 — Module 5).
+  // BUG FIX: the prior version capped confidence at 35% any time the
+  // displayed range had to be clamped, with no regard for WHY it was
+  // clamped. Confirmed in real usage: Pattern Stability 76%, Volatility EMA
+  // 0 (zero timing drift), Data Quality 80% — every underlying signal said
+  // "trust this" — yet confidence still showed 35% purely because the raw
+  // percentile spread exceeded the cap width. That conflated "the math
+  // produced a wide spread" with "this prediction is unreliable," which are
+  // not the same thing. A range-width clamp is no longer treated as an
+  // automatic confidence penalty.
+  //
+  // Instead: if stability AND data quality both clear a high bar, apply a
+  // floor so a good dataset can't be dragged down by a single weak or
+  // momentarily-clamped signal — UNLESS crisis mode is active, since active
+  // schedule upheaval should always suppress confidence regardless of how
+  // good the pre-crisis data looked.
+  const isHighQualityData = stabilityRaw > 0.70 && dataQuantityFactor > 0.70;
+  if (isHighQualityData && !crisis.active) {
+    confidenceRaw = Math.max(confidenceRaw, 0.55);
   }
 
   const confidence = Math.round(confidenceRaw * 100);
@@ -1088,7 +1304,15 @@ Deno.serve(async (req) => {
   }
 
   if (nextTransition?.rangeWasClamped) {
-    reasoning.push("⚠️ Underlying uncertainty was very high — the displayed window was compressed to stay usable, but treat this prediction as Low confidence rather than precise.");
+    if (isHighQualityData && !crisis.active) {
+      reasoning.push("Reality Filter applied: the raw statistical spread was wider than this pattern's typical behavior, so the window was tightened to match recent real-world consistency.");
+    } else {
+      reasoning.push("⚠️ Underlying uncertainty was high — the displayed window was compressed to stay usable, but treat this prediction loosely rather than precisely.");
+    }
+  }
+
+  if (nextTransition?.realityClamped) {
+    reasoning.push("Reality Duration Constraints adjusted the prediction — an upstream correction pushed the estimate outside what recent real cycles support, so it was pulled back to a physically plausible range.");
   }
 
   // ── Learning mode (kept for legacy UI, now driven by the weaker of the
@@ -1131,11 +1355,20 @@ Deno.serve(async (req) => {
     dataWindowHours: DATA_WINDOW_HOURS,
     computedAt: now.toISOString(),
 
-    // Phase 14 — new v4 fields, additive under apppe
+    // Phase 14 — new v4/v4.1 fields, additive under apppe
     apppe: {
-      version: "4.0",
+      version: "4.1",
       driftOffset: driftOffset.offsetMin,
       driftSampleCount: driftOffset.sampleCount,
+      // Diagnostic: the actual signed error values (minutes, actual-predicted)
+      // drift correction is computing from. If these all cluster in one
+      // direction (e.g. all around +30 to +60), that confirms a real,
+      // correctable systematic offset — and the median above should be
+      // moving to compensate. If this list looks wrong (e.g. all values
+      // suspiciously identical, or sign doesn't match what you observe in
+      // reality), that points to a data-quality issue in the source table
+      // rather than the correction math itself.
+      driftSampleErrors: history.slice(0, DRIFT_HISTORY_SIZE).map((h) => Math.round(h.errorMinutes)),
       biasRatio: Math.round(biasRatio.ratio * 100) / 100,
       biasSampleCount: biasRatio.sampleCount,
       volatilityEMA: Math.round(volatilityEMA * 10) / 10,
@@ -1158,6 +1391,7 @@ Deno.serve(async (req) => {
       },
       historySource: HISTORY_SOURCE,
       rangeWasClamped: nextTransition?.rangeWasClamped ?? false,
+      realityClamped: nextTransition?.realityClamped ?? false,
     },
   };
 
