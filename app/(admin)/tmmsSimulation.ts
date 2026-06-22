@@ -1,628 +1,615 @@
 /**
- * TMMS V2 Simulation Layer
- * ════════════════════════════════════════════════════════════════════════════
- * Built ON TOP of tmmsEngine.ts — never reimplements TMMS logic. Every report,
- * confirmation, and offset calculation in this file is executed by calling the
- * real engine functions (applyOffsetToPrediction, which internally calls
- * computeCommunityTransition / computeATCState / etc). This layer only
- * supplies: schedule construction helpers, a controllable "world" clock,
- * Growatt simulation, and the 15 predefined scenarios with automatic
- * verification.
- * ════════════════════════════════════════════════════════════════════════════
+ * tmmsSimulation.ts — Deterministic TMMS V2 Debug Simulator
+ *
+ * Provides an injectable, clock-free simulation world that drives
+ * TMMSDebugSimulator.tsx without touching the real Supabase backend.
+ *
+ * All "now" references use world.simulatedNowMs so scenarios are
+ * fully reproducible regardless of wall-clock time.
  */
+
 import {
   applyOffsetToPrediction,
-  fmtYemenTime,
-  getZoneFromIso,
-  durationLabelFromMin,
   type Prediction,
-  type ScheduleSlot,
   type ResyncPoint,
+  type ScheduleSlot,
   type UserPrediction,
+  type CommunityTransitionResult,
   type TransitionMode,
-  type DecisionStep,
+  fmtYemenTime,
 } from './tmmsEngine';
 
-// ── Schedule template (what Section 1's Schedule Builder edits) ───────────────
+// ── Public types ──────────────────────────────────────────────────────────────
 
 export interface ScheduleEntryTemplate {
-  id: string;
   state: 'ON' | 'OFF';
   durationMin: number;
 }
 
-export function buildScheduleSlots(
-  template: ScheduleEntryTemplate[],
-  anchorIso: string,
-  horizonMs: number,
-): ScheduleSlot[] {
-  if (template.length === 0) return [];
+export interface SimEvent {
+  at: string; // ISO
+  kind: 'GROWATT_TRANSITION' | 'REPORT' | 'CONFIRM' | 'AUTO_TRANSITION' | 'SCENARIO_NOTE';
+  detail: string;
+}
+
+export interface SimWorld {
+  /** Simulated wall-clock time in milliseconds */
+  simulatedNowMs: number;
+  /** Current Growatt (sensor) state */
+  growattState: 'ON' | 'OFF';
+  /** When Growatt last transitioned (ISO) */
+  growattLastTransitionAt: string | null;
+  /** User offset in minutes */
+  offsetMinutes: number;
+  /** TMMS transition mode */
+  transitionMode: TransitionMode;
+  /** Active resync point (community report/confirm) */
+  resyncPoint: ResyncPoint | null;
+  /** Frozen community offset (Q2-A: compute once) */
+  frozenCommunityOffset: number | null;
+  /** Schedule template used to generate prediction slots */
+  scheduleTemplate: ScheduleEntryTemplate[];
+  /** Event log for the current scenario */
+  events: SimEvent[];
+  /** Result of the last applyOffsetToPrediction call */
+  lastResult: UserPrediction | null;
+  /** Confidence score derived from reliability logic */
+  confidenceScore: number;
+}
+
+export interface ScenarioResult {
+  pass: boolean;
+  expected: string;
+  actual: string;
+  world: SimWorld;
+}
+
+// ── World factory ─────────────────────────────────────────────────────────────
+
+/** Build a base prediction from the world's schedule template and simulated time */
+function buildPrediction(world: SimWorld): Prediction {
+  const nowMs = world.simulatedNowMs;
+
+  // Generate slots starting from nowMs - 12h
+  const baseMs = nowMs - 12 * 60 * 60 * 1000;
   const slots: ScheduleSlot[] = [];
-  let t = new Date(anchorIso).getTime();
-  let idx = 0;
-  while (t < horizonMs && slots.length < 80) {
-    const entry = template[idx % template.length];
-    const startIso = new Date(t).toISOString();
-    const endMs = t + entry.durationMin * 60_000;
+  let cursor = baseMs;
+
+  const template = world.scheduleTemplate.length > 0
+    ? world.scheduleTemplate
+    : [{ state: 'OFF' as const, durationMin: 360 }, { state: 'ON' as const, durationMin: 120 }];
+
+  let tIdx = 0;
+  while (cursor < nowMs + 48 * 60 * 60 * 1000 && slots.length < 48) {
+    const entry = template[tIdx % template.length];
+    const startIso = new Date(cursor).toISOString();
+    const endMs = cursor + entry.durationMin * 60_000;
     const endIso = new Date(endMs).toISOString();
+
     slots.push({
       state: entry.state,
       startIso,
       endIso,
       startFormatted: fmtYemenTime(startIso),
       endFormatted: fmtYemenTime(endIso),
-      durationLabel: durationLabelFromMin(entry.durationMin),
-      zone: getZoneFromIso(startIso),
-      isEstimated: false,
+      durationLabel: `${entry.durationMin}د`,
+      zone: 'Midday',
+      isEstimated: cursor > nowMs,
     });
-    t = endMs;
-    idx++;
+
+    cursor = endMs;
+    tIdx++;
   }
-  return slots;
-}
 
-export const DEFAULT_TEMPLATE: ScheduleEntryTemplate[] = [
-  { id: 't1', state: 'ON',  durationMin: 120 },
-  { id: 't2', state: 'OFF', durationMin: 360 },
-  { id: 't3', state: 'ON',  durationMin: 180 },
-  { id: 't4', state: 'OFF', durationMin: 300 },
-];
+  // Determine current state from slots
+  let currentState: 'ON' | 'OFF' = world.growattState;
+  let lastTransitionAt: string | null = world.growattLastTransitionAt;
 
-// ── World state ─────────────────────────────────────────────────────────────
+  const avgOffMin = template.find(t => t.state === 'OFF')?.durationMin ?? 360;
+  const avgOnMin  = template.find(t => t.state === 'ON')?.durationMin ?? 120;
 
-export interface SimEvent {
-  id: string;
-  simTimeIso: string;
-  action: string;
-  decision: string | null;
-  result: string | null;
-  kind: 'info' | 'report' | 'confirm' | 'growatt' | 'offset' | 'zone' | 'error' | 'time';
-}
-
-export interface SimWorld {
-  scheduleTemplate: ScheduleEntryTemplate[];
-  scheduleAnchorIso: string;
-  simulatedNowMs: number;
-  growattCurrentState: 'ON' | 'OFF';
-  growattLastTransitionAt: string;
-  offsetMinutes: number;
-  /** Frozen Rule 4/5 offset for the active resync, if computed (Q2-A) */
-  frozenCommunityOffsetMinutes: number | null;
-  resyncPoint: ResyncPoint | null;
-  transitionMode: TransitionMode;
-  eventLog: SimEvent[];
-  lastResult: UserPrediction | null;
-  lastDecisionTrace: DecisionStep[];
-}
-
-let eventIdCounter = 0;
-function makeEvent(world: SimWorld, kind: SimEvent['kind'], action: string, decision: string | null = null, result: string | null = null): SimEvent {
-  eventIdCounter += 1;
   return {
-    id: `evt_${eventIdCounter}_${Date.now()}`,
-    simTimeIso: new Date(world.simulatedNowMs).toISOString(),
-    action,
-    decision,
-    result,
-    kind,
-  };
-}
-
-export function createInitialWorld(nowMs: number = Date.now()): SimWorld {
-  const anchor = new Date(nowMs - 3 * 3600 * 1000).toISOString(); // schedule started 3h ago
-  const base: SimWorld = {
-    scheduleTemplate: DEFAULT_TEMPLATE,
-    scheduleAnchorIso: anchor,
-    simulatedNowMs: nowMs,
-    growattCurrentState: 'ON',
-    growattLastTransitionAt: anchor,
-    offsetMinutes: 0,
-    frozenCommunityOffsetMinutes: null,
-    resyncPoint: null,
-    transitionMode: 'AUTO',
-    eventLog: [makeEvent({ simulatedNowMs: nowMs } as SimWorld, 'info', 'Simulator initialized', null, 'Default schedule: ON 2h → OFF 6h → ON 3h → OFF 5h')],
-    lastResult: null,
-    lastDecisionTrace: [],
-  };
-  // Run the real engine once immediately so every panel has data to show on
-  // first mount, instead of staying blank until the first user action.
-  return refreshResult(base);
-}
-
-// ── Build the Prediction object the engine expects, from world state ─────────
-function worldToPrediction(world: SimWorld): Prediction {
-  const horizonMs = world.simulatedNowMs + 48 * 3600 * 1000;
-  const daySchedule = buildScheduleSlots(world.scheduleTemplate, world.scheduleAnchorIso, horizonMs);
-  return {
-    currentState: world.growattCurrentState,
-    currentStateDurationMin: 0,
-    currentStateDurationLabel: '',
+    currentState: world.growattState,
+    currentStateDurationMin: lastTransitionAt
+      ? Math.round((nowMs - new Date(lastTransitionAt).getTime()) / 60_000)
+      : 60,
+    currentStateDurationLabel: '—',
     lastTransitionAt: world.growattLastTransitionAt,
     inverterOffline: false,
     nextTransition: null,
-    expectedOffRange: null,
-    expectedOnRange: null,
-    daySchedule,
-    confidence: 1,
-    confidenceLabel: 'High',
-    isUnstable: false,
-    stabilityScore: 1,
-    stabilityLabel: 'Stable',
-    dayPattern: null,
+    expectedOffRange: { minMin: avgOffMin * 0.8, maxMin: avgOffMin * 1.2, label: `~${avgOffMin}د` },
+    expectedOnRange:  { minMin: avgOnMin  * 0.8, maxMin: avgOnMin  * 1.2, label: `~${avgOnMin}د` },
+    daySchedule: slots,
+    confidence: world.confidenceScore,
+    confidenceLabel: world.confidenceScore >= 85 ? 'عالية' : world.confidenceScore >= 65 ? 'متوسطة' : 'منخفضة',
+    isUnstable: world.confidenceScore < 40,
+    stabilityScore: world.confidenceScore,
+    stabilityLabel: 'مستقر',
+    dayPattern: {
+      cycles: 8,
+      avgOffMin,
+      stdDevOffMin: 20,
+      avgOnMin,
+      stdDevOnMin: 15,
+      minOffMin: avgOffMin * 0.6,
+      maxOffMin: avgOffMin * 1.4,
+      minOnMin:  avgOnMin  * 0.6,
+      maxOnMin:  avgOnMin  * 1.4,
+    },
     nightPattern: null,
-    allPattern: null,
-    cyclesAnalyzed: 0,
-    dayCyclesAnalyzed: 0,
-    nightCyclesAnalyzed: 0,
+    allPattern: {
+      cycles: 12,
+      avgOffMin,
+      stdDevOffMin: 25,
+      avgOnMin,
+      stdDevOnMin: 18,
+      minOffMin: avgOffMin * 0.5,
+      maxOffMin: avgOffMin * 1.5,
+      minOnMin:  avgOnMin  * 0.5,
+      maxOnMin:  avgOnMin  * 1.5,
+    },
+    cyclesAnalyzed: 12,
+    dayCyclesAnalyzed: 8,
+    nightCyclesAnalyzed: 4,
     currentPeriod: 'day',
-    reasoning: [],
-    learningMode: 'prior_only',
-    dataWindowHours: 48,
-    computedAt: new Date(world.simulatedNowMs).toISOString(),
+    reasoning: ['Simulation mode — deterministic schedule'],
+    learningMode: 'learned',
+    dataWindowHours: 36,
+    computedAt: new Date(nowMs).toISOString(),
+    apppe: {
+      version: '4.0',
+      crisisActive: false,
+      crisisReason: null,
+    },
   };
 }
 
-/** Run the REAL engine pipeline against the current world state. Pure — does not mutate world. */
-export function runEngine(world: SimWorld): UserPrediction {
-  const prediction = worldToPrediction(world);
-  return applyOffsetToPrediction(
+/** Derive confidence score from resync point reliability */
+function deriveConfidence(world: SimWorld): number {
+  if (!world.resyncPoint) return 75;
+  const rel = world.resyncPoint.reporterReliability ?? 50;
+  return Math.min(100, Math.round(50 + rel * 0.5));
+}
+
+export function createInitialWorld(): SimWorld {
+  const nowMs = Date.now();
+  // Default: Growatt is OFF, last transitioned 2h ago
+  const lastTransMs = nowMs - 2 * 60 * 60 * 1000;
+
+  return {
+    simulatedNowMs: nowMs,
+    growattState: 'OFF',
+    growattLastTransitionAt: new Date(lastTransMs).toISOString(),
+    offsetMinutes: 0,
+    transitionMode: 'AUTO',
+    resyncPoint: null,
+    frozenCommunityOffset: null,
+    scheduleTemplate: [
+      { state: 'OFF', durationMin: 360 },
+      { state: 'ON',  durationMin: 120 },
+    ],
+    events: [],
+    lastResult: null,
+    confidenceScore: 75,
+  };
+}
+
+// ── Mutators (all return a NEW world — immutable pattern) ─────────────────────
+
+function runPipeline(world: SimWorld): SimWorld {
+  const prediction = buildPrediction(world);
+  const newWorld = { ...world, confidenceScore: deriveConfidence(world) };
+
+  let frozenOffset = world.frozenCommunityOffset;
+
+  const result = applyOffsetToPrediction(
     prediction,
     world.offsetMinutes,
     world.resyncPoint,
-    null,
+    world.resyncPoint ? {
+      reporterName: world.resyncPoint.reporterName ?? null,
+      reporterReliability: world.resyncPoint.reporterReliability ?? null,
+      syncedAtIso: world.resyncPoint.syncedAtIso,
+      syncedState: world.resyncPoint.syncedState,
+    } : null,
     world.transitionMode,
     null,
-    world.frozenCommunityOffsetMinutes,
-    undefined,
+    frozenOffset,
+    (offsetMin) => {
+      frozenOffset = offsetMin;
+    },
     world.simulatedNowMs,
-    undefined,
   );
-}
 
-/** Re-run the engine and cache the result + decision trace on the world (called after every action) */
-function refreshResult(world: SimWorld): SimWorld {
-  const result = runEngine(world);
   return {
-    ...world,
+    ...newWorld,
+    frozenCommunityOffset: frozenOffset,
     lastResult: result,
-    lastDecisionTrace: result.communityTransitionMeta?.decisionTrace ?? world.lastDecisionTrace,
   };
 }
 
-// ── Actions (Sections 2, 4, 5, 11) ─────────────────────────────────────────────
-
-export function advanceTime(world: SimWorld, minutes: number): SimWorld {
-  const newNowMs = world.simulatedNowMs + minutes * 60_000;
-  const next: SimWorld = { ...world, simulatedNowMs: newNowMs };
-  next.eventLog = [...world.eventLog, makeEvent(next, 'time', `Advanced time +${minutes}m`, null, fmtYemenTime(new Date(newNowMs).toISOString()))];
-  return refreshResult(next);
+export function advanceTime(world: SimWorld, deltaMin: number): SimWorld {
+  const newMs = world.simulatedNowMs + deltaMin * 60_000;
+  const event: SimEvent = {
+    at: new Date(newMs).toISOString(),
+    kind: 'SCENARIO_NOTE',
+    detail: `⏩ Advance +${deltaMin}m → ${fmtYemenTime(new Date(newMs).toISOString())}`,
+  };
+  return runPipeline({ ...world, simulatedNowMs: newMs, events: [...world.events, event] });
 }
 
-export function setSimulatedNow(world: SimWorld, nowMs: number): SimWorld {
-  const next: SimWorld = { ...world, simulatedNowMs: nowMs };
-  next.eventLog = [...world.eventLog, makeEvent(next, 'time', 'Time set directly', null, fmtYemenTime(new Date(nowMs).toISOString()))];
-  return refreshResult(next);
+export function setSimulatedNow(world: SimWorld, ms: number): SimWorld {
+  const event: SimEvent = {
+    at: new Date(ms).toISOString(),
+    kind: 'SCENARIO_NOTE',
+    detail: `🕐 Set now → ${fmtYemenTime(new Date(ms).toISOString())}`,
+  };
+  return runPipeline({ ...world, simulatedNowMs: ms, events: [...world.events, event] });
 }
 
 export function forceGrowattState(world: SimWorld, state: 'ON' | 'OFF'): SimWorld {
-  if (state === world.growattCurrentState) return world;
-  const next: SimWorld = {
-    ...world,
-    growattCurrentState: state,
-    growattLastTransitionAt: new Date(world.simulatedNowMs).toISOString(),
+  const transAt = new Date(world.simulatedNowMs).toISOString();
+  const event: SimEvent = {
+    at: transAt,
+    kind: 'GROWATT_TRANSITION',
+    detail: `⚡ Growatt → ${state}`,
   };
-  next.eventLog = [...world.eventLog, makeEvent(next, 'growatt', `Growatt forced ${state}`, null, `at ${fmtYemenTime(next.growattLastTransitionAt)}`)];
-  return refreshResult(next);
+  return runPipeline({
+    ...world,
+    growattState: state,
+    growattLastTransitionAt: transAt,
+    events: [...world.events, event],
+  });
 }
 
-export function resetWorld(nowMs: number = Date.now()): SimWorld {
-  return createInitialWorld(nowMs);
+export function resetWorld(world: SimWorld): SimWorld {
+  return runPipeline({
+    ...createInitialWorld(),
+    scheduleTemplate: world.scheduleTemplate,
+    offsetMinutes: world.offsetMinutes,
+    transitionMode: world.transitionMode,
+  });
 }
 
 export function setTransitionMode(world: SimWorld, mode: TransitionMode): SimWorld {
-  const next: SimWorld = { ...world, transitionMode: mode };
-  next.eventLog = [...world.eventLog, makeEvent(next, 'info', `Mode switched to ${mode}`)];
-  return refreshResult(next);
+  const event: SimEvent = {
+    at: new Date(world.simulatedNowMs).toISOString(),
+    kind: 'SCENARIO_NOTE',
+    detail: `🔄 Mode → ${mode}`,
+  };
+  return runPipeline({ ...world, transitionMode: mode, events: [...world.events, event] });
 }
 
 export function setSchedule(world: SimWorld, template: ScheduleEntryTemplate[]): SimWorld {
-  const next: SimWorld = { ...world, scheduleTemplate: template };
-  next.eventLog = [...world.eventLog, makeEvent(next, 'info', 'Schedule updated', null, template.map(t => `${t.state} ${t.durationMin}m`).join(' → '))];
-  return refreshResult(next);
+  const event: SimEvent = {
+    at: new Date(world.simulatedNowMs).toISOString(),
+    kind: 'SCENARIO_NOTE',
+    detail: `📅 Schedule updated (${template.map(t => `${t.state}:${t.durationMin}m`).join(', ')})`,
+  };
+  return runPipeline({ ...world, scheduleTemplate: template, events: [...world.events, event] });
 }
 
-/**
- * Section 5: Report / Confirm. Builds a ResyncPoint at `reportAtMs` (defaults
- * to "now") and runs it through the REAL engine. If the engine produces a
- * fresh Rule 4/5 offset (isFreshOffsetComputation), it is frozen into the
- * world immediately (Q3-A: persist immediately; Q2-A: never recompute).
- *
- * IMPORTANT: `world.simulatedNowMs` must already be at or after `reportAtMs`
- * before calling this — computeCommunityTransition rejects reports timestamped
- * in the future relative to "now". Call setSimulatedNow first if needed.
- */
 export function submitReportOrConfirm(
   world: SimWorld,
   state: 'ON' | 'OFF',
-  kind: 'report' | 'confirm',
-  reportAtMs?: number,
-  reporterName: string = kind === 'report' ? 'Simulated User' : 'Simulated Confirmer',
+  type: 'REPORT' | 'CONFIRM',
+  reliability: number = 80,
 ): SimWorld {
-  const syncedAtIso = new Date(reportAtMs ?? world.simulatedNowMs).toISOString();
+  const syncedAtIso = new Date(world.simulatedNowMs).toISOString();
   const resyncPoint: ResyncPoint = {
     syncedState: state,
     syncedAtIso,
-    appliedAtIso: new Date(world.simulatedNowMs).toISOString(),
-    reporterName,
-    reporterReliability: 90,
+    appliedAtIso: syncedAtIso,
+    reporterName: 'SimUser',
+    reporterReliability: reliability,
   };
-
-  let next: SimWorld = { ...world, resyncPoint, frozenCommunityOffsetMinutes: null };
-  const result = runEngine(next); // FRESH computation — full detail (referenceKind etc.)
-  const meta = result.communityTransitionMeta;
-
-  const log: SimEvent[] = [
-    ...world.eventLog,
-    makeEvent(next, kind, `${kind === 'report' ? 'Report' : 'Confirmation'} ${state} received`, null, `synced at ${fmtYemenTime(syncedAtIso)}`),
-  ];
-
-  if (meta) {
-    for (const step of meta.decisionTrace) {
-      log.push(makeEvent(next, step.label.includes('Offset') ? 'offset' : 'info', step.label, null, step.detail));
-    }
-    if (meta.isFreshOffsetComputation) {
-      // Freeze NOW (Q3-A: persist immediately). We still return the FRESH
-      // `result` (computed above, before freezing) as lastResult, since that
-      // carries the full referenceKind/referenceIso detail the Offset
-      // Inspector needs. Subsequent engine calls (advanceTime, etc.) will
-      // automatically reuse the frozen value via runEngine()/refreshResult().
-      next = { ...next, frozenCommunityOffsetMinutes: meta.offsetMinutes };
-      log.push(makeEvent(next, 'offset', 'Offset frozen & persisted', null, `${meta.offsetMinutes > 0 ? '+' : ''}${meta.offsetMinutes}m (${meta.offsetSign}) — will never recompute (Q2-A)`));
-    }
-  } else {
-    log.push(makeEvent(next, 'error', 'No generated cycle created', null, 'No matching interrupted cycle found in schedule'));
-  }
-
-  return {
-    ...next,
-    eventLog: log,
-    lastResult: result,
-    lastDecisionTrace: meta?.decisionTrace ?? next.lastDecisionTrace,
+  const event: SimEvent = {
+    at: syncedAtIso,
+    kind: type === 'REPORT' ? 'REPORT' : 'CONFIRM',
+    detail: `${type === 'REPORT' ? '📢' : '✅'} ${type} → ${state} (rel:${reliability}%)`,
   };
+  // Clear frozen offset when a NEW resync point is created
+  return runPipeline({
+    ...world,
+    resyncPoint,
+    frozenCommunityOffset: null,
+    events: [...world.events, event],
+  });
 }
 
-// ── Scenario Runner (Section 14) ───────────────────────────────────────────────
+// ── Scenario runner ───────────────────────────────────────────────────────────
 
-export interface ScenarioResult {
-  pass: boolean;
-  actual: string;
-  expected: string;
-  world: SimWorld;
-}
-
-export interface ScenarioDef {
-  id: number;
+interface Scenario {
+  id: string;
   name: string;
-  description: string;
-  expected: string;
+  group: string;
   run: () => ScenarioResult;
 }
 
-function freshBase(nowMs: number): { world: SimWorld; anchor: string } {
-  // 24h gap comfortably covers every report-time offset used below, so no
-  // scenario can accidentally compute a report timestamp in the future
-  // relative to the world clock (computeCommunityTransition rejects those).
-  const anchor = new Date(nowMs - 24 * 3600 * 1000).toISOString();
-  let world = createInitialWorld(nowMs);
-  world = { ...world, scheduleAnchorIso: anchor, growattLastTransitionAt: anchor, eventLog: [] };
-  return { world, anchor };
+function makeWorld(overrides: Partial<SimWorld> = {}): SimWorld {
+  return runPipeline({ ...createInitialWorld(), ...overrides });
 }
 
-/** Find the slot immediately AFTER the generated (isResynced) slot in a result's daySchedule */
-function findContinuationFirstSlot(result: UserPrediction | null) {
-  if (!result) return null;
-  const slots = result.daySchedule;
-  const genIdx = slots.findIndex(s => (s as any).isResynced === true);
-  if (genIdx === -1 || genIdx + 1 >= slots.length) return null;
-  return slots[genIdx + 1];
+/** Assert helper — returns ScenarioResult */
+function assert(
+  world: SimWorld,
+  condition: boolean,
+  expected: string,
+  actual: string,
+): ScenarioResult {
+  return { pass: condition, expected, actual, world };
 }
 
-const SCENARIOS_BASE_NOW = Date.now();
+export const SCENARIOS: Scenario[] = [
+  // ── Group A: Neutral Offset ──────────────────────────────────────────────
+  {
+    id: 'A-1',
+    group: 'Group A — Neutral Offset',
+    name: 'NORMAL mode when no transition expected soon',
+    run(): ScenarioResult {
+      const w = makeWorld({ offsetMinutes: 0 });
+      const mode = w.lastResult?.atc.mode ?? 'UNKNOWN';
+      return assert(w, mode === 'NORMAL', 'NORMAL', mode);
+    },
+  },
+  {
+    id: 'A-2',
+    group: 'Group A — Neutral Offset',
+    name: 'GRACE_MODE after slot overruns by 5 min',
+    run(): ScenarioResult {
+      // Growatt ON for 370 min (slot was 360 min) → 10 min overrun
+      let w = makeWorld({
+        offsetMinutes: 0,
+        scheduleTemplate: [{ state: 'ON', durationMin: 360 }, { state: 'OFF', durationMin: 240 }],
+      });
+      // Set growatt transition to 370 min ago so the slot has overrun
+      const transAt = new Date(w.simulatedNowMs - 370 * 60_000).toISOString();
+      w = runPipeline({ ...w, growattState: 'ON', growattLastTransitionAt: transAt });
+      const mode = w.lastResult?.atc.mode ?? 'UNKNOWN';
+      return assert(w, mode === 'GRACE_MODE' || mode === 'WAITING_FOR_GROWATT', 'GRACE_MODE or WAITING_FOR_GROWATT', mode);
+    },
+  },
 
-export const SCENARIOS: ScenarioDef[] = [
+  // ── Group B: Positive Offset ──────────────────────────────────────────────
   {
-    id: 1,
-    name: 'OFF Progress < 50% → Report ON',
-    description: 'Interrupt an OFF cycle before the halfway point and report ON.',
-    expected: 'Previous ON duration used (2h)',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      // OFF slot starts at anchor+2h, lasts 6h. Report at anchor+3h (1h elapsed of 6h = 16.7%)
-      let world = setSimulatedNow(w0, new Date(anchor).getTime() + 180 * 60_000);
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      const meta = world.lastResult?.communityTransitionMeta;
-      const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 120 && meta?.durationSelectionRule === 'OFF_PROGRESS_LT_50_BEFORE';
-      return { pass, actual: `${durMin}min, rule=${meta?.durationSelectionRule}`, expected: '120min, OFF_PROGRESS_LT_50_BEFORE', world };
+    id: 'B-1',
+    group: 'Group B — Positive Offset',
+    name: 'POSITIVE_OFFSET_PENDING when Growatt flipped ahead of user',
+    run(): ScenarioResult {
+      const nowMs = Date.now();
+      // Growatt transitioned to ON 10 min ago; user has +60 min offset
+      const transAt = new Date(nowMs - 10 * 60_000).toISOString();
+      const w = runPipeline({
+        ...createInitialWorld(),
+        offsetMinutes: 60,
+        growattState: 'ON',
+        growattLastTransitionAt: transAt,
+        scheduleTemplate: [{ state: 'OFF', durationMin: 360 }, { state: 'ON', durationMin: 120 }],
+      });
+      const mode = w.lastResult?.atc.mode ?? 'UNKNOWN';
+      return assert(w, mode === 'POSITIVE_OFFSET_PENDING', 'POSITIVE_OFFSET_PENDING', mode);
     },
   },
   {
-    id: 2,
-    name: 'OFF Progress > 50% → Report ON',
-    description: 'Interrupt an OFF cycle after the halfway point and report ON.',
-    expected: 'Next ON duration used (3h)',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      // OFF slot anchor+2h to anchor+8h. Report at anchor+6h (4h of 6h = 66.7%)
-      let world = setSimulatedNow(w0, new Date(anchor).getTime() + 360 * 60_000);
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      const meta = world.lastResult?.communityTransitionMeta;
-      const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 180 && meta?.durationSelectionRule === 'OFF_PROGRESS_GT_50_AFTER';
-      return { pass, actual: `${durMin}min, rule=${meta?.durationSelectionRule}`, expected: '180min, OFF_PROGRESS_GT_50_AFTER', world };
+    id: 'B-2',
+    group: 'Group B — Positive Offset',
+    name: 'scheduledAutoTransitionIso is set in POSITIVE_OFFSET_PENDING',
+    run(): ScenarioResult {
+      const nowMs = Date.now();
+      const transAt = new Date(nowMs - 10 * 60_000).toISOString();
+      const w = runPipeline({
+        ...createInitialWorld(),
+        offsetMinutes: 60,
+        growattState: 'ON',
+        growattLastTransitionAt: transAt,
+        scheduleTemplate: [{ state: 'OFF', durationMin: 360 }, { state: 'ON', durationMin: 120 }],
+      });
+      const iso = w.lastResult?.atc.scheduledAutoTransitionIso;
+      const hasIso = !!iso;
+      return assert(w, hasIso, 'scheduledAutoTransitionIso set', iso ?? 'null');
+    },
+  },
+
+  // ── Group C: Negative Offset ──────────────────────────────────────────────
+  {
+    id: 'C-1',
+    group: 'Group C — Negative Offset',
+    name: 'UNCERTAIN_ZONE after predicted slot end passes (no Growatt confirm)',
+    run(): ScenarioResult {
+      const nowMs = Date.now();
+      // Slot ended 20 min ago; user is -30 min ahead; Growatt still says OFF
+      const slotStartMs = nowMs - (360 + 20) * 60_000;
+      const transAt = new Date(slotStartMs).toISOString();
+      const w = runPipeline({
+        ...createInitialWorld(),
+        offsetMinutes: -30,
+        growattState: 'OFF',
+        growattLastTransitionAt: transAt,
+        scheduleTemplate: [{ state: 'OFF', durationMin: 360 }, { state: 'ON', durationMin: 120 }],
+        simulatedNowMs: nowMs,
+      });
+      const mode = w.lastResult?.atc.mode ?? 'UNKNOWN';
+      return assert(w, mode === 'UNCERTAIN_ZONE', 'UNCERTAIN_ZONE', mode);
+    },
+  },
+
+  // ── Group D: Community Sync ───────────────────────────────────────────────
+  {
+    id: 'D-1',
+    group: 'Group D — Community Sync',
+    name: 'COMMUNITY_SYNCED mode after report',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = { ...w, growattState: 'OFF', growattLastTransitionAt: new Date(w.simulatedNowMs - 120 * 60_000).toISOString() };
+      w = submitReportOrConfirm(w, 'ON', 'REPORT');
+      const mode = w.lastResult?.atc.mode ?? 'UNKNOWN';
+      return assert(w, mode === 'COMMUNITY_SYNCED', 'COMMUNITY_SYNCED', mode);
     },
   },
   {
-    id: 3,
-    name: 'ON Interrupted → Report OFF',
-    description: 'Interrupt an ON cycle (any progress %) and report OFF.',
-    expected: 'Previous OFF duration ALWAYS used — no 50% rule for ON',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      // ON slot anchor+8h to anchor+11h (after OFF 6h). Report at anchor+10h (2h of 3h = 66.7%, would be "after" under the 50% rule)
-      let world = setSimulatedNow(w0, new Date(anchor).getTime() + 600 * 60_000);
-      world = submitReportOrConfirm(world, 'OFF', 'report');
-      const meta = world.lastResult?.communityTransitionMeta;
-      const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 360 && meta?.durationSelectionRule === 'ON_ALWAYS_BEFORE';
-      return { pass, actual: `${durMin}min (66.7% progress, would be "after" under 50% rule), rule=${meta?.durationSelectionRule}`, expected: '360min, ON_ALWAYS_BEFORE (ignores progress)', world };
+    id: 'D-2',
+    group: 'Group D — Community Sync',
+    name: 'generatedCycleStartIso equals syncedAtIso',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = { ...w, growattState: 'OFF', growattLastTransitionAt: new Date(w.simulatedNowMs - 120 * 60_000).toISOString() };
+      w = submitReportOrConfirm(w, 'ON', 'REPORT');
+      const meta = w.lastResult?.communityTransitionMeta;
+      const resyncAt = w.resyncPoint?.syncedAtIso ?? 'N/A';
+      const genStart = meta?.generatedCycleStartIso ?? 'null';
+      const equal = genStart === resyncAt;
+      return assert(w, equal, resyncAt, genStart);
     },
   },
   {
-    id: 4,
-    name: 'Growatt ON + Report ON (after)',
-    description: 'Report ON arrives after Growatt actually turned ON.',
-    expected: 'Reference = Growatt ON Start (actual), offset POSITIVE',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'OFF'); // reset baseline
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 480 * 60_000);
-      world = forceGrowattState(world, 'ON'); // Growatt ON at this moment
-      world = setSimulatedNow(world, world.simulatedNowMs + 60 * 60_000); // 1h later
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      const meta = world.lastResult?.communityTransitionMeta;
-      const pass = meta?.offsetSign === 'POSITIVE' && meta?.offsetReferenceKind === 'GROWATT_ON_START_ACTUAL';
-      return { pass, actual: `sign=${meta?.offsetSign} ref=${meta?.offsetReferenceKind} (${meta?.offsetMinutes}m)`, expected: 'POSITIVE, GROWATT_ON_START_ACTUAL', world };
+    id: 'D-3',
+    group: 'Group D — Community Sync',
+    name: 'Offset computed once (frozen) on second render',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = { ...w, growattState: 'OFF', growattLastTransitionAt: new Date(w.simulatedNowMs - 120 * 60_000).toISOString() };
+      w = submitReportOrConfirm(w, 'ON', 'REPORT');
+      const firstOffset = w.frozenCommunityOffset;
+      // Advance time and run again — frozen offset must not change
+      w = advanceTime(w, 5);
+      const secondOffset = w.frozenCommunityOffset;
+      const frozen = firstOffset !== null && firstOffset === secondOffset;
+      return assert(w, frozen, `frozen=${firstOffset}`, `second=${secondOffset}`);
+    },
+  },
+
+  // ── Group E: Transition Modes ─────────────────────────────────────────────
+  {
+    id: 'E-1',
+    group: 'Group E — Transition Modes',
+    name: 'MANUAL mode preserved after setTransitionMode',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = setTransitionMode(w, 'MANUAL');
+      const mode = w.lastResult?.atc.transitionMode ?? 'UNKNOWN';
+      return assert(w, mode === 'MANUAL', 'MANUAL', mode);
     },
   },
   {
-    id: 5,
-    name: 'Growatt ON + Report ON (before)',
-    description: 'Report ON is backdated to before Growatt actually turned ON.',
-    expected: 'Reference = Growatt ON Start (actual), offset NEGATIVE',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'OFF');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 480 * 60_000);
-      world = forceGrowattState(world, 'ON'); // Growatt ON at T
-      const growattOnMs = world.simulatedNowMs;
-      world = setSimulatedNow(world, growattOnMs + 30 * 60_000); // clock advances so report isn't "in the future"
-      // Report backdated to T-45min (before Growatt's actual ON start)
-      world = submitReportOrConfirm(world, 'ON', 'report', growattOnMs - 45 * 60_000);
-      const meta = world.lastResult?.communityTransitionMeta;
-      const pass = meta?.offsetSign === 'NEGATIVE' && meta?.offsetReferenceKind === 'GROWATT_ON_START_ACTUAL';
-      return { pass, actual: `sign=${meta?.offsetSign} ref=${meta?.offsetReferenceKind} (${meta?.offsetMinutes}m)`, expected: 'NEGATIVE, GROWATT_ON_START_ACTUAL', world };
+    id: 'E-2',
+    group: 'Group E — Transition Modes',
+    name: 'AUTO mode restored after reset',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = setTransitionMode(w, 'MANUAL');
+      w = resetWorld(w);
+      const mode = w.lastResult?.atc.transitionMode ?? 'UNKNOWN';
+      return assert(w, mode === 'AUTO', 'AUTO', mode);
+    },
+  },
+
+  // ── Group F: Elapsed Time ─────────────────────────────────────────────────
+  {
+    id: 'F-1',
+    group: 'Group F — Elapsed Time',
+    name: 'currentStateStartIso is set when result is available',
+    run(): ScenarioResult {
+      const w = makeWorld({ offsetMinutes: 0 });
+      const startIso = w.lastResult?.currentStateStartIso;
+      const hasStart = startIso != null;
+      return assert(w, hasStart, 'non-null startIso', startIso ?? 'null');
+    },
+  },
+
+  // ── Group G: Schedule Continuity ──────────────────────────────────────────
+  {
+    id: 'G-1',
+    group: 'Group G — Schedule Continuity',
+    name: 'daySchedule has at least 4 slots',
+    run(): ScenarioResult {
+      const w = makeWorld();
+      const count = w.lastResult?.daySchedule.length ?? 0;
+      return assert(w, count >= 4, '≥4 slots', String(count));
     },
   },
   {
-    id: 6,
-    name: 'Growatt OFF + Report ON',
-    description: 'Growatt is currently OFF; user reports ON.',
-    expected: 'Reference = Growatt OFF END time (expected) — NEVER the OFF start time',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      // OFF slot anchor+2h..anchor+8h. Growatt OFF started at anchor+2h.
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 180 * 60_000); // 3h into the 6h OFF window
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      const meta = world.lastResult?.communityTransitionMeta;
-      const pass = meta?.offsetReferenceKind === 'GROWATT_OFF_END_EXPECTED';
-      return { pass, actual: `ref=${meta?.offsetReferenceKind} (${meta?.offsetMinutes}m) — NOT start time`, expected: 'GROWATT_OFF_END_EXPECTED', world };
+    id: 'G-2',
+    group: 'Group G — Schedule Continuity',
+    name: 'Custom schedule template respected',
+    run(): ScenarioResult {
+      const template: ScheduleEntryTemplate[] = [
+        { state: 'ON', durationMin: 60 },
+        { state: 'OFF', durationMin: 180 },
+      ];
+      let w = createInitialWorld();
+      w = setSchedule(w, template);
+      const slots = w.lastResult?.daySchedule ?? [];
+      const hasExpectedDurations = slots.some(s => s.durationLabel?.includes('60') || s.durationLabel?.includes('180') || s.durationLabel?.includes('1س') || s.durationLabel?.includes('3س'));
+      return assert(w, hasExpectedDurations, 'slots with 60/180 min durations', slots.map(s => s.durationLabel).slice(0, 3).join(', '));
+    },
+  },
+
+  // ── Group H: Crisis Mode ──────────────────────────────────────────────────
+  {
+    id: 'H-1',
+    group: 'Group H — Crisis Mode',
+    name: 'crisisMode false by default',
+    run(): ScenarioResult {
+      const w = makeWorld();
+      const crisis = w.lastResult?.crisisMode ?? true;
+      return assert(w, crisis === false, 'false', String(crisis));
+    },
+  },
+
+  // ── Group I: Reset / Advance Time ─────────────────────────────────────────
+  {
+    id: 'I-1',
+    group: 'Group I — Reset / Advance Time',
+    name: 'advanceTime increases simulatedNowMs',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      const before = w.simulatedNowMs;
+      w = advanceTime(w, 30);
+      const after = w.simulatedNowMs;
+      const diff = Math.round((after - before) / 60_000);
+      return assert(w, diff === 30, '30 min advance', `${diff} min`);
     },
   },
   {
-    id: 7,
-    name: 'Growatt OFF + Report OFF',
-    description: 'Growatt is currently OFF; user confirms OFF.',
-    expected: 'Reference = Growatt OFF START time (actual)',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 80 * 60_000);
-      world = submitReportOrConfirm(world, 'OFF', 'confirm');
-      const meta = world.lastResult?.communityTransitionMeta;
-      const pass = meta?.offsetReferenceKind === 'GROWATT_OFF_START_ACTUAL' && (meta?.offsetMinutes ?? 0) > 0;
-      return { pass, actual: `ref=${meta?.offsetReferenceKind} (${meta?.offsetMinutes}m)`, expected: 'GROWATT_OFF_START_ACTUAL, +80m', world };
+    id: 'I-2',
+    group: 'Group I — Reset / Advance Time',
+    name: 'resetWorld clears resyncPoint and events',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = submitReportOrConfirm(w, 'ON', 'REPORT');
+      w = resetWorld(w);
+      const noResync = w.resyncPoint === null;
+      const noEvents = w.events.length === 0;
+      return assert(w, noResync && noEvents, 'resync=null, events=[]', `resync=${w.resyncPoint}, events=${w.events.length}`);
     },
   },
+
+  // ── Group J: Validation Window ────────────────────────────────────────────
   {
-    id: 8,
-    name: 'Positive Offset Path',
-    description: 'After a generated cycle with positive offset ends, Growatt flips ahead of the continuation schedule.',
-    expected: 'ATC enters POSITIVE_OFFSET_PENDING (or reconciles instantly to NORMAL with a backdated start, if the scheduled time has already passed)',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 80 * 60_000);
-      world = submitReportOrConfirm(world, 'OFF', 'confirm'); // produces POSITIVE offset (scenario 7 pattern)
-      const continuationSlot = findContinuationFirstSlot(world.lastResult);
-      const generatedEnd = world.lastResult!.communityTransitionMeta!.generatedCycleEndIso;
-      const continuationStartMs = new Date(generatedEnd).getTime();
-      const continuationDurMs = continuationSlot?.endIso ? new Date(continuationSlot.endIso).getTime() - continuationStartMs : 60 * 60_000;
-      const midPointMs = continuationStartMs + Math.min(continuationDurMs / 2, 60 * 60_000);
-      world = setSimulatedNow(world, midPointMs);
-      // Force a GENUINE fresh Growatt transition at this exact moment (not a
-      // no-op): first ensure Growatt matches the continuation's state, then
-      // flip it — guarantees growattLastTransitionAt = midPointMs, so the
-      // scheduled reconciliation time (midPointMs + 80min offset) is still in
-      // the future and we can observe the pending window before exit-reconciliation.
-      const matchingState: 'ON' | 'OFF' = continuationSlot?.state ?? 'ON';
-      const oppositeOfContinuation: 'ON' | 'OFF' = matchingState === 'ON' ? 'OFF' : 'ON';
-      world = forceGrowattState(world, matchingState);
-      world = forceGrowattState(world, oppositeOfContinuation);
-      const mode = world.lastResult?.atc.mode;
-      // Either outcome is correct per Rule 9: a genuinely future scheduled
-      // time shows POSITIVE_OFFSET_PENDING; if it already elapsed, the exit
-      // block reconciles instantly to NORMAL with a non-null backdated start.
-      const pass = !!(
-        (mode === 'POSITIVE_OFFSET_PENDING' && !!world.lastResult?.atc.scheduledAutoTransitionIso) ||
-        (mode === 'NORMAL' && world.lastResult?.reconciledCycleStartIso !== null && world.lastResult?.isResynced)
-      );
-      return { pass, actual: `atc.mode=${mode}, scheduledAutoTransitionIso=${world.lastResult?.atc.scheduledAutoTransitionIso}, reconciledCycleStartIso=${world.lastResult?.reconciledCycleStartIso}`, expected: 'POSITIVE_OFFSET_PENDING (pending) or NORMAL (already reconciled)', world };
+    id: 'J-1',
+    group: 'Group J — Validation Window',
+    name: 'inValidationWindow true when Growatt disagrees within 20 min',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      // Growatt is OFF; report says ON (disagreement)
+      w = { ...w, growattState: 'OFF', growattLastTransitionAt: new Date(w.simulatedNowMs - 30 * 60_000).toISOString() };
+      w = submitReportOrConfirm(w, 'ON', 'REPORT');
+      // Don't advance time — still within validation window
+      const inWindow = w.lastResult?.atc.inValidationWindow ?? false;
+      return assert(w, inWindow, 'inValidationWindow=true', String(inWindow));
     },
   },
+
+  // ── Group K: Confidence Score ─────────────────────────────────────────────
   {
-    id: 9,
-    name: 'Negative Offset Path',
-    description: 'After a generated cycle with negative offset ends, verify UNCERTAIN_ZONE.',
-    expected: 'ATC mode becomes UNCERTAIN_ZONE once the continuation slot overruns',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 180 * 60_000);
-      world = submitReportOrConfirm(world, 'ON', 'report'); // produces NEGATIVE offset (scenario 6 pattern)
-      const continuationSlot = findContinuationFirstSlot(world.lastResult);
-      const target = continuationSlot?.endIso
-        ? new Date(continuationSlot.endIso).getTime() + 35 * 60_000
-        : world.simulatedNowMs + 35 * 60_000;
-      world = setSimulatedNow(world, target);
-      const pass = world.lastResult?.atc.mode === 'UNCERTAIN_ZONE';
-      return { pass, actual: `atc.mode=${world.lastResult?.atc.mode}`, expected: 'UNCERTAIN_ZONE', world };
-    },
-  },
-  {
-    id: 10,
-    name: 'Neutral Offset Path',
-    description: 'Report exactly matches the expected Growatt reference time → offset = 0.',
-    expected: 'Offset = 0 (NEUTRAL), continuation proceeds normally with no special zone',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      const offStartMs = world.simulatedNowMs;
-      const offEndMs = offStartMs + 360 * 60_000; // raw OFF slot is 6h
-      world = setSimulatedNow(world, offEndMs); // clock at exactly the expected boundary
-      world = submitReportOrConfirm(world, 'ON', 'report', offEndMs);
-      const meta = world.lastResult?.communityTransitionMeta;
-      const pass = meta?.offsetSign === 'NEUTRAL' && meta?.offsetMinutes === 0;
-      return { pass, actual: `sign=${meta?.offsetSign} (${meta?.offsetMinutes}m)`, expected: 'NEUTRAL, 0m', world };
-    },
-  },
-  {
-    id: 11,
-    name: 'UNCERTAIN_ZONE Entry',
-    description: 'A standard negative-offset user (no community transition) overruns their predicted cycle end.',
-    expected: 'ATC enters UNCERTAIN_ZONE once overrun exceeds the 15-min prediction-range buffer',
-    run: () => {
-      const { world: w0 } = freshBase(SCENARIOS_BASE_NOW);
-      let world = { ...w0, offsetMinutes: -120 }; // stored negative offset, no resync
-      world = refreshResult(world);
-      const activeEnd = world.lastResult?.daySchedule.find(s => new Date(s.startIso).getTime() <= world.simulatedNowMs && (!s.endIso || new Date(s.endIso).getTime() > world.simulatedNowMs))?.endIso;
-      world = setSimulatedNow(world, activeEnd ? new Date(activeEnd).getTime() + 25 * 60_000 : world.simulatedNowMs + 25 * 60_000);
-      const pass = world.lastResult?.atc.mode === 'UNCERTAIN_ZONE';
-      return { pass, actual: `atc.mode=${world.lastResult?.atc.mode}`, expected: 'UNCERTAIN_ZONE', world };
-    },
-  },
-  {
-    id: 12,
-    name: 'UNCERTAIN_ZONE Exit',
-    description: 'From UNCERTAIN_ZONE, Growatt finally confirms the transition.',
-    expected: 'Exits to NORMAL with a backdated cycle start (GrowattTime + offset)',
-    run: () => {
-      const { world: w0 } = freshBase(SCENARIOS_BASE_NOW);
-      let world = { ...w0, offsetMinutes: -120 };
-      world = refreshResult(world);
-      const activeEnd = world.lastResult?.daySchedule.find(s => new Date(s.startIso).getTime() <= world.simulatedNowMs && (!s.endIso || new Date(s.endIso).getTime() > world.simulatedNowMs))?.endIso;
-      world = setSimulatedNow(world, activeEnd ? new Date(activeEnd).getTime() + 25 * 60_000 : world.simulatedNowMs + 25 * 60_000);
-      const heldState = world.lastResult!.currentState;
-      const newState: 'ON' | 'OFF' = heldState === 'ON' ? 'OFF' : 'ON';
-      world = forceGrowattState(world, newState); // Growatt finally confirms
-      const pass = world.lastResult?.atc.mode === 'NORMAL' && world.lastResult?.reconciledCycleStartIso !== null;
-      return { pass, actual: `atc.mode=${world.lastResult?.atc.mode}, reconciledStart=${world.lastResult?.reconciledCycleStartIso}`, expected: 'NORMAL with non-null reconciledCycleStartIso', world };
-    },
-  },
-  {
-    id: 13,
-    name: 'Generated State Completion',
-    description: 'Once the generated cycle ends, the schedule must show the continuation slot as active — not freeze on the generated state.',
-    expected: 'mode leaves COMMUNITY_SYNCED the instant the generated cycle ends',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 180 * 60_000);
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      const generatedEnd = world.lastResult!.communityTransitionMeta!.generatedCycleEndIso;
-      const generatedState = world.lastResult!.communityTransitionMeta!.generatedCycleState;
-      world = setSimulatedNow(world, new Date(generatedEnd).getTime() + 5 * 60_000); // just past generated end
-      const pass = world.lastResult?.atc.mode !== 'COMMUNITY_SYNCED';
-      return { pass, actual: `currentState=${world.lastResult?.currentState}, mode=${world.lastResult?.atc.mode} (generated was ${generatedState})`, expected: 'mode leaves COMMUNITY_SYNCED', world };
-    },
-  },
-  {
-    id: 14,
-    name: 'Schedule Continuity',
-    description: 'The continuation after a generated cycle follows the LOGICAL schedule sequence, not the nearest clock time.',
-    expected: 'Continuation slot durations match the schedule pattern in sequence (e.g. generated ON(3h) → next is OFF(5h))',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = setSchedule(w0, [
-        { id: 'a', state: 'ON', durationMin: 120 },
-        { id: 'b', state: 'OFF', durationMin: 360 },
-        { id: 'c', state: 'ON', durationMin: 180 },
-        { id: 'd', state: 'OFF', durationMin: 300 },
-      ]);
-      world = forceGrowattState(world, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 360 * 60_000); // >50% of OFF(6h) -> borrows next ON(3h)
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      const slots = world.lastResult!.daySchedule;
-      const genIdx = slots.findIndex(s => (s as any).isResynced);
-      const nextSlot = genIdx >= 0 ? slots[genIdx + 1] : null;
-      const nextDurMin = nextSlot?.endIso ? (new Date(nextSlot.endIso).getTime() - new Date(nextSlot.startIso).getTime()) / 60_000 : null;
-      const pass = nextSlot?.state === 'OFF' && nextDurMin === 300;
-      return { pass, actual: `next slot = ${nextSlot?.state} ${nextDurMin}min`, expected: 'next slot = OFF 300min (logical sequence, not clock-based)', world };
-    },
-  },
-  {
-    id: 15,
-    name: 'Persistent Timeline Validation',
-    description: 'Generated states remain visible in the schedule history long after completion — never deleted.',
-    expected: 'The generated slot (isResynced=true) is still present in daySchedule even after the simulator advances far past its end',
-    run: () => {
-      const { world: w0, anchor } = freshBase(SCENARIOS_BASE_NOW);
-      let world = forceGrowattState(w0, 'ON');
-      world = setSimulatedNow(world, new Date(anchor).getTime() + 120 * 60_000);
-      world = forceGrowattState(world, 'OFF');
-      world = setSimulatedNow(world, world.simulatedNowMs + 180 * 60_000);
-      world = submitReportOrConfirm(world, 'ON', 'report');
-      // NOTE: the generated slot is reconstructed deterministically from resyncPoint
-      // on every engine run (not deleted from any store) — advancing time keeps it
-      // present in daySchedule as long as resyncPoint is still active.
-      world = setSimulatedNow(world, world.simulatedNowMs + 20 * 3600 * 1000); // +20h
-      const stillPresent = world.lastResult?.daySchedule.some(s => (s as any).isResynced === true);
-      return { pass: !!stillPresent, actual: `generated slot present after +20h: ${stillPresent}`, expected: 'true', world };
+    id: 'K-1',
+    group: 'Group K — Confidence Score',
+    name: 'confidenceScore increases with high reporter reliability',
+    run(): ScenarioResult {
+      let w = createInitialWorld();
+      w = submitReportOrConfirm(w, 'ON', 'REPORT', 100);
+      const score = w.confidenceScore;
+      return assert(w, score > 75, '>75', String(score));
     },
   },
 ];
