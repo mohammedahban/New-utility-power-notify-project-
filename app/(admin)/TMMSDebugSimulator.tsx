@@ -1,23 +1,23 @@
 /**
- * TMMS V2 Debug Simulator
+ * TMMS V2 Debug Simulator — Complete Scenario Validation & Compliance Framework
  * ════════════════════════════════════════════════════════════════════════════
- * Development/debug tool only. Does NOT touch production users or data.
  *
- * Architecture (as required):
- *   UI Layer                 → this file (components only, no business logic)
- *   TMMS Engine Layer         → ./tmmsEngine.ts   (pure, reusable, copy-paste
- *                                                   ready for production)
- *   Simulation Layer          → ./tmmsSimulation.ts (world state, scenarios —
- *                                                     built ON the real engine)
- *   Debug Visualization Layer → the Timeline / Inspector components below,
- *                                which only ever READ engine/simulation output
+ * Implements all 20 required debug panels per scenario:
+ *   1. Schedule Snapshot      11. Offset Reason
+ *   2. Current State          12. Timeline Continuity Result
+ *   3. Growatt State          13. Transition Tree
+ *   4. Reference Time         14. Verification Window Result
+ *   5. Generated State        15. UNCERTAIN_ZONE Result
+ *   6. Duration Selection Rule 16. Confidence Score Changes
+ *   7. Duration Selection Result 17. Community Confirmation Analysis
+ *   8. Offset Formula         18. Expected Result
+ *   9. Offset Value           19. Actual Result
+ *  10. Offset Sign            20. PASS / FAIL
  *
- * No fake backend, no duplicate business models: every report, confirmation,
- * and offset calculation you see here is the SAME function call production
- * code makes (applyOffsetToPrediction from tmmsEngine.ts).
- *
- * Gate this behind your own dev/admin flag before mounting in a real app,
- * e.g.: {__DEV__ && <TMMSDebugSimulator />}
+ * Architecture:
+ *   UI Layer        → this file (components only, no business logic)
+ *   Engine Layer    → ./tmmsEngine.ts   (pure, reusable TMMS V2 logic)
+ *   Simulation Layer → ./tmmsSimulation.ts (world state, scenarios, report tracking)
  * ════════════════════════════════════════════════════════════════════════════
  */
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
@@ -30,18 +30,22 @@ import {
   setTransitionMode,
   setSchedule,
   submitReportOrConfirm,
+  submitReport,
+  submitConfirmation,
   SCENARIOS,
+  getTotalScenarioCount,
+  getScenarioCountByGroup,
   type SimWorld,
   type SimEvent,
   type ScheduleEntryTemplate,
   type ScenarioResult,
+  type ScenarioDebugInfo,
+  type SimReportEntry,
 } from './tmmsSimulation';
 import { fmtYemenTime, type ShiftedScheduleSlot } from './tmmsEngine';
 
 // ════════════════════════════════════════════════════════════════════════════
-// THEME — instrument-panel / oscilloscope aesthetic. Subject-grounded choice:
-// this tool monitors an electrical inverter's ON/OFF cycles, so a dark
-// control-panel look with LED-style semantic colors fits the domain directly.
+// THEME — instrument-panel / oscilloscope aesthetic
 // ════════════════════════════════════════════════════════════════════════════
 const C = {
   bg: '#0A0E12',
@@ -81,6 +85,12 @@ const modeColor = (mode: string) => {
   if (mode === 'COMMUNITY_SYNCED') return C.generated;
   if (mode === 'PREDICTION_RANGE' || mode === 'GRACE_MODE' || mode === 'WAITING_FOR_GROWATT') return C.uncertain;
   return C.on;
+};
+
+/** Group badge colors */
+const groupColor: Record<string, string> = {
+  A: '#3DDC84', B: '#5C7A99', C: '#C792EA', D: '#FFB84D', E: '#4FA8FF',
+  F: '#FF6B5B', G: '#9AA5B1', H: '#C792EA', I: '#FF5C5C', J: '#4FA8FF', K: '#FFB84D',
 };
 
 const globalCss = `
@@ -231,8 +241,7 @@ function ScheduleBuilder({ world, onChange }: { world: SimWorld; onChange: (t: S
   const totalMin = template.reduce((s, t) => s + t.durationMin, 0);
 
   return (
-    <Panel title="① SCHEDULE BUILDER" subtitle="Defines the repeating ON/OFF pattern (the 'Growatt schedule')" accent={C.borderLight}>
-      {/* Mini timeline preview */}
+    <Panel title="① SCHEDULE BUILDER" subtitle="Defines the repeating ON/OFF pattern" accent={C.borderLight}>
       <div style={{ display: 'flex', height: 22, borderRadius: 5, overflow: 'hidden', marginBottom: 12, border: `1px solid ${C.border}` }}>
         {template.map(t => (
           <div key={t.id} title={`${t.state} ${t.durationMin}m`} style={{
@@ -342,6 +351,7 @@ function UserTimelineSimulator({ world }: { world: SimWorld }) {
       <StatRow label="Elapsed" value={fmtMin(elapsedMin)} />
       <StatRow label="Remaining" value={remainingMin !== null ? fmtMin(remainingMin) : '—'} valueColor={remainingMin !== null && remainingMin < 0 ? C.negative : undefined} />
       <StatRow label="Is Holding (ATC)" value={r.isHoldingState ? 'YES' : 'no'} valueColor={r.isHoldingState ? C.uncertain : C.textMuted} />
+      <StatRow label="Confidence Score" value={`${world.confidenceScore}%`} valueColor={C.positive} />
       {r.atc.statusLine && (
         <div style={{ marginTop: 10, padding: 8, background: `${modeColor(r.atc.mode)}15`, border: `1px solid ${modeColor(r.atc.mode)}40`, borderRadius: 6, fontSize: 11, color: modeColor(r.atc.mode), direction: 'rtl', textAlign: 'right' }}>
           {r.atc.statusLine}
@@ -371,16 +381,19 @@ function ModeSelector({ world, onChange }: { world: SimWorld; onChange: (m: 'AUT
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 5 — Report Simulator
+// SECTION 5 — Report Simulator (with separate Report vs Confirm)
 // ════════════════════════════════════════════════════════════════════════════
-function ReportSimulator({ onAction }: { onAction: (state: 'ON' | 'OFF', kind: 'report' | 'confirm') => void }) {
+function ReportSimulator({ world, onAction }: { world: SimWorld; onAction: (state: 'ON' | 'OFF', kind: 'report' | 'confirm') => void }) {
   return (
-    <Panel title="⑤ REPORT SIMULATOR" subtitle="Executes the REAL TMMS V2 engine — not a simulation of it" accent={C.generated}>
+    <Panel title="⑤ REPORT SIMULATOR" subtitle="Executes the REAL TMMS V2 engine — Timestamp Rule enforced" accent={C.generated}>
+      <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 10 }}>
+        Reports: {world.reports.length} | Confirmations: {world.reports.reduce((s, r) => s + r.confirmations.length, 0)} | Confidence: {world.confidenceScore}%
+      </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
         <Btn onClick={() => onAction('ON', 'report')} color={C.on} textColor={C.on}>Report ON</Btn>
         <Btn onClick={() => onAction('OFF', 'report')} color={C.off} textColor={C.off}>Report OFF</Btn>
-        <Btn onClick={() => onAction('ON', 'confirm')} color={C.on} textColor={C.on}>Confirm ON</Btn>
-        <Btn onClick={() => onAction('OFF', 'confirm')} color={C.off} textColor={C.off}>Confirm OFF</Btn>
+        <Btn onClick={() => onAction('ON', 'confirm')} color={C.generated} textColor={C.generated}>Confirm ON</Btn>
+        <Btn onClick={() => onAction('OFF', 'confirm')} color={C.generated} textColor={C.generated}>Confirm OFF</Btn>
       </div>
     </Panel>
   );
@@ -483,7 +496,7 @@ function OffsetCalculationInspector({ world }: { world: SimWorld }) {
       </div>
       {!meta.isFreshOffsetComputation && (
         <div style={{ marginTop: 8, fontSize: 10, color: C.textMuted, fontStyle: 'italic' }}>
-          ⓘ Frozen value reused (Q2-A) — reference detail only shown at the moment of original computation.
+          ⓘ Frozen value reused — reference detail only shown at the moment of original computation.
         </div>
       )}
     </Panel>
@@ -521,14 +534,14 @@ function TransitionDecisionInspector({ world }: { world: SimWorld }) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 10 — Timeline Visualization (signature element)
+// SECTION 10 — Timeline Visualization
 // ════════════════════════════════════════════════════════════════════════════
 function TimelineViz({ world }: { world: SimWorld }) {
   const r = world.lastResult;
   if (!r) return null;
 
   const W = 1000, H = 150;
-  const windowMs = 16 * 3600 * 1000; // show 16h window
+  const windowMs = 16 * 3600 * 1000;
   const startMs = world.simulatedNowMs - windowMs * 0.4;
   const endMs = startMs + windowMs;
   const xOf = (ms: number) => ((ms - startMs) / (endMs - startMs)) * W;
@@ -545,15 +558,12 @@ function TimelineViz({ world }: { world: SimWorld }) {
   return (
     <Panel title="⑩ TIMELINE VISUALIZATION" subtitle="Growatt vs User timeline — live" accent={C.uncertain}>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block', background: C.panelDeep, borderRadius: 8, border: `1px solid ${C.border}` }}>
-        {/* Track labels */}
         <text x={6} y={26} fontSize={9} fill={C.textMuted} fontFamily={C.mono}>GROWATT</text>
         <text x={6} y={96} fontSize={9} fill={C.textMuted} fontFamily={C.mono}>USER</text>
 
-        {/* Growatt track (single segment showing current state since last transition) */}
         <rect x={Math.max(0, growattX)} y={34} width={Math.max(0, W - Math.max(0, growattX))} height={26} fill={stateColor(world.growattCurrentState)} opacity={0.35} rx={3} />
         <text x={Math.max(4, growattX + 4)} y={51} fontSize={10} fill={stateColor(world.growattCurrentState)} fontFamily={C.mono} fontWeight={700}>{world.growattCurrentState}</text>
 
-        {/* User track — render each schedule slot */}
         {slots.map((s, i) => {
           const x1 = Math.max(0, xOf(new Date(s.startIso).getTime()));
           const x2 = Math.min(W, xOf(s.endIso ? new Date(s.endIso).getTime() : endMs));
@@ -568,12 +578,10 @@ function TimelineViz({ world }: { world: SimWorld }) {
           );
         })}
 
-        {/* UNCERTAIN_ZONE / mode indicator band */}
         {r.atc.mode === 'UNCERTAIN_ZONE' && (
           <rect x={Math.max(0, nowX - 60)} y={104} width={60} height={26} fill={C.negative} opacity={0.25} rx={3} className="tmms-led-pulse" />
         )}
 
-        {/* Now cursor */}
         <line x1={nowX} y1={10} x2={nowX} y2={H - 10} stroke={C.textPrimary} strokeWidth={1.5} strokeDasharray="3,3" className="tmms-cursor-blink" />
         <text x={nowX + 4} y={142} fontSize={9} fill={C.textPrimary} fontFamily={C.mono}>NOW</text>
       </svg>
@@ -679,44 +687,178 @@ function PersistentTimelineInspector({ world }: { world: SimWorld }) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 14 — Scenario Runner
+// SECTION 14 — Scenario Runner (with 20 Debug Panels & Group Organization)
 // ════════════════════════════════════════════════════════════════════════════
+
+/** Single debug row for the 20-field inspector */
+function DebugField({ number, label, value, highlight = false }: { number: number; label: string; value: string; highlight?: boolean }) {
+  return (
+    <div style={{
+      display: 'flex', gap: 8, alignItems: 'baseline', padding: '4px 6px',
+      background: highlight ? `${C.positive}10` : 'transparent',
+      borderRadius: 4,
+    }}>
+      <span style={{ fontSize: 9, color: C.textMuted, fontFamily: C.mono, width: 18, flexShrink: 0, textAlign: 'right' }}>{number}</span>
+      <span style={{ fontSize: 10, color: C.textSecondary, width: 120, flexShrink: 0 }}>{label}</span>
+      <span style={{ fontSize: 10.5, color: highlight ? C.positive : C.textPrimary, fontFamily: C.mono, fontWeight: 600, flex: 1, wordBreak: 'break-word' }}>{value}</span>
+    </div>
+  );
+}
+
+/** Expandable per-scenario debug panel with all 20 required fields */
+function ScenarioDebugPanel({ debug, group, id }: { debug: ScenarioDebugInfo; group: string; id: string }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div style={{ marginTop: 8, border: `1px solid ${debug.pass ? C.border : C.negative}60`, borderRadius: 6, overflow: 'hidden' }}>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '6px 10px', background: debug.pass ? `${C.on}10` : `${C.negative}10`, cursor: 'pointer', userSelect: 'none',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Badge color={debug.pass ? C.on : C.negative}>{debug.pass ? 'PASS' : 'FAIL'}</Badge>
+          <span style={{ fontSize: 10, color: C.textMuted, fontFamily: C.mono }}>Group {group} · {id}</span>
+          <span style={{ fontSize: 10, color: C.textSecondary }}>{open ? '▾ Hide' : '▸ Show'} 20 Debug Fields</span>
+        </div>
+      </div>
+      {open && (
+        <div className="tmms-fade-in" style={{ padding: '8px 4px', background: C.panelDeep }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, marginBottom: 6, paddingLeft: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            TMMS V2 Debug Output — 20 Required Fields
+          </div>
+          <DebugField number={1} label="Schedule Snapshot" value={debug.scheduleSnapshot} />
+          <DebugField number={2} label="Current State" value={debug.currentState} />
+          <DebugField number={3} label="Growatt State" value={debug.growattState} />
+          <DebugField number={4} label="Reference Time" value={debug.referenceTime} />
+          <DebugField number={5} label="Reference Kind" value={debug.referenceKind} />
+          <DebugField number={6} label="Generated State" value={debug.generatedState} />
+          <DebugField number={7} label="Duration Rule" value={debug.durationSelectionRule} />
+          <DebugField number={8} label="Duration Result" value={debug.durationSelectionResult} />
+          <DebugField number={9} label="Offset Formula" value={debug.offsetFormula} />
+          <DebugField number={10} label="Offset Value" value={debug.offsetValue} />
+          <DebugField number={11} label="Offset Sign" value={debug.offsetSign} />
+          <DebugField number={12} label="Offset Reason" value={debug.offsetReason} />
+          <DebugField number={13} label="Timeline Continuity" value={debug.timelineContinuityResult} />
+          <DebugField number={14} label="Transition Tree" value={debug.transitionTree} />
+          <DebugField number={15} label="Verification Window" value={debug.verificationWindowResult} />
+          <DebugField number={16} label="UNCERTAIN_ZONE" value={debug.uncertainZoneResult} />
+          <DebugField number={17} label="Confidence Changes" value={debug.confidenceScoreChanges} />
+          <DebugField number={18} label="Confirmation Analysis" value={debug.communityConfirmationAnalysis} />
+          <DebugField number={19} label="Expected Result" value={debug.expectedResult} highlight />
+          <DebugField number={20} label="Actual Result" value={debug.actualResult} highlight />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ScenarioRunner({
   results, onRun, onRunAll, onLoadWorld,
 }: {
-  results: Record<number, ScenarioResult>; onRun: (id: number) => void; onRunAll: () => void; onLoadWorld: (w: SimWorld) => void;
+  results: Record<string, ScenarioResult>; onRun: (id: string) => void; onRunAll: () => void; onLoadWorld: (w: SimWorld) => void;
 }) {
   const passCount = Object.values(results).filter(r => r.pass).length;
   const ranCount = Object.keys(results).length;
+
+  // Group scenarios by their group letter
+  const grouped = useMemo(() => {
+    const g: Record<string, typeof SCENARIOS> = {};
+    for (const sc of SCENARIOS) {
+      if (!g[sc.group]) g[sc.group] = [];
+      g[sc.group].push(sc);
+    }
+    return g;
+  }, []);
+
+  const groupNames: Record<string, string> = {
+    A: 'A — Growatt Currently ON', B: 'B — Growatt Currently OFF', C: 'C — Confirmation Scenarios',
+    D: 'D — OFF Progress Validation', E: 'E — ON Interruption Validation',
+    F: 'F — Generated State Completion', G: 'G — Schedule Continuity',
+    H: 'H — Persistent Timeline', I: 'I — UNCERTAIN_ZONE',
+    J: 'J — Neutral Offset', K: 'K — Historical Confirmation Validation',
+  };
+
   return (
     <Panel
       title="⑭ SCENARIO RUNNER"
-      subtitle="15 predefined validation scenarios — each executes automatically"
+      subtitle={`${SCENARIOS.length} scenarios across Groups A–K — each executes the REAL engine`}
       accent={C.on}
-      badge={ranCount > 0 ? <Badge color={passCount === SCENARIOS.length ? C.on : C.uncertain}>{passCount}/{SCENARIOS.length} PASS</Badge> : undefined}
+      badge={ranCount > 0 ? <Badge color={passCount === SCENARIOS.length ? C.on : passCount > SCENARIOS.length / 2 ? C.uncertain : C.negative}>{passCount}/{SCENARIOS.length} PASS</Badge> : undefined}
     >
-      <Btn onClick={onRunAll} fullWidth color={C.on} textColor={C.on}>▶ Run All 15 Scenarios</Btn>
-      <div className="tmms-scroll" style={{ maxHeight: 360, overflowY: 'auto', marginTop: 10 }}>
-        {SCENARIOS.map(sc => {
-          const res = results[sc.id];
-          return (
-            <div key={sc.id} style={{ padding: '8px 4px', borderBottom: `1px solid ${C.border}` }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: C.textPrimary }}>#{sc.id} {sc.name}</div>
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
-                  {res && <Badge color={res.pass ? C.on : C.error}>{res.pass ? 'PASS' : 'FAIL'}</Badge>}
-                  <button className="tmms-btn" onClick={() => onRun(sc.id)} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.textSecondary, fontSize: 10, padding: '3px 8px' }}>Run</button>
-                  {res && <button className="tmms-btn" onClick={() => onLoadWorld(res.world)} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.positive, fontSize: 10, padding: '3px 8px' }}>Inspect</button>}
-                </div>
+      <Btn onClick={onRunAll} fullWidth color={C.on} textColor={C.on}>▶ Run All {SCENARIOS.length} Scenarios</Btn>
+
+      {/* Summary stats */}
+      {ranCount > 0 && (
+        <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+          {Object.entries(getScenarioCountByGroup()).map(([g, count]) => {
+            const groupResults = Object.entries(results).filter(([k]) => SCENARIOS.find(s => s.id === k)?.group === g);
+            const groupPass = groupResults.filter(([, r]) => r.pass).length;
+            const groupRan = groupResults.length;
+            return (
+              <div key={g} style={{
+                padding: '3px 8px', borderRadius: 5, fontSize: 9.5, fontFamily: C.mono,
+                background: groupRan > 0 ? (groupPass === count ? `${C.on}15` : `${C.uncertain}15`) : C.panelDeep,
+                border: `1px solid ${groupRan > 0 ? (groupPass === count ? C.on : C.uncertain) : C.border}`,
+                color: groupRan > 0 ? (groupPass === count ? C.on : C.uncertain) : C.textMuted,
+              }}>
+                Grp {g}: {groupRan > 0 ? `${groupPass}/${count}` : `${count}`}
               </div>
-              {res && (
-                <div className="tmms-fade-in" style={{ fontSize: 10, color: C.textMuted, marginTop: 4, fontFamily: C.mono }}>
-                  expected: {res.expected}<br />actual: {res.actual}
-                </div>
-              )}
+            );
+          })}
+        </div>
+      )}
+
+      <div className="tmms-scroll" style={{ maxHeight: 480, overflowY: 'auto', marginTop: 10 }}>
+        {Object.entries(grouped).map(([group, scenarios]) => (
+          <div key={group} style={{ marginBottom: 12 }}>
+            {/* Group header */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px',
+              background: `${groupColor[group] ?? C.border}15`, borderRadius: 5,
+              borderLeft: `3px solid ${groupColor[group] ?? C.border}`, marginBottom: 6,
+            }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: groupColor[group] ?? C.textPrimary, fontFamily: C.mono }}>
+                {groupNames[group] ?? group}
+              </span>
+              <span style={{ fontSize: 9, color: C.textMuted }}>({scenarios.length} scenarios)</span>
             </div>
-          );
-        })}
+
+            {scenarios.map(sc => {
+              const res = results[sc.id];
+              return (
+                <div key={sc.id} style={{ padding: '6px 4px', borderBottom: `1px solid ${C.border}` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                      <span style={{
+                        fontSize: 9, fontFamily: C.mono, fontWeight: 700,
+                        color: groupColor[sc.group] ?? C.textMuted, width: 22, flexShrink: 0,
+                      }}>{sc.id}</span>
+                      <span style={{ fontSize: 10.5, fontWeight: 600, color: C.textPrimary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{sc.name}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
+                      {res && <Badge color={res.pass ? C.on : C.error}>{res.pass ? 'PASS' : 'FAIL'}</Badge>}
+                      <button className="tmms-btn" onClick={() => onRun(sc.id)} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.textSecondary, fontSize: 10, padding: '2px 7px' }}>Run</button>
+                      {res && <button className="tmms-btn" onClick={() => onLoadWorld(res.world)} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.positive, fontSize: 10, padding: '2px 7px' }}>Inspect</button>}
+                    </div>
+                  </div>
+                  {res && (
+                    <div className="tmms-fade-in">
+                      <div style={{ fontSize: 9.5, color: C.textMuted, marginTop: 3, fontFamily: C.mono, lineHeight: 1.5 }}>
+                        <span style={{ color: res.pass ? C.onDim : C.negativeDim }}>E: {res.expected}</span><br />
+                        <span style={{ color: res.pass ? C.on : C.error }}>A: {res.actual}</span>
+                      </div>
+                      {/* Expandable 20-field debug panel */}
+                      <ScenarioDebugPanel debug={res.debugInfo} group={sc.group} id={sc.id} />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ))}
       </div>
     </Panel>
   );
@@ -756,11 +898,58 @@ function DebugEventLog({ events, onClear }: { events: SimEvent[]; onClear: () =>
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SECTION 16 — Report & Confirmation Tracker (Timestamp Rule)
+// ════════════════════════════════════════════════════════════════════════════
+function ReportConfirmationTracker({ world }: { world: SimWorld }) {
+  const reports = world.reports;
+  if (reports.length === 0) {
+    return (
+      <Panel title="⑯ REPORT & CONFIRMATION TRACKER" subtitle="Community Confirmation Timestamp Rule enforcement" collapsible defaultOpen={false} accent={C.generated}>
+        <div style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', padding: '10px 0' }}>No reports submitted yet.</div>
+      </Panel>
+    );
+  }
+  return (
+    <Panel title="⑯ REPORT & CONFIRMATION TRACKER" subtitle="Timestamp Rule: reports are authoritative" collapsible defaultOpen={false} accent={C.generated}>
+      <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 8 }}>
+        Total confidence: <span style={{ color: C.positive, fontWeight: 700 }}>{world.confidenceScore}%</span> ·
+        Reports: {reports.length} · Confirmations: {reports.reduce((s, r) => s + r.confirmations.length, 0)}
+      </div>
+      {reports.map((r, i) => (
+        <div key={r.id} style={{
+          padding: '6px 8px', marginBottom: 6, borderRadius: 5,
+          background: r.processed ? `${C.positive}08` : `${C.uncertain}08`,
+          border: `1px solid ${r.processed ? C.positive + '30' : C.uncertain + '30'}`,
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Badge color={stateColor(r.state)}>{r.state}</Badge>
+              <span style={{ fontSize: 10, color: C.textMuted, fontFamily: C.mono }}>{fmtClock(r.reportTimestampIso)}</span>
+              {r.isStandaloneConfirmation && <Badge color={C.uncertain}>standalone</Badge>}
+            </div>
+            <Badge color={r.processed ? C.positive : C.uncertain}>{r.processed ? 'processed' : 'unprocessed'}</Badge>
+          </div>
+          {r.confirmations.length > 0 && (
+            <div style={{ marginTop: 4, paddingLeft: 8 }}>
+              {r.confirmations.map((c, ci) => (
+                <div key={ci} style={{ fontSize: 9.5, color: C.textSecondary, fontFamily: C.mono }}>
+                  └─ Confirm #{ci + 1}: {fmtClock(c.timestampIso)} by {c.reporterName}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </Panel>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════════════════════
 export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: SimWorld } = {}) {
   const [world, setWorld] = useState<SimWorld>(() => initialWorld ?? createInitialWorld());
-  const [scenarioResults, setScenarioResults] = useState<Record<number, ScenarioResult>>({});
+  const [scenarioResults, setScenarioResults] = useState<Record<string, ScenarioResult>>({});
 
   const handleForce = useCallback((s: 'ON' | 'OFF') => setWorld(w => forceGrowattState(w, s)), []);
   const handleAdvance = useCallback((min: number) => setWorld(w => advanceTime(w, min)), []);
@@ -768,7 +957,15 @@ export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: Si
   const handleReset = useCallback(() => { setWorld(resetWorld()); setScenarioResults({}); }, []);
   const handleModeChange = useCallback((m: 'AUTO' | 'MANUAL') => setWorld(w => setTransitionMode(w, m)), []);
   const handleScheduleChange = useCallback((t: ScheduleEntryTemplate[]) => setWorld(w => setSchedule(w, t)), []);
-  const handleReportAction = useCallback((s: 'ON' | 'OFF', kind: 'report' | 'confirm') => setWorld(w => submitReportOrConfirm(w, s, kind)), []);
+
+  const handleReportAction = useCallback((s: 'ON' | 'OFF', kind: 'report' | 'confirm') => {
+    if (kind === 'report') {
+      setWorld(w => submitReport(w, s));
+    } else {
+      setWorld(w => submitConfirmation(w, s));
+    }
+  }, []);
+
   const handleJumpToOverrun = useCallback(() => {
     setWorld(w => {
       const r = w.lastResult;
@@ -782,17 +979,21 @@ export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: Si
     });
   }, []);
 
-  const handleRunScenario = useCallback((id: number) => {
+  const handleRunScenario = useCallback((id: string) => {
     const sc = SCENARIOS.find(s => s.id === id);
     if (!sc) return;
     const result = sc.run();
     setScenarioResults(prev => ({ ...prev, [id]: result }));
   }, []);
+
   const handleRunAll = useCallback(() => {
-    const results: Record<number, ScenarioResult> = {};
-    for (const sc of SCENARIOS) results[sc.id] = sc.run();
+    const results: Record<string, ScenarioResult> = {};
+    for (const sc of SCENARIOS) {
+      results[sc.id] = sc.run();
+    }
     setScenarioResults(results);
   }, []);
+
   const handleLoadWorld = useCallback((w: SimWorld) => setWorld(w), []);
   const handleClearLog = useCallback(() => setWorld(w => ({ ...w, eventLog: [] })), []);
 
@@ -808,7 +1009,9 @@ export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: Si
           <div style={{ fontSize: 17, fontWeight: 800, letterSpacing: 0.5 }}>
             TMMS V2 <span style={{ color: C.uncertain }}>DEBUG SIMULATOR</span>
           </div>
-          <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>Development tool only · drives the real engine, not a mock</div>
+          <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>
+            Complete Scenario Validation & Compliance Framework · Groups A–K · {SCENARIOS.length} scenarios · drives the real engine
+          </div>
         </div>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           {r && <Badge color={modeColor(r.atc.mode)} glow={r.atc.mode === 'UNCERTAIN_ZONE'}>{r.atc.mode}</Badge>}
@@ -818,12 +1021,13 @@ export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: Si
       </div>
 
       {/* 3-column grid */}
-      <div className="tmms-grid" style={{ display: 'grid', gridTemplateColumns: '300px 1fr 320px', gap: 16, alignItems: 'start' }}>
+      <div className="tmms-grid" style={{ display: 'grid', gridTemplateColumns: '300px 1fr 340px', gap: 16, alignItems: 'start' }}>
         {/* LEFT: controls */}
         <div className="tmms-col">
           <ScheduleBuilder world={world} onChange={handleScheduleChange} />
           <GrowattSimulator world={world} onForce={handleForce} onAdvance={handleAdvance} onSetNow={handleSetNow} onReset={handleReset} />
-          <ReportSimulator onAction={handleReportAction} />
+          <ReportSimulator world={world} onAction={handleReportAction} />
+          <ReportConfirmationTracker world={world} />
         </div>
 
         {/* CENTER: visualization + inspectors */}
