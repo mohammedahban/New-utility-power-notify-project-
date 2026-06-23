@@ -14,8 +14,6 @@ import { useAdminResyncHistory, useUnreviewedConflictsCount } from '../../hooks/
 import { AR } from '../../constants/arabic';
 import { supabase } from '../../lib/supabase';
 
-// ── ADDED IMPORT: TMMS Simulator ─────────────────────────────────────────────
-import TMMSDebugSimulator from './TMMSDebugSimulator';
 
 // ── 3-day Accuracy Mini-Sparkline ───────────────────────────────────────────
 interface DayAccuracy { label: string; avg: number; count: number; }
@@ -474,17 +472,6 @@ export default function AdminDashboard() {
         </View>
       </View>
 
-      {/* ── ADDED COMPONENT: TMMS Debug Simulator Wrapper ───────────────────── */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>⚙️ جهاز محاكاة TMMS (بيئة التطوير)</Text>
-        </View>
-        <View style={styles.simulatorWrapper}>
-          <TMMSDebugSimulator />
-        </View>
-      </View>
-      {/* ──────────────────────────────────────────────────────────────────── */}
-
 
       <View style={styles.navRow}>
         <TouchableOpacity style={[styles.navBtn, { flex: 1 }]} onPress={() => router.push('/(admin)/settings')} activeOpacity={0.75}>
@@ -530,5 +517,4 @@ const styles = StyleSheet.create({
   navBtn: { backgroundColor: '#1e293b', padding: 16, borderRadius: 14, alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
   navBtnAccent: { borderColor: '#4c1d95', backgroundColor: '#1a1035' },
   navBtnText: { color: '#38bdf8', fontWeight: '700', fontSize: 14 },
-  simulatorWrapper: { borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: '#334155', backgroundColor: '#0A0E12' },
 });
