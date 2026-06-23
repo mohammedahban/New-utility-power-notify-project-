@@ -411,6 +411,45 @@ export function findActiveSlotInRawSchedule(
   return best;
 }
 
+// ── Compute expected end of current Growatt state using schedule durations ──────
+function computeExpectedStateEnd(
+  rawSchedule: ScheduleSlot[],
+  state: 'ON' | 'OFF',
+  transitionTimeIso: string,
+): { endIso: string; durationMin: number } | null {
+  const transitionMs = new Date(transitionTimeIso).getTime();
+
+  // First, try to find a schedule slot of the given state that contains the transition time
+  for (const s of rawSchedule) {
+    if (s.state !== state || !s.endIso) continue;
+    const startMs = new Date(s.startIso).getTime();
+    const endMs = new Date(s.endIso).getTime();
+    if (transitionMs >= startMs && transitionMs < endMs) {
+      return { endIso: s.endIso, durationMin: (endMs - startMs) / 60_000 };
+    }
+  }
+
+  // If no containing slot, find the next slot of the same state and borrow its duration
+  let bestSlot: ScheduleSlot | null = null;
+  let bestStartMs = Infinity;
+  for (const s of rawSchedule) {
+    if (s.state !== state || !s.endIso) continue;
+    const sStartMs = new Date(s.startIso).getTime();
+    if (sStartMs >= transitionMs && sStartMs < bestStartMs) {
+      bestStartMs = sStartMs;
+      bestSlot = s;
+    }
+  }
+
+  if (bestSlot && bestSlot.endIso) {
+    const durationMs = new Date(bestSlot.endIso).getTime() - new Date(bestSlot.startIso).getTime();
+    const expectedEndMs = transitionMs + durationMs;
+    return { endIso: new Date(expectedEndMs).toISOString(), durationMin: durationMs / 60_000 };
+  }
+
+  return null;
+}
+
 // ── Rule 4 + Rule 5: compute the offset (sign + magnitude) ─────────────────────
 export function computeCommunityOffset(
   rawSchedule: ScheduleSlot[],
@@ -421,15 +460,17 @@ export function computeCommunityOffset(
   const startMs = new Date(resync.syncedAtIso).getTime();
   const reportedState = resync.syncedState;
 
-  let referenceIso: string | null;
-  let referenceKind: OffsetReferenceKind;
+  let referenceIso: string | null = null;
+  let referenceKind: OffsetReferenceKind = growattCurrentState === 'ON' ? 'GROWATT_ON_END_EXPECTED' : 'GROWATT_OFF_END_EXPECTED';
 
   if (growattCurrentState === reportedState) {
+    // Report matches current Growatt state → reference is the actual transition start
     referenceIso  = growattLastTransitionAt;
     referenceKind = reportedState === 'ON' ? 'GROWATT_ON_START_ACTUAL' : 'GROWATT_OFF_START_ACTUAL';
-  } else {
-    const rawActiveSlot = findActiveSlotInRawSchedule(rawSchedule, growattCurrentState, startMs);
-    referenceIso  = rawActiveSlot?.endIso ?? null;
+  } else if (growattLastTransitionAt) {
+    // Report differs from Growatt state → reference is expected end of current Growatt state
+    const expectedEnd = computeExpectedStateEnd(rawSchedule, growattCurrentState, growattLastTransitionAt);
+    referenceIso = expectedEnd?.endIso ?? null;
     referenceKind = growattCurrentState === 'ON' ? 'GROWATT_ON_END_EXPECTED' : 'GROWATT_OFF_END_EXPECTED';
   }
 
@@ -486,9 +527,21 @@ export function computeCommunityTransition(
     }
   }
   if (interruptedSlotIdx === -1) {
+    // Fallback 1: find the last interrupted-state slot that starts before syncMs
     for (let i = offsetSlots.length - 1; i >= 0; i--) {
       if (offsetSlots[i].state !== interruptedState) continue;
       if (new Date(offsetSlots[i].startIso).getTime() <= syncMs) {
+        interruptedSlotIdx = i;
+        break;
+      }
+    }
+  }
+  if (interruptedSlotIdx === -1) {
+    // Fallback 2: find the NEXT interrupted-state slot that starts after syncMs
+    // (report arrived before the interrupted cycle even started — preemptive report)
+    for (let i = 0; i < offsetSlots.length; i++) {
+      if (offsetSlots[i].state !== interruptedState) continue;
+      if (new Date(offsetSlots[i].startIso).getTime() > syncMs) {
         interruptedSlotIdx = i;
         break;
       }
@@ -1011,7 +1064,7 @@ export function deriveCurrentStateATC(
   atcMode: ScheduleStateMode,
   masterCurrentState: 'ON' | 'OFF',
   resyncPoint: ResyncPoint | null,
-  transitionMode: TransitionMode = 'AUTO',
+  _transitionMode: TransitionMode = 'AUTO',
   communityTransition?: CommunityTransitionResult | null,
   nowMs: number = Date.now(),
 ): { state: 'ON' | 'OFF'; startIso: string | null } {
@@ -1150,7 +1203,7 @@ export function applyOffsetToPrediction(
   resyncPoint?: ResyncPoint | null,
   communitySyncMeta?: CommunitySyncMeta | null,
   transitionMode: TransitionMode = 'AUTO',
-  heldCycleStartIso?: string | null,
+  _heldCycleStartIso?: string | null,
   frozenCommunityOffsetMinutes?: number | null,
   onOffsetCalculated?: (
     offsetMinutes: number,
