@@ -16,14 +16,12 @@ import {
   fmtYemenTime,
   getZoneFromIso,
   durationLabelFromMin,
-  computeCommunityOffset,
   type Prediction,
   type ScheduleSlot,
   type ResyncPoint,
   type UserPrediction,
   type TransitionMode,
   type DecisionStep,
-  type CommunityTransitionResult,
 } from './tmmsEngine';
 
 // ── Schedule template ─────────────────────────────────────────────────────────
@@ -104,7 +102,7 @@ export interface SimReportEntry {
   confidenceScore: number;
   confirmations: SimConfirmationEntry[];
   /** The engine result when this report was processed */
-  transitionResult: CommunityTransitionResult | null;
+  transitionResult: any;
 }
 
 /** Full per-scenario debug payload (20 required fields from spec) */
@@ -460,6 +458,43 @@ export function submitConfirmation(
   const processedReport = findProcessedReport(world, state) ?? findLatestReport(world, state);
 
   if (processedReport) {
+    // SPECIAL: If currently in UNCERTAIN_ZONE, treat confirmation as a new resync
+    // to exit the zone (I2 scenario)
+    const inUncertainZone = world.lastResult?.atc.mode === 'UNCERTAIN_ZONE';
+    if (inUncertainZone) {
+      const resyncPoint: ResyncPoint = {
+        syncedState: state,
+        syncedAtIso: confirmAtIso,
+        appliedAtIso: new Date(world.simulatedNowMs).toISOString(),
+        reporterName,
+        reporterReliability: 90,
+      };
+      const newConfidence = Math.min(100, world.confidenceScore + 15);
+      let next: SimWorld = {
+        ...world,
+        resyncPoint,
+        frozenCommunityOffsetMinutes: null,
+        confidenceScore: newConfidence,
+      };
+      const result = runEngine(next);
+      const meta = result.communityTransitionMeta;
+      const updatedReports = world.reports.map(r =>
+        r.id === processedReport.id
+          ? { ...r, confirmations: [...r.confirmations, confirmationEntry], confidenceScore: Math.min(100, r.confidenceScore + 15) }
+          : r,
+      );
+      const log: SimEvent[] = [
+        ...world.eventLog,
+        makeEvent(next, 'confirm', `Confirmation ${state} during UNCERTAIN_ZONE`, null, `exiting zone — confirm at ${fmtYemenTime(confirmAtIso)}`),
+        makeEvent(next, 'info', `Confidence increased`, null, `${world.confidenceScore} → ${newConfidence}`),
+      ];
+      if (meta?.isFreshOffsetComputation) {
+        next = { ...next, frozenCommunityOffsetMinutes: meta.offsetMinutes };
+      }
+      return { ...next, reports: updatedReports, eventLog: log, lastResult: result, lastDecisionTrace: meta?.decisionTrace ?? next.lastDecisionTrace };
+    }
+
+    // Normal Case 2: just increase confidence
     const newConfidence = Math.min(100, world.confidenceScore + 15);
 
     // Add confirmation to the report
@@ -520,13 +555,18 @@ export function setSimulatedNow(world: SimWorld, nowMs: number): SimWorld {
 }
 
 export function forceGrowattState(world: SimWorld, state: 'ON' | 'OFF'): SimWorld {
-  if (state === world.growattCurrentState) return world;
+  // Always update transition time — even if state is the same — so simulator
+  // scenarios that call forceGrowattState at a specific moment get the
+  // transition time they expect (anchor for the generated-state / offset calc).
   const next: SimWorld = {
     ...world,
     growattCurrentState: state,
     growattLastTransitionAt: new Date(world.simulatedNowMs).toISOString(),
   };
-  next.eventLog = [...world.eventLog, makeEvent(next, 'growatt', `Growatt forced ${state}`, null, `at ${fmtYemenTime(next.growattLastTransitionAt)}`)];
+  const action = state === world.growattCurrentState
+    ? `Growatt reaffirmed ${state} (time updated)`
+    : `Growatt forced ${state}`;
+  next.eventLog = [...world.eventLog, makeEvent(next, 'growatt', action, null, `at ${fmtYemenTime(next.growattLastTransitionAt)}`)];
   return refreshResult(next);
 }
 
@@ -781,7 +821,7 @@ export const SCENARIOS: ScenarioDef[] = [
   // ════════════════════════════════════════════════════════════════════════════
 
   {
-    group: 'B', id: 'B1', name: 'OFF Progress 20% + Report ON', description: 'OFF cycle at 20% progress. Report ON.', expected: 'Previous ON = 3h. Offset Negative.',
+    group: 'B', id: 'B1', name: 'OFF Progress 20% + Report ON', description: 'OFF cycle at 20% progress. Report ON.', expected: 'Previous ON = 2h (from schedule). Offset Negative.',
     run: () => {
       const { world: w0, anchor } = freshMasterSchedule(SCENARIOS_BASE_NOW);
       // OFF starts at anchor+120m, 6h duration. 20% = 72m into OFF.
@@ -791,13 +831,14 @@ export const SCENARIOS: ScenarioDef[] = [
       world = submitReport(world, 'ON');
       const meta = world.lastResult?.communityTransitionMeta;
       const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 180 && meta?.durationSelectionRule === 'OFF_PROGRESS_LT_50_BEFORE';
-      const actual = `dur=${durMin}min (Previous ON=3h), rule=${meta?.durationSelectionRule}, offsetSign=${meta?.offsetSign}`;
-      return { pass, actual, expected: 'dur=180min, OFF_PROGRESS_LT_50_BEFORE, offset=NEGATIVE', world, debugInfo: extractDebugInfo(world, 'dur=180min (Previous ON), NEGATIVE', actual, pass) };
+      // Previous ON in master schedule is the 02:00-04:00 ON (2h = 120m)
+      const pass = durMin === 120 && meta?.durationSelectionRule === 'OFF_PROGRESS_LT_50_BEFORE';
+      const actual = `dur=${durMin}min (Previous ON=2h), rule=${meta?.durationSelectionRule}, offsetSign=${meta?.offsetSign}`;
+      return { pass, actual, expected: 'dur=120min, OFF_PROGRESS_LT_50_BEFORE, offset=NEGATIVE', world, debugInfo: extractDebugInfo(world, 'dur=120min (Previous ON), NEGATIVE', actual, pass) };
     },
   },
   {
-    group: 'B', id: 'B2', name: 'OFF Progress 80% + Report ON', description: 'OFF cycle at 80% progress. Report ON.', expected: 'Next ON = 2h. Offset Negative.',
+    group: 'B', id: 'B2', name: 'OFF Progress 80% + Report ON', description: 'OFF cycle at 80% progress. Report ON.', expected: 'Next ON = 3h (from schedule). Offset Negative.',
     run: () => {
       const { world: w0, anchor } = freshMasterSchedule(SCENARIOS_BASE_NOW);
       let world = setSimulatedNow(w0, new Date(anchor).getTime() + 120 * 60_000);
@@ -806,9 +847,10 @@ export const SCENARIOS: ScenarioDef[] = [
       world = submitReport(world, 'ON');
       const meta = world.lastResult?.communityTransitionMeta;
       const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 120 && meta?.durationSelectionRule === 'OFF_PROGRESS_GT_50_AFTER';
-      const actual = `dur=${durMin}min (Next ON=2h), rule=${meta?.durationSelectionRule}, offsetSign=${meta?.offsetSign}`;
-      return { pass, actual, expected: 'dur=120min, OFF_PROGRESS_GT_50_AFTER, offset=NEGATIVE', world, debugInfo: extractDebugInfo(world, 'dur=120min (Next ON), NEGATIVE', actual, pass) };
+      // Next ON in master schedule after the 04:00-10:00 OFF is the 10:00-13:00 ON (3h = 180m)
+      const pass = durMin === 180 && meta?.durationSelectionRule === 'OFF_PROGRESS_GT_50_AFTER';
+      const actual = `dur=${durMin}min (Next ON=3h), rule=${meta?.durationSelectionRule}, offsetSign=${meta?.offsetSign}`;
+      return { pass, actual, expected: 'dur=180min, OFF_PROGRESS_GT_50_AFTER, offset=NEGATIVE', world, debugInfo: extractDebugInfo(world, 'dur=180min (Next ON), NEGATIVE', actual, pass) };
     },
   },
   {
@@ -965,7 +1007,7 @@ export const SCENARIOS: ScenarioDef[] = [
     },
   },
   {
-    group: 'C', id: 'C7', name: 'Confirm ON at OFF 20% — B1 equivalent', description: 'Confirmation ON during OFF at 20% progress.', expected: 'Same as B1: Previous ON=3h, NEGATIVE.',
+    group: 'C', id: 'C7', name: 'Confirm ON at OFF 20% — B1 equivalent', description: 'Confirmation ON during OFF at 20% progress.', expected: 'Same as B1: Previous ON=2h, NEGATIVE.',
     run: () => {
       const { world: w0, anchor } = freshMasterSchedule(SCENARIOS_BASE_NOW);
       let world = setSimulatedNow(w0, new Date(anchor).getTime() + 120 * 60_000);
@@ -974,13 +1016,13 @@ export const SCENARIOS: ScenarioDef[] = [
       world = submitConfirmation(world, 'ON');
       const meta = world.lastResult?.communityTransitionMeta;
       const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 180 && meta?.durationSelectionRule === 'OFF_PROGRESS_LT_50_BEFORE';
+      const pass = durMin === 120 && meta?.durationSelectionRule === 'OFF_PROGRESS_LT_50_BEFORE';
       const actual = `dur=${durMin}min, rule=${meta?.durationSelectionRule}`;
-      return { pass, actual, expected: 'dur=180min, OFF_PROGRESS_LT_50_BEFORE — same as report', world, debugInfo: extractDebugInfo(world, 'dur=180min, NEGATIVE', actual, pass) };
+      return { pass, actual, expected: 'dur=120min, OFF_PROGRESS_LT_50_BEFORE — same as report', world, debugInfo: extractDebugInfo(world, 'dur=120min, NEGATIVE', actual, pass) };
     },
   },
   {
-    group: 'C', id: 'C8', name: 'Confirm ON at OFF 80% — B2 equivalent', description: 'Confirmation ON during OFF at 80% progress.', expected: 'Same as B2: Next ON=2h, NEGATIVE.',
+    group: 'C', id: 'C8', name: 'Confirm ON at OFF 80% — B2 equivalent', description: 'Confirmation ON during OFF at 80% progress.', expected: 'Same as B2: Next ON=3h, NEGATIVE.',
     run: () => {
       const { world: w0, anchor } = freshMasterSchedule(SCENARIOS_BASE_NOW);
       let world = setSimulatedNow(w0, new Date(anchor).getTime() + 120 * 60_000);
@@ -989,9 +1031,9 @@ export const SCENARIOS: ScenarioDef[] = [
       world = submitConfirmation(world, 'ON');
       const meta = world.lastResult?.communityTransitionMeta;
       const durMin = meta ? (new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000 : null;
-      const pass = durMin === 120 && meta?.durationSelectionRule === 'OFF_PROGRESS_GT_50_AFTER';
+      const pass = durMin === 180 && meta?.durationSelectionRule === 'OFF_PROGRESS_GT_50_AFTER';
       const actual = `dur=${durMin}min, rule=${meta?.durationSelectionRule}`;
-      return { pass, actual, expected: 'dur=120min, OFF_PROGRESS_GT_50_AFTER — same as report', world, debugInfo: extractDebugInfo(world, 'dur=120min, NEGATIVE', actual, pass) };
+      return { pass, actual, expected: 'dur=180min, OFF_PROGRESS_GT_50_AFTER — same as report', world, debugInfo: extractDebugInfo(world, 'dur=180min, NEGATIVE', actual, pass) };
     },
   },
   {
@@ -1411,15 +1453,17 @@ export const SCENARIOS: ScenarioDef[] = [
       const reportMs = world.simulatedNowMs;
       world = submitReport(world, 'ON', reportMs); // Process report
       const confidenceBefore = world.confidenceScore;
-      const slotsBefore = world.lastResult?.daySchedule.length ?? 0;
+      const genStartBefore = world.lastResult?.communityTransitionMeta?.generatedCycleStartIso;
       // Confirmation 10 min later
       world = setSimulatedNow(world, reportMs + 10 * 60_000);
       world = submitConfirmation(world, 'ON', reportMs + 10 * 60_000);
       const confidenceAfter = world.confidenceScore;
-      const noNewTransition = (world.lastResult?.daySchedule.length ?? 0) === slotsBefore;
-      const pass = confidenceAfter > confidenceBefore && noNewTransition && world.reports[0].confirmations.length === 1;
-      const actual = `confidence=${confidenceBefore}→${confidenceAfter}, noNewTransition=${noNewTransition}, confirms=${world.reports[0].confirmations.length}`;
-      return { pass, actual, expected: 'confidence increased, no new transition', world, debugInfo: extractDebugInfo(world, 'Confidence only (+10m)', actual, pass) };
+      // No new generated state should be created (same start time)
+      const genStartAfter = world.lastResult?.communityTransitionMeta?.generatedCycleStartIso;
+      const noNewGenState = genStartBefore === genStartAfter;
+      const pass = confidenceAfter > confidenceBefore && noNewGenState && world.reports[0].confirmations.length === 1;
+      const actual = `confidence=${confidenceBefore}→${confidenceAfter}, noNewGenState=${noNewGenState}, confirms=${world.reports[0].confirmations.length}`;
+      return { pass, actual, expected: 'confidence increased, no new generated state', world, debugInfo: extractDebugInfo(world, 'Confidence only (+10m)', actual, pass) };
     },
   },
   {
@@ -1564,7 +1608,6 @@ export const SCENARIOS: ScenarioDef[] = [
       const modeAfterEnd = world.lastResult?.atc.mode;
       // Now confirmation arrives 5h after report
       world = setSimulatedNow(world, reportMs + 8 * 3600 * 1000);
-      const reportsBefore = world.reports.length;
       const slotsBefore = world.lastResult?.daySchedule.length ?? 0;
       world = submitConfirmation(world, 'ON', reportMs + 8 * 3600 * 1000);
       const noNewSlots = (world.lastResult?.daySchedule.length ?? 0) <= slotsBefore + 1; // +1 tolerance
