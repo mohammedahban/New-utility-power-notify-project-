@@ -481,7 +481,7 @@ export default function AdminDashboard() {
             <Text style={styles.sectionTitle}>⚙️ جهاز محاكاة TMMS (بيئة التطوير)</Text>
           </View>
           <View style={styles.simulatorWrapper}>
-            <TMMSDebugSimulator.native/>
+            <TMMSDebugSimulator/>
           </View>
         </View>
       )}
