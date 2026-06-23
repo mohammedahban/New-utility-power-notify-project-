@@ -395,59 +395,170 @@ export function findActiveSlotInRawSchedule(
   state: 'ON' | 'OFF',
   atMs: number,
 ): ScheduleSlot | null {
+  // 1) Exact match — a slot of this state literally spans atMs.
   for (const s of rawSchedule) {
     if (s.state !== state || !s.endIso) continue;
     const startMs = new Date(s.startIso).getTime();
     const endMs   = new Date(s.endIso).getTime();
     if (atMs >= startMs && atMs <= endMs) return s;
   }
-  let best: ScheduleSlot | null = null;
-  let bestDist = Infinity;
+  // 2) No exact match — atMs falls in a gap (the state's slot already ended
+  //    on the predicted schedule, but Growatt's sensor hasn't caught up to
+  //    the transition yet — exactly the case GROWATT_*_END_EXPECTED exists
+  //    for). The correct reference is the MOST RECENTLY ENDED past
+  //    occurrence of this state — never a future one, even if a future
+  //    occurrence's *start* happens to be numerically closer to atMs than
+  //    the true past occurrence's start. Only fall back to the nearest
+  //    future occurrence if no past one exists at all (e.g. atMs precedes
+  //    the entire schedule).
+  let bestPast: ScheduleSlot | null = null;
+  let bestPastEndMs = -Infinity;
+  let bestFuture: ScheduleSlot | null = null;
+  let bestFutureStartMs = Infinity;
   for (const s of rawSchedule) {
     if (s.state !== state || !s.endIso) continue;
-    const dist = Math.abs(new Date(s.startIso).getTime() - atMs);
-    if (dist < bestDist) { bestDist = dist; best = s; }
+    const startMs = new Date(s.startIso).getTime();
+    const endMs   = new Date(s.endIso).getTime();
+    if (endMs <= atMs && endMs > bestPastEndMs) { bestPastEndMs = endMs; bestPast = s; }
+    if (startMs > atMs && startMs < bestFutureStartMs) { bestFutureStartMs = startMs; bestFuture = s; }
+  }
+  return bestPast ?? bestFuture ?? null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// COMMUNITY CONFIRMATION TIMESTAMP RULE
+// ════════════════════════════════════════════════════════════════════════════
+// A Community Confirmation must NEVER create a new transition using its own
+// timestamp. All calculations (Generated State Start, Offset, Duration
+// Selection, Timeline Reconstruction, Schedule Continuity) must use the
+// ORIGINAL REPORT TIMESTAMP. The Confirmation Timestamp may only affect:
+// Confidence Score / Trust Level / Community Reliability / Report Validation
+// Status. See LATE CONFIRMATION RULE (24h max window) and UNPROCESSED REPORT
+// RULE (a confirmation may trigger processing of a still-pending report, but
+// processing always uses that report's *original* timestamp).
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Maximum window (spec: 24 Hours) during which a confirmation can still be
+ *  matched to its originating report. Outside this window there is no
+ *  report left to confirm, so the signal is treated as a fresh, independent
+ *  report instead (see Scenario Group C: a "bare" confirmation with no
+ *  antecedent report is itself authoritative). */
+export const MAX_CONFIRMATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export type TrustLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'VERIFIED';
+
+export interface ConfirmationEntry {
+  confirmedAtIso: string;
+  confirmerName: string | null;
+  hoursAfterReport: number;
+  confidenceScoreAfter: number;
+}
+
+export interface ReportRecord {
+  id: string;
+  state: 'ON' | 'OFF';
+  /** The ONE authoritative event timestamp. Set once, at creation. Never
+   *  overwritten by any confirmation, no matter how many arrive or how late. */
+  originalReportAtIso: string;
+  reporterName: string | null;
+  /** ISO time the engine actually derived a transition from this report.
+   *  null = pending ("Report Exists But Not Processed" — UNPROCESSED REPORT
+   *  RULE). A later confirmation may trigger processing, but will use
+   *  originalReportAtIso, never its own timestamp, when it does. */
+  processedAtIso: string | null;
+  confidenceScore: number;
+  trustLevel: TrustLevel;
+  confirmations: ConfirmationEntry[];
+}
+
+/**
+ * Simulator scoring convention — the spec mandates the *directional*
+ * behavior (confidence only ever rises, only via confirmations, and nothing
+ * else does) but does not specify exact point values. This formula is an
+ * illustrative, tunable convention: base 40 on creation ("LOW"), +20 per
+ * confirmation inside the Max Confirmation Window, capped at 100 ("VERIFIED").
+ */
+export const BASE_REPORT_CONFIDENCE = 40;
+export const CONFIRMATION_CONFIDENCE_BONUS = 20;
+
+export function trustLevelForScore(score: number): TrustLevel {
+  if (score >= 90) return 'VERIFIED';
+  if (score >= 70) return 'HIGH';
+  if (score >= 40) return 'MEDIUM';
+  return 'LOW';
+}
+
+let reportIdCounter = 0;
+export function createReportRecord(
+  state: 'ON' | 'OFF',
+  originalReportAtIso: string,
+  reporterName: string | null,
+  processed: boolean,
+  processedAtIso: string | null,
+): ReportRecord {
+  reportIdCounter += 1;
+  return {
+    id: `report_${reportIdCounter}_${Date.parse(originalReportAtIso)}`,
+    state,
+    originalReportAtIso,
+    reporterName,
+    processedAtIso: processed ? processedAtIso : null,
+    confidenceScore: BASE_REPORT_CONFIDENCE,
+    trustLevel: trustLevelForScore(BASE_REPORT_CONFIDENCE),
+    confirmations: [],
+  };
+}
+
+/**
+ * Find the report an incoming confirmation should attach to: same state,
+ * originally reported at-or-before the confirmation, within the Max
+ * Confirmation Window. Picks the most recent qualifying report (there should
+ * normally be at most one candidate, but this disambiguates defensively).
+ * Returns null if there is no report left to confirm — the caller should
+ * then treat the confirmation as a fresh, independent report (Group C).
+ */
+export function findConfirmableReport(
+  reports: ReportRecord[],
+  state: 'ON' | 'OFF',
+  confirmedAtMs: number,
+): ReportRecord | null {
+  let best: ReportRecord | null = null;
+  let bestMs = -Infinity;
+  for (const r of reports) {
+    if (r.state !== state) continue;
+    const originalMs = new Date(r.originalReportAtIso).getTime();
+    const deltaMs = confirmedAtMs - originalMs;
+    if (deltaMs < 0 || deltaMs > MAX_CONFIRMATION_WINDOW_MS) continue; // outside the window, or predates the report
+    if (originalMs > bestMs) { bestMs = originalMs; best = r; }
   }
   return best;
 }
 
-// ── Compute expected end of current Growatt state using schedule durations ──────
-function computeExpectedStateEnd(
-  rawSchedule: ScheduleSlot[],
-  state: 'ON' | 'OFF',
-  transitionTimeIso: string,
-): { endIso: string; durationMin: number } | null {
-  const transitionMs = new Date(transitionTimeIso).getTime();
-
-  // First, try to find a schedule slot of the given state that contains the transition time
-  for (const s of rawSchedule) {
-    if (s.state !== state || !s.endIso) continue;
-    const startMs = new Date(s.startIso).getTime();
-    const endMs = new Date(s.endIso).getTime();
-    if (transitionMs >= startMs && transitionMs < endMs) {
-      return { endIso: s.endIso, durationMin: (endMs - startMs) / 60_000 };
-    }
-  }
-
-  // If no containing slot, find the next slot of the same state and borrow its duration
-  let bestSlot: ScheduleSlot | null = null;
-  let bestStartMs = Infinity;
-  for (const s of rawSchedule) {
-    if (s.state !== state || !s.endIso) continue;
-    const sStartMs = new Date(s.startIso).getTime();
-    if (sStartMs >= transitionMs && sStartMs < bestStartMs) {
-      bestStartMs = sStartMs;
-      bestSlot = s;
-    }
-  }
-
-  if (bestSlot && bestSlot.endIso) {
-    const durationMs = new Date(bestSlot.endIso).getTime() - new Date(bestSlot.startIso).getTime();
-    const expectedEndMs = transitionMs + durationMs;
-    return { endIso: new Date(expectedEndMs).toISOString(), durationMin: durationMs / 60_000 };
-  }
-
-  return null;
+/**
+ * Apply a confirmation to an existing report. Confidence/trust ONLY — never
+ * touches originalReportAtIso, never triggers a new transition. Safe to call
+ * for late confirmations (LATE CONFIRMATION RULE): being outside the normal
+ * flow changes nothing about this function's effect, since it never had any
+ * side-effect beyond confidence in the first place.
+ */
+export function applyConfirmationToReport(
+  report: ReportRecord,
+  confirmedAtIso: string,
+  confirmerName: string | null,
+): ReportRecord {
+  const originalMs  = new Date(report.originalReportAtIso).getTime();
+  const confirmedMs = new Date(confirmedAtIso).getTime();
+  const hoursAfterReport = (confirmedMs - originalMs) / 3_600_000;
+  const newScore = Math.min(100, report.confidenceScore + CONFIRMATION_CONFIDENCE_BONUS);
+  return {
+    ...report,
+    confidenceScore: newScore,
+    trustLevel: trustLevelForScore(newScore),
+    confirmations: [
+      ...report.confirmations,
+      { confirmedAtIso, confirmerName, hoursAfterReport, confidenceScoreAfter: newScore },
+    ],
+  };
 }
 
 // ── Rule 4 + Rule 5: compute the offset (sign + magnitude) ─────────────────────
@@ -460,17 +571,15 @@ export function computeCommunityOffset(
   const startMs = new Date(resync.syncedAtIso).getTime();
   const reportedState = resync.syncedState;
 
-  let referenceIso: string | null = null;
-  let referenceKind: OffsetReferenceKind = growattCurrentState === 'ON' ? 'GROWATT_ON_END_EXPECTED' : 'GROWATT_OFF_END_EXPECTED';
+  let referenceIso: string | null;
+  let referenceKind: OffsetReferenceKind;
 
   if (growattCurrentState === reportedState) {
-    // Report matches current Growatt state → reference is the actual transition start
     referenceIso  = growattLastTransitionAt;
     referenceKind = reportedState === 'ON' ? 'GROWATT_ON_START_ACTUAL' : 'GROWATT_OFF_START_ACTUAL';
-  } else if (growattLastTransitionAt) {
-    // Report differs from Growatt state → reference is expected end of current Growatt state
-    const expectedEnd = computeExpectedStateEnd(rawSchedule, growattCurrentState, growattLastTransitionAt);
-    referenceIso = expectedEnd?.endIso ?? null;
+  } else {
+    const rawActiveSlot = findActiveSlotInRawSchedule(rawSchedule, growattCurrentState, startMs);
+    referenceIso  = rawActiveSlot?.endIso ?? null;
     referenceKind = growattCurrentState === 'ON' ? 'GROWATT_ON_END_EXPECTED' : 'GROWATT_OFF_END_EXPECTED';
   }
 
@@ -527,21 +636,9 @@ export function computeCommunityTransition(
     }
   }
   if (interruptedSlotIdx === -1) {
-    // Fallback 1: find the last interrupted-state slot that starts before syncMs
     for (let i = offsetSlots.length - 1; i >= 0; i--) {
       if (offsetSlots[i].state !== interruptedState) continue;
       if (new Date(offsetSlots[i].startIso).getTime() <= syncMs) {
-        interruptedSlotIdx = i;
-        break;
-      }
-    }
-  }
-  if (interruptedSlotIdx === -1) {
-    // Fallback 2: find the NEXT interrupted-state slot that starts after syncMs
-    // (report arrived before the interrupted cycle even started — preemptive report)
-    for (let i = 0; i < offsetSlots.length; i++) {
-      if (offsetSlots[i].state !== interruptedState) continue;
-      if (new Date(offsetSlots[i].startIso).getTime() > syncMs) {
         interruptedSlotIdx = i;
         break;
       }
@@ -1064,7 +1161,7 @@ export function deriveCurrentStateATC(
   atcMode: ScheduleStateMode,
   masterCurrentState: 'ON' | 'OFF',
   resyncPoint: ResyncPoint | null,
-  _transitionMode: TransitionMode = 'AUTO',
+  transitionMode: TransitionMode = 'AUTO',
   communityTransition?: CommunityTransitionResult | null,
   nowMs: number = Date.now(),
 ): { state: 'ON' | 'OFF'; startIso: string | null } {
@@ -1203,7 +1300,7 @@ export function applyOffsetToPrediction(
   resyncPoint?: ResyncPoint | null,
   communitySyncMeta?: CommunitySyncMeta | null,
   transitionMode: TransitionMode = 'AUTO',
-  _heldCycleStartIso?: string | null,
+  heldCycleStartIso?: string | null,
   frozenCommunityOffsetMinutes?: number | null,
   onOffsetCalculated?: (
     offsetMinutes: number,
