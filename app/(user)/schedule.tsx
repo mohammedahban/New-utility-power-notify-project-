@@ -8,7 +8,6 @@ import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../.
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 
@@ -356,15 +355,9 @@ export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
+  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
   const { anchor } = useStateAnchor();
-  const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction, loading } = useUserPredictions(
-    offset?.offset_minutes ?? 0,
-    resyncPoint,
-    transitionMode,
-    anchor?.startIso ?? null,
-  );
 
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});

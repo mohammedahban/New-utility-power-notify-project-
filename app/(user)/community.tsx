@@ -17,8 +17,6 @@ import { useAuth } from '../../contexts/AuthContext';
 import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
-import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useUserPredictions } from '../../hooks/useUserPredictions';
 import { AR } from '../../constants/arabic';
@@ -682,14 +680,7 @@ export default function CommunityScreen() {
   const [myOffsetMinutes, setMyOffsetMinutes] = React.useState(0);
   const { applyResync, resyncPoint } = useResync();
   const { offset } = useUserOffset();
-  const { mode: transitionMode } = useTransitionMode();
-  const { anchor } = useStateAnchor();
-  const { userPrediction } = useUserPredictions(
-    offset?.offset_minutes ?? 0,
-    resyncPoint,
-    transitionMode,
-    anchor?.startIso ?? null,
-  );
+  const { userPrediction } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { captureSnapshot } = useStatusSnapshot();
 
   useEffect(() => { registerPushToken(); }, []);
