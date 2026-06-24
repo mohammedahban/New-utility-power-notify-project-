@@ -657,14 +657,27 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   if (!prediction) return null;
 
-  // CRITICAL: For POSITIVE_OFFSET_PENDING, build an nt from the scheduled transition time
-  // even if prediction.isUnstable=true (which forces nextTransition=null in the hook).
-  // This ensures the hold card always renders instead of the unstable-message card.
+  // CRITICAL (v4.2 UI fix): Build an effectiveNt from MULTIPLE fallback sources so the
+  // countdown card ALWAYS renders — the previous code returned a "Pattern unstable"
+  // message instead of the countdown whenever prediction.isUnstable was true or nt
+  // was null. That replaced the user's countdown card with a warning every time the
+  // server entered crisis mode (which, before v4.2's R1 client-row filter, was
+  // happening on contaminated data and firing almost constantly).
+  //
+  // Fallback chain (tried in order, first non-null wins):
+  //   1. nt (prediction.nextTransition) — the authoritative server-computed transition
+  //   2. POSITIVE_OFFSET_PENDING scheduled time — already-used fallback for held state
+  //   3. daySchedule next slot — derived from the schedule projection
+  //
+  // Only if ALL three fail do we fall back to the "unstable" card further below.
   const effectiveNt = (() => {
+    // Source 1: the authoritative nt from the server
+    if (nt) return nt;
+
+    // Source 2: POSITIVE_OFFSET_PENDING scheduled transition (existing behaviour)
     if (
       isHolding &&
       atcMode === 'POSITIVE_OFFSET_PENDING' &&
-      !nt &&
       prediction?.atc?.scheduledAutoTransitionIso
     ) {
       const scheduledIso = prediction.atc.scheduledAutoTransitionIso;
@@ -681,8 +694,46 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         inRangeWindow: minFromNow <= 0,
       };
     }
-    return nt;
+
+    // Source 3 (v4.2 NEW): daySchedule fallback. When the server can't produce an
+    // authoritative nextTransition (e.g. crisis mode widened the range too much,
+    // or isUnstable forced nextTransition=null in the hook), the daySchedule still
+    // contains the projected slot transitions. Use the next upcoming slot whose
+    // state differs from the current state as a degraded countdown target.
+    const slots = prediction?.daySchedule ?? [];
+    const current_state = prediction?.currentState ?? 'OFF';
+    const nowMs = Date.now();
+    // Find first slot whose start is in the future AND whose state differs from current.
+    // (Slots whose state matches current are the active slot, not the next transition.)
+    const nextSlot = slots.find(s => {
+      const startMs = new Date(s.startIso).getTime();
+      return startMs > nowMs && s.state !== current_state;
+    });
+    if (nextSlot && nextSlot.startIso) {
+      const startMs = new Date(nextSlot.startIso).getTime();
+      const minFromNow = Math.max(0, (startMs - nowMs) / 60_000);
+      // Use slot.endIso as the upper bound if available, otherwise same as start (point estimate)
+      const endMs = nextSlot.endIso ? new Date(nextSlot.endIso).getTime() : startMs;
+      const maxFromNow = Math.max(minFromNow, (endMs - nowMs) / 60_000);
+      return {
+        type: (nextSlot.state === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF') as 'UTILITY_ON' | 'UTILITY_OFF',
+        rangeStartIso: nextSlot.startIso,
+        rangeEndIso: nextSlot.endIso ?? nextSlot.startIso,
+        rangeLabel: `${fmtTimeAr(nextSlot.startIso)}${nextSlot.endIso ? ' → ' + fmtTimeAr(nextSlot.endIso) : ''}`,
+        minFromNowMin: minFromNow,
+        maxFromNowMin: maxFromNow,
+        waitLabel: '',
+        inRangeWindow: minFromNow <= 0,
+      };
+    }
+
+    return null;
   })();
+
+  // Flag: true when we're using a degraded/fallback nt rather than the authoritative one.
+  // Used to render a small "تقديري" (estimated) badge so the user knows this countdown
+  // is derived from the schedule projection rather than the live prediction engine.
+  const isDegradedCountdown = !nt && effectiveNt !== null;
 
   // ATC hold card — MUST be checked before isUnstable to avoid showing wrong message
   if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
@@ -754,42 +805,27 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     );
   }
 
-  // ── v4.2: COUNTDOWN-CARD / CRISIS COEXISTENCE FIX ──────────────────────────
-  //
-  // BEFORE (v4.1): `if (prediction.isUnstable || !nt) return <UnstableCard/>`
-  //   This entirely replaced the countdown card with a "النمط غير مستقر" message
-  //   whenever crisis mode triggered isUnstable=true — even though we still had
-  //   a perfectly good `nt` (next transition range) to display.
-  //
-  // AFTER (v4.2): Split into two branches:
-  //   • !nt              → still show the "no prediction" card (genuinely nothing to count down to)
-  //   • isUnstable && nt → fall through to the normal countdown card, but render a small
-  //                        "crisis-aware prediction" chip below the title so the user knows
-  //                        the engine is adapting. The countdown STAYS VISIBLE.
-  //
-  // The crisis banner at the top of the home screen still fires separately (line ~1397),
-  // so the user gets BOTH the countdown AND the crisis notice — never one replacing the other.
-  if (!nt) {
+  // v4.2 FIX: Only show the "unstable" card as a LAST RESORT — when we have neither
+  // an authoritative nt NOR a daySchedule-derived fallback. Previously this branch
+  // fired whenever prediction.isUnstable was true, replacing the countdown card
+  // with a warning even when we had perfectly usable daySchedule data.
+  if (!effectiveNt) {
     return (
       <View style={[utStyles.card, { borderColor: T.warning + '44' }]}>
         <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
         <View style={utStyles.holdBox}>
-          <Text style={utStyles.holdTitle}>⚠️ لا يوجد توقع متاح حالياً</Text>
-          <Text style={utStyles.holdBody}>يستمر التطبيق في التعلم من أنماط الكهرباء. حاول مجدداً خلال دقائق.</Text>
+          <Text style={utStyles.holdTitle}>⚠️ النمط غير مستقر مؤقتاً</Text>
+          <Text style={utStyles.holdBody}>لا توجد توقعات موثوقة حالياً. يستمر التطبيق في التعلم.</Text>
         </View>
       </View>
     );
   }
 
-  const isNextOn = nt.type === 'UTILITY_ON';
+  const isNextOn = effectiveNt.type === 'UTILITY_ON';
   const color = isNextOn ? T.success : T.danger;
   const confPct = prediction.confidence;
   const confText = confPct >= 80 ? 'ثقة مرتفعة' : confPct >= 55 ? 'ثقة متوسطة' : 'ثقة منخفضة';
   const confColor = confPct >= 80 ? T.success : confPct >= 55 ? T.warning : T.danger;
-
-  // v4.2: crisis-aware chip — shown inline when isUnstable is true but we still render the countdown.
-  // Replaces the old behavior of hiding the countdown card entirely during crisis.
-  const showCrisisAwareChip = prediction.isUnstable;
 
   const slots = prediction.daySchedule ?? [];
   const nextIdx = slots.findIndex(s => {
@@ -798,25 +834,39 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   });
   const afterNext = nextIdx >= 0 && nextIdx + 1 < slots.length ? slots[nextIdx + 1] : null;
 
+  // v4.2: When we're showing a degraded countdown (derived from daySchedule rather
+  // than the authoritative nt), surface a small "تقديري" chip next to the title
+  // so the user understands this is a schedule-based estimate, not a live prediction.
+  const degradedBadge = isDegradedCountdown ? (
+    <View style={utStyles.degradedBadge}>
+      <Text style={utStyles.degradedBadgeText}>تقديري</Text>
+    </View>
+  ) : null;
+
   return (
     <View style={[utStyles.card, { borderColor: color + '30' }]}>
       <View style={utStyles.headerRow}>
         <View style={[utStyles.confBadge, { backgroundColor: confColor + '20', borderColor: confColor + '44' }]}>
           <Text style={[utStyles.confText, { color: confColor }]}>{confText}</Text>
         </View>
-        <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+        <View style={{ flexDirection: 'row-reverse', alignItems: 'center', gap: 6 }}>
+          {degradedBadge}
+          <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+        </View>
       </View>
 
-      {/* v4.2: Inline crisis-awareness chip — keeps countdown visible during crisis */}
-      {showCrisisAwareChip && (
-        <View style={utStyles.crisisAwareChip}>
-          <Text style={utStyles.crisisAwareChipText}>
-            ⚠️ محرك التوقع يتكيّف مع تغيّر النمط — قد تتأثر دقة التوقع
+      {/* v4.2: When using a degraded countdown, show a one-line note explaining why */}
+      {isDegradedCountdown && (
+        <View style={utStyles.degradedNoteBox}>
+          <Text style={utStyles.degradedNoteText}>
+            {prediction.isUnstable
+              ? '⚠️ النمط غير مستقر مؤقتاً — هذا التوقيت مأخوذ من جدول اليوم كتقدير مؤقت. يستمر التطبيق في التعلم.'
+              : '⏳ توقيت تقديري مأخوذ من جدول اليوم'}
           </Text>
         </View>
       )}
 
-      {nt.inRangeWindow && (
+      {effectiveNt.inRangeWindow && (
         <View style={[utStyles.rangeWindowBadge, { backgroundColor: color + '15', borderColor: color + '66' }]}>
           <Text style={[utStyles.rangeWindowText, { color }]}>
             🟠 {isNextOn ? 'بدأ نطاق التشغيل المتوقع' : 'بدأ نطاق الانطفاء المتوقع'}
@@ -831,14 +881,18 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
           {isNextOn ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
         </Text>
         <View style={utStyles.rangeTimeStack} dir="ltr">
-          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeStartIso)}</Text>
-          <Text style={[utStyles.rangeSep, { color: color + '88' }]}>و</Text>
-          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeEndIso)}</Text>
+          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(effectiveNt.rangeStartIso)}</Text>
+          {effectiveNt.rangeStartIso !== effectiveNt.rangeEndIso ? (
+            <>
+              <Text style={[utStyles.rangeSep, { color: color + '88' }]}>و</Text>
+              <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(effectiveNt.rangeEndIso)}</Text>
+            </>
+          ) : null}
         </View>
       </View>
 
-      {/* SECONDARY: countdown (spec §20) */}
-      {!nt.inRangeWindow && (
+      {/* SECONDARY: countdown (spec §20) — always rendered now, even in degraded mode */}
+      {!effectiveNt.inRangeWindow && (
         <View style={utStyles.countdownSection}>
           <Text style={utStyles.countdownLabel}>⏳ يبدأ نطاق التوقع بعد</Text>
           <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginBottom: 10 }}>
@@ -913,14 +967,19 @@ const utStyles = StyleSheet.create({
   holdBody: { color: T.textMuted, fontSize: 12, lineHeight: 18, textAlign: 'right' },
   communityPrioBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.accent + '44' },
   communityPrioText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
-  // v4.2: inline crisis-awareness chip — soft amber, non-blocking
-  crisisAwareChip: {
+  // v4.2 — Degraded-countdown styles. Shown when the countdown is derived from
+  // daySchedule rather than the authoritative nextTransition (e.g. during crisis
+  // mode when the server widened the range too much to return a usable nt).
+  degradedBadge: {
+    backgroundColor: T.warning + '20', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2,
+    borderWidth: 1, borderColor: T.warning + '55',
+  },
+  degradedBadgeText: { color: T.warning, fontSize: 9, fontWeight: '800', letterSpacing: 0.5 },
+  degradedNoteBox: {
     backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12,
-    borderWidth: 1, borderColor: T.warning + '44',
+    borderWidth: 1, borderColor: T.warning + '33',
   },
-  crisisAwareChipText: {
-    color: T.warning, fontSize: 11, fontWeight: '600', textAlign: 'right', lineHeight: 16,
-  },
+  degradedNoteText: { color: '#fbbf24', fontSize: 11, lineHeight: 16, textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1430,33 +1489,47 @@ export default function Home() {
         </View>
       </View>
 
-      {/* v4.2 Crisis banner — softened copy
-          v4.1: implied confidence was unreliable (capped at 30%).
-          v4.2: crisis no longer caps confidence — the engine is adapting,
-                not failing. Wording reflects that. Banner stays amber/yellow
-                (informational) rather than red (alarm). */}
+      {/* Crisis banner — v4.2 UI update: changed from alarming "تغيّر ملحوظ" to
+          informational "نمط التيار يتغير" so the user understands this is the
+          server detecting a pattern shift and recentering, not an emergency.
+          Also reduced border emphasis (was #92400e dark red, now T.warning + '44'). */}
       {userPrediction?.crisisMode && userPrediction.crisisReason ? (
-        <View style={styles.crisisBanner}>
-          <View style={styles.crisisIconWrap}><Text style={{ fontSize: 20 }}>⚠️</Text></View>
+        <View style={[styles.crisisBanner, { borderColor: T.warning + '55' }]}>
+          <View style={styles.crisisIconWrap}><Text style={{ fontSize: 20 }}>ℹ️</Text></View>
           <View style={{ flex: 1 }}>
-            <Text style={styles.crisisTitle}>محرك التوقع يتكيّف مع نمط متغيّر</Text>
+            <Text style={styles.crisisTitle}>نمط التيار يتغير — يتم ضبط التوقعات</Text>
             <Text style={styles.crisisBody}>{translateCrisisReason(userPrediction.crisisReason)}</Text>
+            <Text style={styles.crisisSub}>التوقعات لا تزال تعمل — مع نطاق أوسع من المعتاد</Text>
           </View>
         </View>
       ) : null}
 
-      {/* v4.2: Client-rows-filtered info badge
-          Shows how many client-bugged rows the v4.2 server filtered out
-          before computing the drift offset. Non-zero = R1 filter is working.
-          Hidden when there's no apppe block or filter count is 0. */}
+      {/* v4.2 UI update: Client-row filter info badge. Shows when the server-side
+          filter (R1) is actively removing client-bugged "pending_offset" rows from
+          history. This is a monitoring signal — the predictions themselves are
+          unaffected, but it tells the user (and you, the developer) that the
+          client write-path bug (R2) is still active and producing contaminated
+          rows that the server is silently filtering out.
+
+          NOTE: This requires the useUserPredictions hook to expose the
+          `apppe.historyDiagnostics` block from the raw server response. If the
+          hook doesn't pass it through yet, this badge will simply never render —
+          no error, no broken UI. To enable: update useUserPredictions.ts to
+          include `apppe?: { historyDiagnostics?: { clientRowsFiltered?: number } }`
+          on the UserPrediction type and pass the field through from the raw
+          server response. */}
       {(() => {
-        const filtered = (userPrediction as any)?.apppe?.historyDiagnostics?.clientRowsFiltered;
-        if (!filtered || filtered === 0) return null;
+        const clientRowsFiltered = (userPrediction as any)?.apppe?.historyDiagnostics?.clientRowsFiltered ?? 0;
+        if (clientRowsFiltered <= 0) return null;
         return (
-          <View style={styles.historyDiagBadge}>
-            <Text style={styles.historyDiagText}>
-              🛡️ تم تجاهل {filtered} صفّاً ملوّثاً من سجلّ الدقّة لمحرك التوقّع
-            </Text>
+          <View style={styles.infoBanner}>
+            <View style={styles.infoIconWrap}><Text style={{ fontSize: 16 }}>🔧</Text></View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.infoTitle}>تصفية بيانات تلقائية</Text>
+              <Text style={styles.infoBody}>
+                تم تجاهل {clientRowsFiltered} صف بيانات تشخيصي من العميل — التوقعات تعمل بشكل سليم.
+              </Text>
+            </View>
           </View>
         );
       })()}
@@ -1506,16 +1579,22 @@ const styles = StyleSheet.create({
   signOutBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#1a0505', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: '#ef444430' },
   signOutIcon: { fontSize: 14 },
   signOutLabel: { color: '#ef4444', fontSize: 12, fontWeight: '700' },
-  crisisBanner: { backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, borderWidth: 1.5, borderColor: '#92400e' },
+  crisisBanner: { backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, borderWidth: 1.5, borderColor: T.warning + '55' },
   crisisIconWrap: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#451a03', alignItems: 'center', justifyContent: 'center' },
-  crisisTitle: { color: '#f59e0b', fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
-  crisisBody: { color: '#fbbf24', fontSize: 12, lineHeight: 19, textAlign: 'right' },
-  // v4.2: yellow info badge for historyDiagnostics.clientRowsFiltered
-  historyDiagBadge: {
-    backgroundColor: '#0c1a2e', borderRadius: 10, padding: 10, marginBottom: 12,
-    borderWidth: 1, borderColor: T.accent + '55',
+  crisisTitle: { color: T.warning, fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
+  crisisBody: { color: '#fbbf24', fontSize: 12, lineHeight: 19, textAlign: 'right', marginBottom: 4 },
+  // v4.2 NEW: Subtext line clarifying that predictions are still working
+  crisisSub: { color: T.textMuted, fontSize: 10, textAlign: 'right', fontStyle: 'italic' },
+  // v4.2 NEW — Info banner for the client-row filter monitoring badge
+  infoBanner: {
+    backgroundColor: '#0a1a2e', borderRadius: 12, padding: 12, marginBottom: 12,
+    flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 10,
+    borderWidth: 1, borderColor: T.accent + '33',
   },
-  historyDiagText: {
-    color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right', lineHeight: 16,
+  infoIconWrap: {
+    width: 32, height: 32, borderRadius: 16, backgroundColor: T.elevated,
+    alignItems: 'center', justifyContent: 'center', flexShrink: 0,
   },
+  infoTitle: { color: T.accent, fontSize: 11, fontWeight: '700', letterSpacing: 0.5, marginBottom: 3, textAlign: 'right' },
+  infoBody: { color: T.textSecondary, fontSize: 11, lineHeight: 16, textAlign: 'right' },
 });

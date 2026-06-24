@@ -24,18 +24,6 @@ type Range = '1' | '7' | '30' | 'all';
 
 const PAGE_SIZE = 20;
 
-// v4.2 — Client-bugged slot_id pattern. These rows are written by the legacy
-// useUserPredictions.logClientAccuracy() helper with slot_ids like:
-//   client_positive_offset_pending_offset60
-//   client_uncertain_zone_offset-60
-// They do NOT represent real APPPE predictions — they're client-perspective
-// reconciliation logs that contaminated the server's drift/crisis engines.
-// The v4.2 server filters them out (R1), and this UI hides them by default.
-// Toggle on the "Show client-bugged rows" badge to inspect them.
-const CLIENT_BUGGED_SLOT_PATTERN = /pending_offset/i;
-const isClientBuggedRow = (l: AccuracyLog): boolean =>
-  !!l.slot_id && CLIENT_BUGGED_SLOT_PATTERN.test(l.slot_id);
-
 interface AccuracyLog {
   id: number;
   predicted_event_time: string;
@@ -275,14 +263,11 @@ function LogRow({ log }: { log: AccuracyLog }) {
   const predAt = new Date(log.predicted_event_time).toLocaleString('ar-SA', {
     timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit',
   });
-  // v4.2: tag client-bugged rows so they're visually distinguishable when un-hidden.
-  const isBugged = isClientBuggedRow(log);
   return (
-    <View style={[logStyles.row, isBugged && logStyles.rowBugged]}>
+    <View style={logStyles.row}>
       <View style={logStyles.scoreCol}>
         <Text style={[logStyles.scoreVal, { color: scoreColor }]}>{Math.round(log.accuracy_score)}%</Text>
         <Text style={logStyles.errorVal}>{Math.round(log.error_minutes)} د</Text>
-        {isBugged && <Text style={logStyles.buggedTag}>ملوّث</Text>}
       </View>
       <View style={logStyles.content}>
         <View style={logStyles.topRow}>
@@ -290,18 +275,12 @@ function LogRow({ log }: { log: AccuracyLog }) {
           <Text style={logStyles.time}>{occurredAt}</Text>
         </View>
         <Text style={logStyles.sub}>توقّعنا: {predAt} · الخطأ: {Math.round(log.error_minutes)} دقيقة</Text>
-        {isBugged && (
-          <Text style={logStyles.buggedSub}>
-            ⚠ سجلّ مصالحة من العميل ({log.slot_id}) — ليس توقّعاً حقيقياً من APPPE
-          </Text>
-        )}
       </View>
     </View>
   );
 }
 const logStyles = StyleSheet.create({
   row: { flexDirection: 'row-reverse', gap: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1e293b', alignItems: 'center' },
-  rowBugged: { backgroundColor: '#2a0a0a', borderRadius: 8, paddingHorizontal: 8, marginVertical: 2 },
   scoreCol: { alignItems: 'center', minWidth: 48 },
   scoreVal: { fontSize: 15, fontWeight: '900' },
   errorVal: { color: '#475569', fontSize: 10, marginTop: 2 },
@@ -310,9 +289,6 @@ const logStyles = StyleSheet.create({
   state: { fontSize: 14, fontWeight: '700' },
   time: { color: '#64748b', fontSize: 11 },
   sub: { color: '#475569', fontSize: 11, textAlign: 'right' },
-  // v4.2: visual flags for client-bugged rows when un-hidden
-  buggedTag: { color: T.danger, fontSize: 9, fontWeight: '800', marginTop: 3, letterSpacing: 0.5 },
-  buggedSub: { color: T.danger, fontSize: 10, marginTop: 4, textAlign: 'right', lineHeight: 15 },
 });
 
 // ── Export / Download ────────────────────────────────────────────────────────
@@ -516,10 +492,6 @@ export default function AccuracyScreen() {
   const [alertVisible, setAlertVisible] = useState(false);
   const [alertMsg, setAlertMsg] = useState('');
 
-  // v4.2: client-bugged rows (slot_id matching /pending_offset/i) are hidden by default.
-  // Toggle to inspect them — they are NOT real APPPE predictions.
-  const [hideClientBugged, setHideClientBugged] = useState(true);
-
   const fetchLogsRef = useRef<(p?: number) => Promise<void>>(async () => {});
 
   const fetchLogs = useCallback(async (pageOverride?: number) => {
@@ -617,15 +589,8 @@ export default function AccuracyScreen() {
   }, [fetchLogs]);
 
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
-
-  // v4.2: split raw logs into clean vs client-bugged. Stats and displays use `cleanLogs`
-  // by default so the accuracy numbers reflect REAL APPPE predictions only.
-  const clientBuggedLogs = logs.filter(isClientBuggedRow);
-  const cleanLogs = hideClientBugged ? logs.filter(l => !isClientBuggedRow(l)) : logs;
-  const clientBuggedHiddenCount = hideClientBugged ? clientBuggedLogs.length : 0;
-
-  const stats = computeStats(cleanLogs);
-  const todayLogs = cleanLogs.filter(l => Date.now() - new Date(l.created_at).getTime() < 86400000);
+  const stats = computeStats(logs);
+  const todayLogs = logs.filter(l => Date.now() - new Date(l.created_at).getTime() < 86400000);
   const todayStats = computeStats(todayLogs);
 
   const ranges: { key: Range; label: string }[] = [
@@ -717,34 +682,6 @@ export default function AccuracyScreen() {
         ))}
       </View>
 
-      {/* v4.2: Client-bugged rows badge + toggle.
-          When `hideClientBugged` is true (default), rows whose slot_id matches
-          /pending_offset/i are filtered out and the count is shown here.
-          Tap to reveal them — they're tagged with a red dot in the log list. */}
-      {clientBuggedLogs.length > 0 && (
-        <View style={styles.clientBuggedBadge}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.clientBuggedTitle}>
-              🛡️ صفوف ملوّثة من العميل
-            </Text>
-            <Text style={styles.clientBuggedBody}>
-              {hideClientBugged
-                ? `${clientBuggedHiddenCount} صفّاً مُخفياً — هذه ليست توقعات حقيقية من APPPE بل سجلّات مصالحة من جهة العميل`
-                : `${clientBuggedLogs.length} صفّاً معروضاً — افحصها للتحقق من نمط التلوّث`}
-            </Text>
-          </View>
-          <TouchableOpacity
-            style={styles.clientBuggedToggle}
-            onPress={() => setHideClientBugged(v => !v)}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.clientBuggedToggleText}>
-              {hideClientBugged ? 'إظهار' : 'إخفاء'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
       {loading ? (
         <View style={styles.center}>
           <ActivityIndicator size="large" color={T.accent} />
@@ -761,10 +698,10 @@ export default function AccuracyScreen() {
           <View style={styles.card}>
             <View style={styles.cardHeader}>
               <TrendBadge trend={stats.trend} delta={stats.trendDelta} />
-              <Text style={styles.cardTitle}>دقة التوقعات — {cleanLogs.length} قياس{hideClientBugged && clientBuggedHiddenCount > 0 ? ` (${clientBuggedHiddenCount} ملوّث مُخفي)` : ''}</Text>
+              <Text style={styles.cardTitle}>دقة التوقعات — {totalCount} قياس إجمالاً</Text>
             </View>
             <View style={styles.gaugesRow}>
-              <ScoreGauge score={stats.overall} label="الإجمالي" sub={`${cleanLogs.length} حدث`} />
+              <ScoreGauge score={stats.overall} label="الإجمالي" sub={`${totalCount} حدث`} />
               <ScoreGauge score={todayStats.overall} label="اليوم" sub={`${todayStats.count} حدث`} />
               <ScoreGauge score={stats.onAccuracy} label="دقة تشغيل" sub="⚡" />
               <ScoreGauge score={stats.offAccuracy} label="دقة انقطاع" sub="🔴" />
@@ -777,16 +714,16 @@ export default function AccuracyScreen() {
               <Text style={styles.pillLabel}>متوسط الخطأ</Text>
             </View>
             <View style={styles.pill}>
-              <Text style={[styles.pillVal, { color: T.success }]}>{cleanLogs.filter(l => l.accuracy_score >= 80).length}</Text>
+              <Text style={[styles.pillVal, { color: T.success }]}>{logs.filter(l => l.accuracy_score >= 80).length}</Text>
               <Text style={styles.pillLabel}>دقة ≥ 80%</Text>
             </View>
             <View style={styles.pill}>
-              <Text style={[styles.pillVal, { color: T.danger }]}>{cleanLogs.filter(l => l.accuracy_score < 60).length}</Text>
+              <Text style={[styles.pillVal, { color: T.danger }]}>{logs.filter(l => l.accuracy_score < 60).length}</Text>
               <Text style={styles.pillLabel}>دقة &lt; 60%</Text>
             </View>
             <View style={styles.pill}>
-              <Text style={styles.pillVal}>{cleanLogs.length}</Text>
-              <Text style={styles.pillLabel}>قياسات معروضة</Text>
+              <Text style={styles.pillVal}>{totalCount}</Text>
+              <Text style={styles.pillLabel}>إجمالي القياسات</Text>
             </View>
           </View>
 
@@ -799,8 +736,8 @@ export default function AccuracyScreen() {
               { label: '30–60 د', filter: (e: number) => e >= 30 && e < 60,  color: '#f97316' },
               { label: '> 60 د',  filter: (e: number) => e >= 60,            color: T.danger },
             ].map(bucket => {
-              const count = cleanLogs.filter(l => bucket.filter(l.error_minutes)).length;
-              const pct = cleanLogs.length > 0 ? (count / cleanLogs.length) * 100 : 0;
+              const count = logs.filter(l => bucket.filter(l.error_minutes)).length;
+              const pct = logs.length > 0 ? (count / logs.length) * 100 : 0;
               return (
                 <View key={bucket.label} style={styles.barRow}>
                   <Text style={styles.barCount}>{count}</Text>
@@ -813,8 +750,8 @@ export default function AccuracyScreen() {
             })}
           </View>
 
-          <AccuracySparkline logs={cleanLogs} />
-          <InsightWidget logs={cleanLogs} />
+          <AccuracySparkline logs={logs} />
+          <InsightWidget logs={logs} />
 
           {/* Paginated log list */}
           <View style={styles.card}>
@@ -827,8 +764,7 @@ export default function AccuracyScreen() {
               </Text>
             </View>
 
-            {/* v4.2: render filtered `cleanLogs` instead of raw `logs` */}
-            {cleanLogs.map(l => <LogRow key={l.id} log={l} />)}
+            {logs.map(l => <LogRow key={l.id} log={l} />)}
 
             {/* Pagination controls */}
             {totalPages > 1 && (
@@ -942,23 +878,4 @@ const styles = StyleSheet.create({
   pageDot: { width: 30, height: 30, borderRadius: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155' },
   pageDotActive: { backgroundColor: '#1e3a5f', borderColor: T.accent },
   pageDotText: { color: '#64748b', fontSize: 12, fontWeight: '700' },
-  // v4.2: client-bugged rows badge + toggle styles
-  clientBuggedBadge: {
-    flexDirection: 'row-reverse', alignItems: 'center', gap: 12,
-    backgroundColor: '#1a0e00', borderRadius: 12, padding: 12, marginBottom: 14,
-    borderWidth: 1, borderColor: T.warning + '55',
-  },
-  clientBuggedTitle: {
-    color: T.warning, fontSize: 12, fontWeight: '800', textAlign: 'right', marginBottom: 4,
-  },
-  clientBuggedBody: {
-    color: '#fbbf24', fontSize: 11, lineHeight: 16, textAlign: 'right',
-  },
-  clientBuggedToggle: {
-    backgroundColor: T.warning + '22', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8,
-    borderWidth: 1, borderColor: T.warning + '55',
-  },
-  clientBuggedToggleText: {
-    color: T.warning, fontSize: 12, fontWeight: '800',
-  },
 });
