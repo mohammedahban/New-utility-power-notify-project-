@@ -59,19 +59,16 @@ const CRISIS_ON_DECREASE_PCT = 0.20;
 // Phase 6 — Volatility EMA
 const VOLATILITY_EMA_ALPHA = 0.3;
 
-// Phase 8 — Adaptive learning trust
-//
-// IMPORTANT: this threshold is compared against the SUM of exponentially
-// decayed weights (weight = 0.5^(ageHours/24)), not a raw cycle count.
-// With a 7-day window and cycles spaced a few hours apart, that sum
-// saturates low — a realistic 19-cycle week sums to ~4-5, never near 15 —
-// because anything older than ~2 days contributes almost nothing. Setting
-// this too high means the model can NEVER reach full trust in real data,
-// permanently blending in the cold-start prior regardless of how much
-// history accumulates. Calibrated instead against "how much does a single
-// very recent day's worth of cycles sum to" (roughly 3-6 cycles at
-// near-1.0 weight), so a normal day or two of real data earns full trust.
-const EFFECTIVE_SAMPLES_FOR_FULL_TRUST = 4;
+// EFFECTIVE_SAMPLES_FOR_FULL_TRUST: compared against the SUM of exponentially
+// decayed weights (weight = 0.5^(ageHours/24)). With 18 real cycles spread
+// over 7 days, this sum is only ~2.9-3.5 because older cycles decay fast.
+// Setting this to 4 kept trust at 72-87%, meaning 13-28% of every computed
+// stat still came from the cold-start prior — even after a full week of real
+// data. Confirmed against 18 real cycles from this grid: the prior was
+// pulling P25Off from ~310→291 (when real data says 370) and P25On toward
+// values below any real observed cycle. Lowered to 3 so that 2.9+ effective
+// samples reaches ~97% trust — functionally full trust after a normal week.
+const EFFECTIVE_SAMPLES_FOR_FULL_TRUST = 3;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
@@ -312,18 +309,21 @@ function madToStability(mad: number, median: number): number {
 // This is the only place a static prior remains, and it's a single flat
 // estimate rather than five hour-pinned curves.
 //
-// Calibrated to this grid's reported real-world bounds: OFF duration has
-// never been observed under 4h, ON duration has never exceeded 2h20. The
-// median sits comfortably inside those bounds rather than at a generic
-// regional guess, so even a small residual prior-blend (see
-// EFFECTIVE_SAMPLES_FOR_FULL_TRUST) nudges predictions in the right
-// direction instead of away from it. Update these numbers if/when the
-// grid's actual pattern shifts — this is meant to be a starting point for
-// a brand-new install with zero history, not a long-term anchor.
+// Calibrated directly from 18 real cycles confirmed from the accuracy log
+// and from power_events screenshots (Jun 15-22, 2026):
+//   ON durations: 105-140min, median=120min, P25=120min, P75=130min, MAD=5min
+//   OFF durations: 280-500min, median=420min, P25=370min, P75=460min, MAD=45min
+//
+// The original values (medOff=300, p25Off=240, p75Off=360) were a generic
+// Yemen regional guess, not calibrated to this specific grid. Confirmed
+// in production: with ~27% of stats still coming from the prior (2.9/4
+// effective samples), the prior was pulling P25Off from 310→291min (when
+// reality is 370min) and P25On from ~115→ below any real observation.
+// Update these if the grid's pattern permanently shifts.
 const COLD_START_PRIOR = {
-  medOff: 300, medOn: 100,
-  p25Off: 240, p75Off: 360,
-  p25On: 70, p75On: 130,
+  medOff: 420, medOn: 120,
+  p25Off: 370, p75Off: 460,
+  p25On: 115, p75On: 133,
 };
 
 function computeWeightedDistStats(cycles: Cycle[]): WeightedDistStats {
@@ -1251,30 +1251,36 @@ Deno.serve(async (req) => {
   const driftStabilityFactor = driftOffset.sampleCount === 0 ? 0.6 : Math.max(0.2, 1 - Math.abs(driftOffset.offsetMin) / 180);
   const biasStabilityFactor = biasRatio.sampleCount === 0 ? 0.7 : Math.max(0.3, 1 - Math.abs(1 - biasRatio.ratio));
   const volatilityFactor = volatilityEMA < 15 ? 1 : volatilityEMA < 35 ? 0.85 : volatilityEMA < 70 ? 0.55 : 0.25;
-  const crisisFactor = crisis.active ? 0.5 : 1;
+  // Crisis is now a multiplicative penalty applied AFTER the weighted sum,
+  // not a 5%-weighted additive term. A 5% weight meant crisis.active only
+  // reduced the total by 2.5% — barely perceptible. A multiplicative factor
+  // of 0.65 reduces any computed confidence by 35% during active crisis,
+  // giving a signal that's both meaningful and proportional to underlying quality.
+  // Example: 71% base × 0.65 = 46% during crisis. 78% base × 0.65 = 51%.
+  const crisisFactor = crisis.active ? 0.5 : 1; // kept for predictionQuality display
+  const crisisMultiplier = crisis.active ? 0.65 : 1.0;
 
   let confidenceRaw =
     dataQuantityFactor * 0.30 +
     stabilityRaw * 0.25 +
     driftStabilityFactor * 0.15 +
     biasStabilityFactor * 0.10 +
-    volatilityFactor * 0.15 +
-    crisisFactor * 0.05;
+    volatilityFactor * 0.20; // redistributed the 0.05 weight to volatility
 
+  // Apply crisis as a multiplicative penalty (35% reduction when active)
+  confidenceRaw = confidenceRaw * crisisMultiplier;
   confidenceRaw = Math.min(0.97, confidenceRaw);
 
   // Low-stability or high-volatility genuinely unstable patterns get a hard
   // cap — but this no longer includes crisis.active, which is handled
-  // proportionally via crisisFactor in the formula above.
+  // proportionally via the multiplicative penalty above.
   if (isUnstable) confidenceRaw = Math.min(confidenceRaw, 0.30);
 
   // CONFIDENCE CONSISTENCY MODEL: if stability AND data quality both clear
-  // a high bar, apply a floor so a good dataset can't be dragged down by a
-  // single weak signal. During an active crisis, allow a reduced floor
-  // (40% rather than 55%) so a genuinely stable, data-rich pattern with a
-  // crisis correction still shows meaningfully higher confidence than an
-  // unstable or data-poor one. Previously blocked this entirely during
-  // crisis, which produced 30% for 78% stability + 82% data quality.
+  // a high bar, apply a floor so a good dataset can't be dragged down
+  // by a single weak signal. During active crisis, reduced floor (40%)
+  // so high-quality-data predictions still show meaningfully higher
+  // confidence than low-quality ones, even with the crisis reduction.
   const isHighQualityData = stabilityRaw > 0.70 && dataQuantityFactor > 0.70;
   if (isHighQualityData) {
     const floor = crisis.active ? 0.40 : 0.55;
@@ -1461,7 +1467,7 @@ Deno.serve(async (req) => {
         driftStabilityFactor: Math.round(driftStabilityFactor * 100),
         biasStabilityFactor: Math.round(biasStabilityFactor * 100),
         volatilityFactor: Math.round(volatilityFactor * 100),
-        crisisFactor: Math.round(crisisFactor * 100),
+        crisisFactor: crisis.active ? Math.round(crisisMultiplier * 100) : 100,
       },
       historySource: HISTORY_SOURCE,
       rangeWasClamped: nextTransition?.rangeWasClamped ?? false,
