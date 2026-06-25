@@ -2,6 +2,21 @@
 // Adaptive Drift-Correcting Prediction Engine
 //
 // ─────────────────────────────────────────────────────────────────────────────
+// v4.3 CHANGES (2026-06-25)
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. SCHEMA FIX: `duration_type`, `predicted_duration_min`, and
+//    `actual_duration_min` confirmed present as nullable columns in the real
+//    prediction_accuracy_logs DDL. loadHistory() accuracy_log branch now
+//    SELECTs all three and maps them from row values instead of hardcoding
+//    null with incorrect comments claiming the columns don't exist. Phase 4
+//    (Prediction Bias Engine) is now structurally active — it will produce
+//    non-trivial ratios as soon as the write path populates these columns.
+// 2. recordCompletedPrediction() extended with optional fields:
+//    confidenceScore, predictionGeneratedAt, durationType,
+//    predictedDurationMin, actualDurationMin — all confirmed in the DDL.
+//    Pass them from poll-growatt when you have the live prediction object.
+// 3. Removed incorrect comments that claimed duration columns were absent.
+//
 // v4.2 CHANGES (2026-06-24)
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. CRITICAL: Filter client-bugged rows out of loadHistory().
@@ -767,9 +782,11 @@ function computeDriftOffset(historyNewestFirst: HistoryRow[]): DriftResult {
 // durationBiasRatio = actualDuration / predictedDuration, applied BEFORE
 // drift correction: Raw Prediction → Bias Correction → Drift Correction → Range.
 //
-// v4.2 STATUS: Still inert (ratio=1, sampleCount=0). Activating this requires
-// adding `duration_type`, `predicted_duration_min`, `actual_duration_min`
-// columns to prediction_accuracy_logs. See migration notes at top of file.
+// v4.3 STATUS: NOW ACTIVE. `duration_type`, `predicted_duration_min`, and
+// `actual_duration_min` are confirmed present as nullable columns in the real
+// prediction_accuracy_logs DDL. loadHistory() now SELECTs and maps all three.
+// The bias engine will produce non-trivial ratios as soon as the write path
+// (recordCompletedPrediction / client logger) starts populating these columns.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function computeBiasRatio(
@@ -1123,21 +1140,20 @@ async function loadHistory(
   }
 
   if (HISTORY_SOURCE === "accuracy_log") {
-    // CORRECTED column names — confirmed against the real AccuracyLog
-    // interface in accuracy_tsx.txt: predicted_event_time / actual_event_time,
-    // not predicted_time / actual_time. duration_type /
-    // predicted_duration_min / actual_duration_min do NOT exist on this
-    // table at all (confirmed: zero references in the real screen source) —
-    // selecting them would make PostgREST error the whole query out,
-    // meaning loadHistory() would have been returning [] unconditionally.
-    // Bias correction (Module/Phase 4) has no data source until those
-    // columns are added to the table; it intentionally stays a no-op
-    // (ratio=1) rather than guessing at columns that don't exist.
+    // Confirmed column names from the real prediction_accuracy_logs DDL:
+    //   predicted_event_time, actual_event_time, predicted_state, actual_state,
+    //   error_minutes, accuracy_score, confidence_score, prediction_generated_at,
+    //   slot_id, duration_type, predicted_duration_min, actual_duration_min.
+    // All three duration columns exist as nullable — they are now SELECTed and
+    // mapped so Phase 4 (Bias Engine) activates as soon as the write path
+    // starts populating them. Previously these were hardcoded to null with the
+    // incorrect comment "columns do not exist on this table".
     //
-    // v4.2: slot_id is now SELECTed so we can filter client-bugged rows.
+    // v4.2: slot_id SELECTed to filter client-bugged rows.
+    // v4.3: duration_type / predicted_duration_min / actual_duration_min added.
     const { data, error } = await supabase
       .from(ACCURACY_LOG_TABLE)
-      .select("predicted_state, predicted_event_time, actual_event_time, error_minutes, slot_id")
+      .select("predicted_state, predicted_event_time, actual_event_time, error_minutes, slot_id, duration_type, predicted_duration_min, actual_duration_min")
       .order("actual_event_time", { ascending: false })
       .limit(fetchLimit);
 
@@ -1203,9 +1219,11 @@ async function loadHistory(
         actualTimeIso: row.actual_event_time,
         errorMinutes,
         ageHours: Math.max(0, (now.getTime() - actualMs) / 3_600_000),
-        durationType: null,        // column does not exist on this table
-        predictedDurationMin: null, // column does not exist on this table
-        actualDurationMin: null,    // column does not exist on this table
+        // Nullable columns confirmed in DDL — null until the write path
+        // (recordCompletedPrediction / client logger) starts populating them.
+        durationType: (row.duration_type as "OFF" | "ON" | null) ?? null,
+        predictedDurationMin: row.predicted_duration_min != null ? Number(row.predicted_duration_min) : null,
+        actualDurationMin: row.actual_duration_min != null ? Number(row.actual_duration_min) : null,
         slotId,
       });
     }
@@ -1289,26 +1307,31 @@ async function loadHistory(
 // function, NOT from analyze-patterns itself — analyze-patterns only reads).
 // Included here for reference / so the schema lives next to the reader.
 //
-// CORRECTED against the real prediction_accuracy_logs schema (confirmed via
-// accuracy_tsx.txt's AccuracyLog interface and runBackfill()'s insert
-// shape): predicted_event_time / actual_event_time / actual_state, not
-// predicted_time / actual_time. accuracy_score is also a real column the
-// existing app computes and relies on (see computeStats in the Accuracy
-// Center screen) — it's included here so this reference writer doesn't
-// produce rows the existing dashboard can't score. duration_type /
-// predicted_duration_min / actual_duration_min do not exist on this table;
-// removed rather than writing columns that don't exist.
+// Full confirmed DDL columns written here:
+//   predicted_state, actual_state, predicted_event_time, actual_event_time,
+//   error_minutes, accuracy_score, confidence_score (nullable),
+//   prediction_generated_at (nullable), slot_id,
+//   duration_type (nullable), predicted_duration_min (nullable),
+//   actual_duration_min (nullable).
 //
-// v4.2: The server-side writer must NOT write slot_id = "pending_offset*".
-// Those rows come from the client's pre-correction state. The server writer
-// should leave slot_id NULL or set it to a server-side identifier like
-// "server_resolved" so it never matches the client-pending filter.
+// v4.2: slot_id = "server_resolved" for server-written rows so they never
+//   match the CLIENT_PENDING_SLOT_PATTERN filter in loadHistory().
+// v4.3: confidence_score, prediction_generated_at, duration_type,
+//   predicted_duration_min, actual_duration_min are now accepted as optional
+//   fields on the input row and written when present. Pass them from the
+//   poll-growatt function once it has access to the live prediction object.
 async function recordCompletedPrediction(
   supabase: ReturnType<typeof createClient>,
   row: {
     predictedType: "UTILITY_ON" | "UTILITY_OFF";
     predictedTimeIso: string;
     actualTimeIso: string;
+    // Optional enrichment — populate from the live prediction object in poll-growatt
+    confidenceScore?: number | null;          // maps to confidence_score
+    predictionGeneratedAt?: string | null;    // maps to prediction_generated_at (ISO)
+    durationType?: "OFF" | "ON" | null;       // maps to duration_type
+    predictedDurationMin?: number | null;     // maps to predicted_duration_min
+    actualDurationMin?: number | null;        // maps to actual_duration_min
   },
 ) {
   const errorMinutes = (new Date(row.actualTimeIso).getTime() - new Date(row.predictedTimeIso).getTime()) / 60000;
@@ -1318,25 +1341,42 @@ async function recordCompletedPrediction(
   if (HISTORY_SOURCE === "accuracy_log") {
     return supabase.from(ACCURACY_LOG_TABLE).insert({
       predicted_state: row.predictedType,
-      actual_state: row.predictedType, // matches runBackfill()'s convention of mirroring the observed event type
+      actual_state: row.predictedType, // mirrors the observed event type per runBackfill() convention
       predicted_event_time: row.predictedTimeIso,
       actual_event_time: row.actualTimeIso,
       error_minutes: Math.round(Math.abs(errorMinutes) * 100) / 100,
       accuracy_score: Math.round(accuracyScore * 100) / 100,
-      // v4.2: slot_id left NULL for server-written rows so it never matches
-      // the client-pending filter. Set to "server_resolved" if you want to
-      // distinguish server rows from real-client rows in diagnostics.
       slot_id: "server_resolved",
+      // Nullable enrichment fields — omitted from the insert when not supplied
+      // so Postgres applies the column DEFAULT (null) rather than writing an
+      // explicit null that could shadow a future DEFAULT change.
+      ...(row.confidenceScore != null && {
+        confidence_score: Math.round(row.confidenceScore * 100) / 100,
+      }),
+      ...(row.predictionGeneratedAt != null && {
+        prediction_generated_at: row.predictionGeneratedAt,
+      }),
+      ...(row.durationType != null && {
+        duration_type: row.durationType,
+      }),
+      ...(row.predictedDurationMin != null && {
+        predicted_duration_min: Math.round(row.predictedDurationMin * 100) / 100,
+      }),
+      ...(row.actualDurationMin != null && {
+        actual_duration_min: Math.round(row.actualDurationMin * 100) / 100,
+      }),
     });
   }
 
-  // "dedicated" branch keeps the original richer schema design (this table
-  // doesn't exist yet — build it with whatever columns you actually want).
+  // "dedicated" branch — purpose-built table, write all available fields.
   return supabase.from(DEDICATED_HISTORY_TABLE).insert({
     predicted_type: row.predictedType,
     predicted_time: row.predictedTimeIso,
     actual_time: row.actualTimeIso,
     error_minutes: errorMinutes,
+    ...(row.durationType != null && { duration_type: row.durationType }),
+    ...(row.predictedDurationMin != null && { predicted_duration_min: row.predictedDurationMin }),
+    ...(row.actualDurationMin != null && { actual_duration_min: row.actualDurationMin }),
   });
 }
 
