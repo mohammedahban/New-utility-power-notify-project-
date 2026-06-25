@@ -448,17 +448,47 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
       slotDate.getUTCHours(), slotDate.getUTCMinutes(), 0, 0
     )).toISOString();
 
-    toInsert.push({
-      predicted_event_time: predictedIso,
-      actual_event_time: ev.occurred_at,
-      predicted_state: ev.event_type,
-      actual_state: ev.event_type,
-      error_minutes: Math.round(errorMin * 100) / 100,
-      accuracy_score: Math.round(accuracyScore * 100) / 100,
-      confidence_score: typeof matchingSlot.confidence === 'number' ? matchingSlot.confidence : null,
-      prediction_generated_at: predRow.computed_at ?? null,
-      slot_id: matchingSlot.slotId ?? matchingSlot.slot_id ?? null,
-    });
+// Compute actual_duration_min: events[] is sorted ascending, so the NEXT
+// event in the array marks the end of this event's state.
+const nextEvent = events[j + 1];  // requires the loop to use `for (let j = 0; j < events.length; j++)` — see note below
+const actualDurationMin = nextEvent
+  ? Math.max(0, (new Date(nextEvent.occurred_at).getTime() - eventMs) / 60000)
+  : null;
+
+// Compute predicted_duration_min from the slot's own start/end ISOs
+const slotStartMs = new Date(matchingSlot.startIso ?? matchingSlot.start_iso ?? '').getTime();
+const slotEndMs   = new Date(matchingSlot.endIso   ?? matchingSlot.end_iso   ?? '').getTime();
+const predictedDurationMin = (slotStartMs && slotEndMs && slotEndMs > slotStartMs)
+  ? (slotEndMs - slotStartMs) / 60000
+  : null;
+
+// duration_type is the state of the period that ENDS at the next event —
+// i.e., the state ev.event_type represents (the START of that state).
+const durationType = ev.event_type === 'UTILITY_ON' ? 'ON' : 'OFF';
+
+toInsert.push({
+  predicted_event_time: predictedIso,
+  actual_event_time: ev.occurred_at,
+  predicted_state: ev.event_type,
+  actual_state: ev.event_type,
+  error_minutes: Math.round(errorMin * 100) / 100,
+  accuracy_score: Math.round(accuracyScore * 100) / 100,
+  // Fallback to the prediction-level confidence if the slot doesn't have its own
+  confidence_score: typeof matchingSlot.confidence === 'number'
+    ? matchingSlot.confidence
+    : (typeof pred.confidence === 'number' ? pred.confidence : null),
+  prediction_generated_at: predRow.computed_at ?? null,
+  // Synthesize a slot_id so future backfilled rows are distinguishable
+  slot_id: matchingSlot.slotId ?? matchingSlot.slot_id ?? `client_backfill_${durationType}`,
+  // NEW v4.3 fields:
+  duration_type: durationType,
+  predicted_duration_min: predictedDurationMin !== null
+    ? Math.round(predictedDurationMin * 100) / 100
+    : null,
+  actual_duration_min: actualDurationMin !== null
+    ? Math.round(actualDurationMin * 100) / 100
+    : null,
+});
   }
 
   if (toInsert.length === 0) {
