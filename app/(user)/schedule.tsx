@@ -5,7 +5,6 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
@@ -356,8 +355,7 @@ export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
-  const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode);
+  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
   const { anchor } = useStateAnchor();
 

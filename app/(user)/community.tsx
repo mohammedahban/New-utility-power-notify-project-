@@ -18,7 +18,6 @@ import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { useUserPredictions } from '../../hooks/useUserPredictions';
 import { AR } from '../../constants/arabic';
 
@@ -681,8 +680,7 @@ export default function CommunityScreen() {
   const [myOffsetMinutes, setMyOffsetMinutes] = React.useState(0);
   const { applyResync, resyncPoint } = useResync();
   const { offset } = useUserOffset();
-  const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode);
+  const { userPrediction } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { captureSnapshot } = useStatusSnapshot();
 
   useEffect(() => { registerPushToken(); }, []);
@@ -781,16 +779,6 @@ export default function CommunityScreen() {
     if (error) {
       Alert.alert(AR.error, error);
     } else if (response === 'yes' && yesResult) {
-      // TMMS V2 §GAP-3: capture snapshot BEFORE applying the community resync so
-      // "العودة إلى الحالة الأصلية" can fully restore the pre-confirmation state
-      // even when the Home tab is not currently mounted (snapshotCbRef would be null).
-      await captureSnapshot(
-        userPrediction?.currentState ?? 'OFF',
-        userPrediction?.currentStateStartIso ?? null,
-        offset?.offset_minutes ?? 0,
-        resyncPoint ?? null,
-        'community_confirm',
-      );
       // Fetch reporter reliability to surface in community sync meta
       let reporterReliability: number | null = null;
       if (notif.reporter_id) {
@@ -812,7 +800,7 @@ export default function CommunityScreen() {
       });
       Alert.alert(AR.scheduleUpdated, AR.scheduleUpdatedBody);
     }
-  }, [respond, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
+  }, [respond, applyResync]);
 
   const myBadge = myScore ? getReliabilityBadge(myScore.reliability_score) : null;
   const { profile } = useAuth();
