@@ -4,38 +4,15 @@
  * Fetches community resync notifications for the current user and handles
  * YES/NO/IGNORE responses.
  *
- * ───────────────────────────────────────────────────────────────────────────
- * TMMS V2 MIGRATION NOTES
- * ───────────────────────────────────────────────────────────────────────────
- * CRITICAL FIX: Community Confirmation Timestamp Rule
- *
- * The previous version computed:
- *   effective_transition_at = estimated_transition_at - response_delay_sec
- *
- * This VIOLATED the TMMS V2 spec:
- *   "Community Confirmations must never create new transitions using
- *    confirmation timestamps. All calculations must use the Original Report
- *    Timestamp. Confirmation timestamps may only affect Confidence, Trust,
- *    Reliability. Nothing else."
- *
- * The `response_delay_sec` is derived from the confirmation timestamp
- * (Date.now() when the recipient clicks YES). Subtracting it from the
- * report's original `estimated_transition_at` modified the transition time
- * using confirmation-derived data — a spec violation.
- *
- * MIGRATED BEHAVIOR:
- *   effective_transition_at = estimated_transition_at
- *     (the original report timestamp — unmodified)
- *
- * The `response_delay_sec` is still recorded in `resync_responses` for
- * trust/reliability analytics (which is spec-compliant: confirmation data
- * may affect Confidence/Trust/Reliability), but it no longer affects the
- * transition time itself.
- *
  * When a recipient responds YES:
- *   effective_transition_at = notif.estimated_transition_at
- *     (the absolute timestamp from the original report — already correct)
+ *   effective_transition_time = estimated_transition_at - response_delay_sec
+ *   (i.e. how long ago did the transition actually happen, accounting for
+ *    both the reporter's reported lag AND the recipient's response delay)
+ *
+ * The effective_transition_at is saved to resync_history and returned so
+ * the caller can apply it to the ResyncContext.
  */
+
 import { useEffect, useState, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
@@ -70,14 +47,7 @@ export interface ResyncHistoryEntry {
 
 /** Returned when a YES response is confirmed */
 export interface YesResyncResult {
-  /**
-   * The effective transition time to apply as a resync point.
-   *
-   * TMMS V2: This is the ORIGINAL REPORT TIMESTAMP
-   * (notif.estimated_transition_at), unmodified by the confirmation delay.
-   * The confirmation timestamp may only affect Confidence/Trust/Reliability,
-   * never the transition time itself.
-   */
+  /** The effective transition time to apply as a resync point */
   effectiveTransitionAt: string;
   /** The utility state that became active */
   reportedState: 'UTILITY_ON' | 'UTILITY_OFF';
@@ -196,12 +166,6 @@ export function useResyncNotifications() {
    *
    * Returns a YesResyncResult when the response is 'yes' so the caller
    * can immediately update the ResyncContext.
-   *
-   * TMMS V2 COMMUNITY CONFIRMATION TIMESTAMP RULE:
-   *   The effective transition time is the ORIGINAL REPORT TIMESTAMP
-   *   (notif.estimated_transition_at).  The confirmation delay
-   *   (response_delay_sec) is recorded for trust/reliability analytics
-   *   but does NOT modify the transition time.
    */
   const respond = useCallback(async (
     notif: ResyncNotification,
@@ -209,16 +173,13 @@ export function useResyncNotifications() {
   ): Promise<{ yesResult: YesResyncResult | null; error: string | null }> => {
     if (!user) return { yesResult: null, error: 'Not authenticated' };
 
-    // Response delay = time since the notification was created.
-    // This is recorded in resync_responses for trust/reliability analytics
-    // (spec-compliant: confirmation data may affect Confidence/Trust/Reliability).
-    // It does NOT affect the transition time.
+    // Response delay = time since the notification was created
     const delaySec = Math.max(
       0,
       Math.round((Date.now() - new Date(notif.created_at).getTime()) / 1000),
     );
 
-    // Record the response (includes delay for analytics — NOT for transition time)
+    // Record the response
     const { error: respError } = await supabase
       .from('resync_responses')
       .upsert({
@@ -234,28 +195,32 @@ export function useResyncNotifications() {
     let yesResult: YesResyncResult | null = null;
 
     if (response === 'yes' && notif.reported_state) {
-      // ── TMMS V2: Community Confirmation Timestamp Rule ──────────────────
-      //
-      // The effective transition time is the ORIGINAL REPORT TIMESTAMP.
-      // Per spec:
-      //   "Community Confirmations must never create new transitions using
-      //    confirmation timestamps. All calculations must use the Original
-      //    Report Timestamp."
-      //
-      // `notif.estimated_transition_at` is already the correct absolute
-      // timestamp — it was set when the reporter submitted the report and
-      // represents when the transition actually occurred.  The confirmation
-      // delay does NOT modify it.
-      //
-      // The previous version incorrectly subtracted `delaySec` here, which
-      // violated the spec by letting confirmation-derived data affect the
-      // transition time.
-      const effectiveTransitionAt = notif.estimated_transition_at
-        ?? new Date().toISOString();
+      /**
+       * Effective transition time calculation:
+       *
+       * The reporter said "it happened X minutes ago" at report creation time.
+       * estimated_transition_at = report_created_at - selectedOffsetMinutes
+       *
+       * The recipient clicked YES after delaySec seconds.
+       * In that time the transition has moved further into the past.
+       *
+       * effective_transition_at = estimated_transition_at
+       * (the absolute timestamp is already correct — it was computed
+       *  relative to wall-clock time, not relative to "now")
+       *
+       * We also factor in the response delay to correct for the recipient's
+       * perception gap: if the notification was created 4 minutes ago the
+       * event is 4 minutes more stale than the reporter's estimate.
+       *
+       * effective = estimated_transition_at - response_delay_sec
+       */
+      const estimatedMs = notif.estimated_transition_at
+        ? new Date(notif.estimated_transition_at).getTime()
+        : Date.now();
+      const effectiveMs = estimatedMs - delaySec * 1000;
+      const effectiveTransitionAt = new Date(effectiveMs).toISOString();
 
-      // Persist to resync_history.
-      // `effective_transition_at` = original report timestamp (spec-compliant).
-      // `confirmed_at` = confirmation timestamp (for record-keeping only).
+      // Persist to resync_history
       await supabase.from('resync_history').insert({
         user_id: user.id,
         report_id: notif.report_id,
