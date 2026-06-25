@@ -370,9 +370,55 @@ async function exportLogsToFile(logs: AccuracyLog[], stats: Stats, range: Range)
 // ─────────────────────────────────────────────────────────────────────────────
 // BACKFILL ENGINE
 // ─────────────────────────────────────────────────────────────────────────────
+
+     
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCHED runBackfill() — APPPE v4.3 compliant
+// ─────────────────────────────────────────────────────────────────────────────
+// Drop-in replacement for the existing runBackfill() function in accuracy_tsx.txt
+// (lines 373-476 in the version you shared).
+//
+// What changed:
+//   1. Loop now uses index `j` so we can reference events[j+1] (the next event,
+//      which marks the end of the current state) for actual_duration_min.
+//   2. Computes predicted_duration_min from the matching slot's startIso/endIso
+//      (these fields already exist on every slot object emitted by
+//      generateDaySchedule() in analyze-patterns.ts).
+//   3. Computes actual_duration_min from the next power_event in chronological
+//      order. For the LAST event in the 30-day window, this is null because
+//      we don't yet know when the next transition will happen.
+//   4. Sets duration_type from ev.event_type ("UTILITY_ON" -> "ON",
+//      "UTILITY_OFF" -> "OFF").
+//   5. Falls back to prediction-level confidence (pred.confidence) if the slot
+//      doesn't carry its own — slot-level confidence isn't currently emitted
+//      by analyze-patterns.ts, so this fallback is what will be used in
+//      practice until generateDaySchedule() is updated.
+//   6. Synthesizes a slot_id ("client_backfill_ON" / "client_backfill_OFF")
+//      so future rows can be distinguished from any server-written rows
+//      (slot_id = "server_resolved") and from old NULL-slot_id rows.
+//
+// What did NOT change:
+//   - Dedup key (actual_event_time at minute precision) — keep as-is.
+//   - The chunked insert loop (CHUNK=50) — keep as-is.
+//   - The 30-day lookback window.
+//   - The slot-matching algorithm (closest slot by time-of-day).
+//
+// After deploying this patch:
+//   - All NEW backfilled rows will have duration_type, predicted_duration_min,
+//     actual_duration_min, confidence_score, and slot_id populated.
+//   - The existing 161 rows will still be NULL for those fields. To populate
+//     them retroactively, run the SQL script in
+//     /home/z/my-project/download/backfill_existing_rows.sql
+//   - Phase 4 (Bias Engine) in analyze-patterns.ts will activate once ~3-5
+//     new rows with duration data accumulate (typically 1-2 days of grid
+//     activity). Watch apppe.biasSampleCount in the API response — when it
+//     leaves 0, Phase 4 is live.
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function runBackfill(): Promise<{ inserted: number; skipped: number; error: string | null }> {
   const MAX_ALLOWED_ERROR_MIN = 150;
 
+  // Fetch the latest prediction row (kept in utility_predictions table, id=1).
   const { data: predRow, error: predErr } = await supabase
     .from('utility_predictions')
     .select('prediction, computed_at')
@@ -388,6 +434,12 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
   if (slots.length === 0) {
     return { inserted: 0, skipped: 0, error: 'جدول التوقعات فارغ في السجل الحالي' };
   }
+
+  // Prediction-level confidence — used as a fallback if the slot doesn't
+  // carry its own confidence field. analyze-patterns.ts currently emits
+  // `confidence` at the top level of the prediction object, not per-slot.
+  const predConfidence: number | null =
+    typeof pred.confidence === 'number' ? pred.confidence : null;
 
   const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
   const { data: events, error: evErr } = await supabase
@@ -411,7 +463,11 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
 
   const toInsert: object[] = [];
 
-  for (const ev of events) {
+  // CHANGED: indexed loop so we can look at the NEXT event in chronological
+  // order. The next event marks the end of the state that THIS event began,
+  // which is what we need to compute actual_duration_min.
+  for (let j = 0; j < events.length; j++) {
+    const ev = events[j];
     const eventMs = new Date(ev.occurred_at).getTime();
     const eventMinKey = new Date(ev.occurred_at).toISOString().slice(0, 16);
     if (existingTimes.has(eventMinKey)) continue;
@@ -433,7 +489,12 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
 
     if (!matchingSlot) continue;
 
-    const predictedMs = new Date(matchingSlot.startIso ?? matchingSlot.start_iso ?? '').getTime();
+    const slotStartStr = matchingSlot.startIso ?? matchingSlot.start_iso;
+    const slotEndStr   = matchingSlot.endIso   ?? matchingSlot.end_iso;
+    const slotStartMs  = slotStartStr ? new Date(slotStartStr).getTime() : 0;
+    const slotEndMs    = slotEndStr   ? new Date(slotEndStr).getTime()   : 0;
+
+    const predictedMs = slotStartMs;
     if (!predictedMs) continue;
 
     let errorMs = Math.abs((eventMs % 86_400_000) - (predictedMs % 86_400_000));
@@ -442,53 +503,84 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
     const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
 
     const eventDate = new Date(ev.occurred_at);
-    const slotDate  = new Date(matchingSlot.startIso ?? matchingSlot.start_iso);
+    const slotDate  = new Date(slotStartStr);
     const predictedIso = new Date(Date.UTC(
       eventDate.getUTCFullYear(), eventDate.getUTCMonth(), eventDate.getUTCDate(),
       slotDate.getUTCHours(), slotDate.getUTCMinutes(), 0, 0
     )).toISOString();
 
-// Compute actual_duration_min: events[] is sorted ascending, so the NEXT
-// event in the array marks the end of this event's state.
-const nextEvent = events[j + 1];  // requires the loop to use `for (let j = 0; j < events.length; j++)` — see note below
-const actualDurationMin = nextEvent
-  ? Math.max(0, (new Date(nextEvent.occurred_at).getTime() - eventMs) / 60000)
-  : null;
+    // ── NEW v4.3 fields ──────────────────────────────────────────────────────
 
-// Compute predicted_duration_min from the slot's own start/end ISOs
-const slotStartMs = new Date(matchingSlot.startIso ?? matchingSlot.start_iso ?? '').getTime();
-const slotEndMs   = new Date(matchingSlot.endIso   ?? matchingSlot.end_iso   ?? '').getTime();
-const predictedDurationMin = (slotStartMs && slotEndMs && slotEndMs > slotStartMs)
-  ? (slotEndMs - slotStartMs) / 60000
-  : null;
+    // duration_type: the state of the period that BEGAN at this event.
+    // matches the convention used by analyze-patterns.ts Phase 4.
+    const durationType: 'ON' | 'OFF' =
+      ev.event_type === 'UTILITY_ON' ? 'ON' : 'OFF';
 
-// duration_type is the state of the period that ENDS at the next event —
-// i.e., the state ev.event_type represents (the START of that state).
-const durationType = ev.event_type === 'UTILITY_ON' ? 'ON' : 'OFF';
+    // predicted_duration_min: from the matching slot's own start/end ISOs.
+    // If the slot's endIso is missing or before its start (defensive guard),
+    // leave NULL — Phase 4's filter will skip this row, which is the
+    // correct behavior.
+    let predictedDurationMin: number | null = null;
+    if (slotStartMs && slotEndMs && slotEndMs > slotStartMs) {
+      predictedDurationMin = (slotEndMs - slotStartMs) / 60000;
+    }
 
-toInsert.push({
-  predicted_event_time: predictedIso,
-  actual_event_time: ev.occurred_at,
-  predicted_state: ev.event_type,
-  actual_state: ev.event_type,
-  error_minutes: Math.round(errorMin * 100) / 100,
-  accuracy_score: Math.round(accuracyScore * 100) / 100,
-  // Fallback to the prediction-level confidence if the slot doesn't have its own
-  confidence_score: typeof matchingSlot.confidence === 'number'
-    ? matchingSlot.confidence
-    : (typeof pred.confidence === 'number' ? pred.confidence : null),
-  prediction_generated_at: predRow.computed_at ?? null,
-  // Synthesize a slot_id so future backfilled rows are distinguishable
-  slot_id: matchingSlot.slotId ?? matchingSlot.slot_id ?? `client_backfill_${durationType}`,
-  // NEW v4.3 fields:
-  duration_type: durationType,
-  predicted_duration_min: predictedDurationMin !== null
-    ? Math.round(predictedDurationMin * 100) / 100
-    : null,
-  actual_duration_min: actualDurationMin !== null
-    ? Math.round(actualDurationMin * 100) / 100
-    : null,
-});
+    // actual_duration_min: from the NEXT event in chronological order.
+    // For the last event in the 30-day window, this is null because the
+    // state is still ongoing (or we don't have data past the window).
+    // Phase 4's filter (requires both predictedDurationMin AND
+    // actualDurationMin) will skip these null rows, which is correct —
+    // you can't compute a bias ratio without both numbers.
+    let actualDurationMin: number | null = null;
+    if (j + 1 < events.length) {
+      const nextEv = events[j + 1];
+      const nextMs = new Date(nextEv.occurred_at).getTime();
+      if (nextMs > eventMs) {
+        actualDurationMin = (nextMs - eventMs) / 60000;
+      }
+    }
+
+    // Defensive sanity cap: if actual_duration_min is absurdly large
+    // (>24h), the next-event match probably crossed a data gap. Skip
+    // rather than write garbage that would skew Phase 4.
+    if (actualDurationMin !== null && actualDurationMin > 1440) {
+      actualDurationMin = null;
+    }
+
+    // Confidence: prefer slot-level if present (future-proofing for when
+    // generateDaySchedule() emits per-slot confidence); fall back to the
+    // prediction-level confidence; finally null.
+    const confidenceScore: number | null =
+      typeof matchingSlot.confidence === 'number' ? matchingSlot.confidence :
+      predConfidence;
+
+    // slot_id: synthesized so backfilled rows are distinguishable from
+    // server-written rows ("server_resolved") and from old NULL rows.
+    // Naming convention: "client_backfill_<STATE>".
+    const slotId: string =
+      matchingSlot.slotId ?? matchingSlot.slot_id ?? `client_backfill_${durationType}`;
+
+    toInsert.push({
+      predicted_event_time: predictedIso,
+      actual_event_time: ev.occurred_at,
+      predicted_state: ev.event_type,
+      actual_state: ev.event_type,
+      error_minutes: Math.round(errorMin * 100) / 100,
+      accuracy_score: Math.round(accuracyScore * 100) / 100,
+      confidence_score: confidenceScore,
+      prediction_generated_at: predRow.computed_at ?? null,
+      slot_id: slotId,
+      // v4.3 NEW:
+      duration_type: durationType,
+      predicted_duration_min:
+        predictedDurationMin !== null
+          ? Math.round(predictedDurationMin * 100) / 100
+          : null,
+      actual_duration_min:
+        actualDurationMin !== null
+          ? Math.round(actualDurationMin * 100) / 100
+          : null,
+    });
   }
 
   if (toInsert.length === 0) {
@@ -498,13 +590,14 @@ toInsert.push({
   let inserted = 0;
   const CHUNK = 50;
   for (let i = 0; i < toInsert.length; i += CHUNK) {
-    const { error: insErr } = await supabase.from('prediction_accuracy_logs').insert(toInsert.slice(i, i + CHUNK));
+    const { error: insErr } = await supabase
+      .from('prediction_accuracy_logs')
+      .insert(toInsert.slice(i, i + CHUNK));
     if (!insErr) inserted += Math.min(CHUNK, toInsert.length - i);
   }
 
   return { inserted, skipped: events.length - toInsert.length, error: null };
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
