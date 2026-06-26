@@ -367,10 +367,6 @@ async function exportLogsToFile(logs: AccuracyLog[], stats: Stats, range: Range)
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BACKFILL ENGINE
-// ─────────────────────────────────────────────────────────────────────────────
-
      
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCHED runBackfill() — APPPE v4.3 compliant
@@ -598,6 +594,7 @@ async function runBackfill(): Promise<{ inserted: number; skipped: number; error
 
   return { inserted, skipped: events.length - toInsert.length, error: null };
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
