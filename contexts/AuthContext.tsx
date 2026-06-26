@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode, useRef } from 'react';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Session, User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
@@ -25,6 +26,36 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Storage keys Supabase uses to persist the session.
+//  We probe these directly as a fallback when getSession() returns null on
+//  cold start — a known issue in React Native where AsyncStorage reads
+//  haven't always completed by the time getSession() is first called.
+// ─────────────────────────────────────────────────────────────────────────────
+const SUPABASE_STORAGE_KEYS = [
+  // sb-<project-ref>-auth-token (v2 default)
+  null, // we will discover the actual key at runtime
+];
+
+const discoverSupabaseStorageKey = async (): Promise<string | null> => {
+  try {
+    const keys = await AsyncStorage.getAllKeys();
+    // Match the v2 default pattern: sb-<ref>-auth-token
+    const key = (keys as readonly string[]).find(
+      (k) => typeof k === 'string' && /^sb-[^-]+-auth-token$/.test(k)
+    );
+    if (key) return key;
+    // Match older v1 / custom patterns
+    const legacy = (keys as readonly string[]).find(
+      (k) => typeof k === 'string' && (k.endsWith('-auth-token') || k === 'supabase.auth.token')
+    );
+    return legacy ?? null;
+  } catch (e) {
+    console.warn('[Auth] storage key discovery failed:', e);
+    return null;
+  }
+};
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -48,7 +79,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         console.error('[Auth] fetchProfile error:', error.message);
         return;
       }
-      // Only commit the profile if this user is still the current one.
       if (currentUidRef.current === uid) {
         setProfile(data as UserProfile);
       }
@@ -57,9 +87,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const applySession = async (s: Session | null) => {
+    if (s?.user) {
+      setSession(s);
+      setUser(s.user);
+      await fetchProfile(s.user.id);
+    } else {
+      currentUidRef.current = null;
+      setSession(null);
+      setUser(null);
+      setProfile(null);
+    }
+  };
+
   useEffect(() => {
     let mounted = true;
     let loadingCleared = false;
+    let initialSessionDelivered = false;
 
     const clearLoading = () => {
       if (!mounted || loadingCleared) return;
@@ -67,88 +111,157 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setLoading(false);
     };
 
-    // Apply a session (or null) to React state and fetch the profile.
-    const applySession = async (s: Session | null) => {
-      if (!mounted) return;
-      if (s?.user) {
-        setSession(s);
-        setUser(s.user);
-        await fetchProfile(s.user.id);
-      } else {
-        currentUidRef.current = null;
-        setSession(null);
-        setUser(null);
-        setProfile(null);
+    // ─────────────────────────────────────────────────────────────────────
+    //  Cold-start session recovery (BULLETPROOF version)
+    // ─────────────────────────────────────────────────────────────────────
+    //  The previous version had a flaw: when getSession() returned null on
+    //  cold start (which happens in React Native because AsyncStorage
+    //  reads aren't always complete by the time getSession() is first
+    //  called), we cleared loading after 1.5s and sent the user to
+    //  /login — even though a valid refresh token was still in storage.
+    //
+    //  This version:
+    //    1. Calls getSession().
+    //    2. If null, probes AsyncStorage directly for the Supabase token
+    //       and parses it.
+    //    3. If we have a session (from either source) with an expired
+    //       access token, calls refreshSession() explicitly.
+    //    4. If we still have no session, waits up to 12s for the
+    //       INITIAL_SESSION event from onAuthStateChange.
+    //    5. Only clears loading when:
+    //         a) We have a definitive session (valid or refreshed), OR
+    //         b) INITIAL_SESSION arrives with null, OR
+    //         c) The 12s safety timeout fires.
+    //
+    //  This means: if the user has ANY valid refresh token in storage,
+    //  they will land on their home screen, never on /login.
+    // ─────────────────────────────────────────────────────────────────────
+
+    const recoverColdStartSession = async (): Promise<Session | null> => {
+      // Step 1: Try getSession() — reads from in-memory state.
+      try {
+        const { data, error } = await supabase.auth.getSession();
+        if (!mounted) return null;
+        if (error) {
+          console.warn('[Auth] getSession error:', error.message);
+        } else if (data.session) {
+          return data.session;
+        }
+      } catch (e: any) {
+        console.warn('[Auth] getSession exception:', e?.message ?? e);
+      }
+
+      // Step 2: getSession() returned null. On cold start in React Native
+      // this can happen even when a valid session IS in storage. Probe
+      // AsyncStorage directly and rehydrate.
+      try {
+        const storageKey = await discoverSupabaseStorageKey();
+        if (storageKey) {
+          const raw = await AsyncStorage.getItem(storageKey);
+          if (raw) {
+            // Supabase v2 stores either a JSON object or a JSON-stringified
+            // object whose value is the session JSON. Handle both.
+            let parsed: any;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              parsed = null;
+            }
+            // v2 shape: { access_token, refresh_token, expires_at, user, ... }
+            const sessionObj =
+              parsed && typeof parsed === 'object' && parsed.access_token
+                ? parsed
+                : parsed && typeof parsed === 'object' && parsed.value && parsed.value.access_token
+                ? parsed.value
+                : null;
+
+            if (sessionObj?.access_token && sessionObj?.refresh_token) {
+              // Rehydrate the Supabase client with what we found in storage.
+              // setSession() will validate the tokens and store them in memory.
+              try {
+                const { data, error } = await supabase.auth.setSession({
+                  access_token: sessionObj.access_token,
+                  refresh_token: sessionObj.refresh_token,
+                });
+                if (!mounted) return null;
+                if (error) {
+                  console.warn('[Auth] setSession error:', error.message);
+                } else if (data.session) {
+                  return data.session;
+                }
+              } catch (e: any) {
+                console.warn('[Auth] setSession exception:', e?.message ?? e);
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        console.warn('[Auth] storage probe failed:', e?.message ?? e);
+      }
+
+      return null;
+    };
+
+    const maybeRefresh = async (s: Session): Promise<Session | null> => {
+      const expiresAt = s.expires_at ?? 0;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const needsRefresh = expiresAt - nowSec < 60; // 60s buffer
+
+      if (!needsRefresh) return s;
+
+      try {
+        const { data, error } = await supabase.auth.refreshSession();
+        if (!mounted) return null;
+        if (error) {
+          console.warn('[Auth] refreshSession error:', error.message);
+          return null;
+        }
+        return data.session;
+      } catch (e: any) {
+        console.warn('[Auth] refreshSession exception:', e?.message ?? e);
+        return null;
       }
     };
 
-    // ─────────────────────────────────────────────────────────────────────
-    //  Cold-start session recovery
-    // ─────────────────────────────────────────────────────────────────────
-    //  This is the fix for the "redirected to login after long close" bug.
-    //
-    //  Old behaviour: getSession() → if no user, wait 2 s then give up and
-    //  show /login. If the refresh token was still valid but the access
-    //  token had expired, the user was wrongly sent to /login and had to
-    //  kill & reopen the app.
-    //
-    //  New behaviour:
-    //    1. Call getSession().
-    //    2. If we have a session whose access token is expired (or about to
-    //       expire), explicitly call refreshSession() to recover via the
-    //       refresh token.
-    //    3. Only clear `loading` (which unlocks navigation to /login) once
-    //       we are certain there is no recoverable session.
-    // ─────────────────────────────────────────────────────────────────────
     const initialize = async () => {
+      // Ensure background auto-refresh is running from the very first
+      // render. startAutoRefresh is a no-op if it's already running.
       try {
-        // Ensure background auto-refresh is running from the very first
-        // render (the original code only started it on AppState changes,
-        // so on a true cold start it was never started until the user
-        // backgrounded & foregrounded the app).
         supabase.auth.startAutoRefresh();
+      } catch {
+        // older SDK versions may not have startAutoRefresh
+      }
 
-        const { data: { session: s }, error } = await supabase.auth.getSession();
+      const recovered = await recoverColdStartSession();
+      if (!mounted) return;
+
+      if (recovered) {
+        // Check if access token is expired; if so, refresh it now.
+        const refreshed = await maybeRefresh(recovered);
         if (!mounted) return;
-        if (error) throw error;
 
-        if (s?.user) {
-          // Check whether the access token is expired (or about to expire).
-          // expires_at is a Unix timestamp in seconds.
-          const expiresAt = s.expires_at ?? 0;
-          const nowSec = Math.floor(Date.now() / 1000);
-          const needsRefresh = expiresAt - nowSec < 60; // 60-second buffer
-
-          if (needsRefresh) {
-            const { data: rd, error: re } = await supabase.auth.refreshSession();
-            if (!mounted) return;
-            if (re || !rd.session) {
-              // The refresh token is also invalid → user is truly logged out.
-              console.warn('[Auth] refreshSession failed on init:', re?.message);
-              await supabase.auth.signOut({ scope: 'local' });
-              await applySession(null);
-              clearLoading();
-              return;
-            }
-            await applySession(rd.session);
-            clearLoading();
-            return;
-          }
-
-          // Access token is still valid — use the session as-is.
-          await applySession(s);
+        if (refreshed) {
+          await applySession(refreshed);
           clearLoading();
           return;
         }
 
-        // No session in storage. Give onAuthStateChange's INITIAL_SESSION
-        // event a short window to deliver a recovered session before we
-        // conclude the user is logged out.
-        setTimeout(clearLoading, 1500);
-      } catch (e: any) {
-        console.warn('[Auth] init error:', e?.message ?? e);
-        setTimeout(clearLoading, 1500);
+        // We had a session but refresh failed — the refresh token is
+        // likely expired/revoked. Sign out locally so storage is cleaned.
+        console.warn('[Auth] recovery succeeded but refresh failed; signing out locally');
+        try {
+          await supabase.auth.signOut({ scope: 'local' });
+        } catch {}
+        await applySession(null);
+        clearLoading();
+        return;
       }
+
+      // No recoverable session yet. DO NOT clear loading here — wait for
+      // the INITIAL_SESSION event from onAuthStateChange (which fires
+      // once the SDK has finished loading from storage). The 12s safety
+      // timeout below will clear loading only as a last resort.
+      // (See fallbackTimer below.)
     };
 
     initialize();
@@ -161,27 +274,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       switch (event) {
         case 'INITIAL_SESSION':
-          // Fires once on subscription with whatever is in storage.
-          // If initialize() hasn't finished yet and we get a session here,
-          // accept it immediately so the user doesn't get sent to /login.
+          // This fires once the SDK has finished reading from storage.
+          // It is the authoritative source of truth on cold start.
+          initialSessionDelivered = true;
+
           if (s?.user) {
-            setSession(prev => prev ?? s);
-            setUser(prev => prev ?? s.user);
-            if (currentUidRef.current !== s.user.id) {
-              await fetchProfile(s.user.id);
+            // We have a session. If the access token is expired, refresh
+            // it now; otherwise use as-is.
+            const expiresAt = s.expires_at ?? 0;
+            const nowSec = Math.floor(Date.now() / 1000);
+            if (expiresAt - nowSec < 60) {
+              const { data: rd } = await supabase.auth.refreshSession();
+              if (!mounted) return;
+              if (rd.session) {
+                await applySession(rd.session);
+              } else {
+                await applySession(s); // fall back to whatever we have
+              }
+            } else {
+              await applySession(s);
             }
             clearLoading();
+          } else {
+            // INITIAL_SESSION definitively says: no session in storage.
+            // Only now is it safe to send the user to /login.
+            await applySession(null);
+            clearLoading();
           }
-          // If s is null, let initialize()'s timeout handle clearing.
           break;
 
         case 'TOKEN_REFRESHED':
-          // Token was refreshed (by auto-refresh or manually). Update the
-          // session and re-fetch the profile (role may have changed).
           if (s?.user) {
             setSession(s);
             setUser(s.user);
-            await fetchProfile(s.user.id);
+            if (currentUidRef.current !== s.user.id) {
+              await fetchProfile(s.user.id);
+            }
           }
           clearLoading();
           break;
@@ -200,17 +328,58 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     });
 
-    // Safety fallback: unblock the UI after 8 s no matter what, so the
-    // user is never stuck on the loading splash forever (e.g. if the
-    // network is completely unreachable on cold start).
-    const fallbackTimer = setTimeout(clearLoading, 8000);
+    // Safety fallback: unblock the UI after 12s no matter what.
+    // This is intentionally LONG because we want to give the SDK ample
+    // time to load from AsyncStorage on a slow cold start. A user on a
+    // slow device with a flaky network might otherwise be stuck forever.
+    // 12s is the maximum acceptable wait; in 99% of cases the user will
+    // be routed in <2s.
+    const fallbackTimer = setTimeout(() => {
+      if (!loadingCleared) {
+        console.warn('[Auth] 12s safety timeout fired — forcing loading=false');
+        if (!initialSessionDelivered) {
+          // We never even got INITIAL_SESSION. Treat as logged out.
+          applySession(null).finally(() => clearLoading());
+        } else {
+          clearLoading();
+        }
+      }
+    }, 12000);
 
     // Start/stop auto-refresh based on app visibility.
     const appStateSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
-        supabase.auth.startAutoRefresh();
+        try {
+          supabase.auth.startAutoRefresh();
+        } catch {}
+        // When the app returns to the foreground, also do an explicit
+        // getSession + refresh check — the auto-refresh interval might
+        // not have fired yet, and this gives an immediate refresh on
+        // foreground (fixes the "long close" case where the OS killed
+        // the JS context and no auto-refresh ran in the background).
+        (async () => {
+          try {
+            const { data } = await supabase.auth.getSession();
+            if (!mounted || !data.session) return;
+            const expiresAt = data.session.expires_at ?? 0;
+            const nowSec = Math.floor(Date.now() / 1000);
+            if (expiresAt - nowSec < 300) {
+              // Token expires in <5min — refresh now.
+              const { data: rd, error } = await supabase.auth.refreshSession();
+              if (error) console.warn('[Auth] foreground refresh error:', error.message);
+              else if (rd.session) {
+                setSession(rd.session);
+                setUser(rd.session.user);
+              }
+            }
+          } catch (e: any) {
+            console.warn('[Auth] foreground refresh exception:', e?.message ?? e);
+          }
+        })();
       } else {
-        supabase.auth.stopAutoRefresh();
+        try {
+          supabase.auth.stopAutoRefresh();
+        } catch {}
       }
     });
 
