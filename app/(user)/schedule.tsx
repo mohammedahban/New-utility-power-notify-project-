@@ -5,10 +5,10 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
+import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 
@@ -19,18 +19,11 @@ const T = {
   success: '#22c55e', warning: '#f59e0b', danger: '#ef4444',
 };
 
-function parseFormattedTime(label: string): number | null {
-  try {
-    const now = new Date();
-    const base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const m24 = label.match(/(\d{1,2}):(\d{2})/);
-    if (m24) {
-      base.setHours(parseInt(m24[1], 10), parseInt(m24[2], 10), 0, 0);
-      return base.getTime();
-    }
-    return null;
-  } catch { return null; }
-}
+// parseFormattedTime — REMOVED (TMMS V2 migration)
+// ScheduleBlock now uses slot.startIso / slot.endIso (UTC ISO-8601 from the
+// engine) for resync-event matching.  The formatted strings were unreliable:
+// fmtYemenTime produces "8:15م" (8:15 PM) but the parser only extracted the
+// numeric portion, interpreting PM slots as 12 hours too early.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Schedule Block
@@ -51,11 +44,21 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
   const endTime = stableEndFormatted ?? slot.shiftedEndFormatted ?? slot.endFormatted;
   const zoneAr = (AR as any)[slot.zone] ?? slot.zone;
 
-  const slotStartMs = startTime ? parseFormattedTime(startTime) : null;
-  const slotEndMs = endTime ? parseFormattedTime(endTime) : null;
+  // TMMS V2: Use the engine-provided ISO timestamps (slot.startIso / slot.endIso)
+  // for resync event matching instead of the formatted display strings.
+  //
+  // The old code called parseFormattedTime(stableStartFormatted) which only
+  // matched the numeric HH:MM portion of the Arabic-formatted string without
+  // converting AM/PM — so "8:15م" (8:15 PM Yemen = 17:15 UTC) was read as
+  // 08:15, a 12-hour error that broke community-badge matching on PM slots.
+  //
+  // slot.startIso / slot.endIso are UTC ISO-8601 as produced by the engine's
+  // applyOffsetToSlots / computeCommunityTransition and are safe for direct
+  // getTime() comparison against effective_transition_at.
+  const slotStartMs = new Date(slot.startIso).getTime();
+  const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : null;
 
   const resyncMatch = resyncEvents.find(ev => {
-    if (slotStartMs === null) return false;
     const evMs = new Date(ev.effective_transition_at).getTime();
     const windowStart = slotStartMs - 15 * 60 * 1000;
     const windowEnd = slotEndMs ? slotEndMs + 15 * 60 * 1000 : slotStartMs + 60 * 60 * 1000;
@@ -356,10 +359,15 @@ export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
-  const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode);
   const { history: resyncHistory } = useResyncNotifications();
   const { anchor } = useStateAnchor();
+  const { mode: transitionMode } = useTransitionMode();
+  const { userPrediction, loading } = useUserPredictions(
+    offset?.offset_minutes ?? 0,
+    resyncPoint,
+    transitionMode,
+    anchor?.startIso ?? null,
+  );
 
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
