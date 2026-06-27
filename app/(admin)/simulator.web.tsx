@@ -21,4 +21,4 @@
 // Re-export TMMSDebugSimulator's default export as this route's page.
 // Expo Router uses the default export of every file in app/ as the page
 // component — no wrapper needed since TMMSDebugSimulator already has one.
-export { default } from '../../components/debug/TMMSDebugSimulator';
+export { default } from '../../components/TMMSDebugSimulator';
