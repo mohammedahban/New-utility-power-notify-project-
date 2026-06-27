@@ -371,8 +371,49 @@ async function exportLogsToFile(logs: AccuracyLog[], stats: Stats, range: Range)
 
 
 ////////\/////////////
-
-
+     
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCHED runBackfill() — APPPE v4.3 compliant
+// ─────────────────────────────────────────────────────────────────────────────
+// Drop-in replacement for the existing runBackfill() function in accuracy_tsx.txt
+// (lines 373-476 in the version you shared).
+//
+// What changed:
+//   1. Loop now uses index `j` so we can reference events[j+1] (the next event,
+//      which marks the end of the current state) for actual_duration_min.
+//   2. Computes predicted_duration_min from the matching slot's startIso/endIso
+//      (these fields already exist on every slot object emitted by
+//      generateDaySchedule() in analyze-patterns.ts).
+//   3. Computes actual_duration_min from the next power_event in chronological
+//      order. For the LAST event in the 30-day window, this is null because
+//      we don't yet know when the next transition will happen.
+//   4. Sets duration_type from ev.event_type ("UTILITY_ON" -> "ON",
+//      "UTILITY_OFF" -> "OFF").
+//   5. Falls back to prediction-level confidence (pred.confidence) if the slot
+//      doesn't carry its own — slot-level confidence isn't currently emitted
+//      by analyze-patterns.ts, so this fallback is what will be used in
+//      practice until generateDaySchedule() is updated.
+//   6. Synthesizes a slot_id ("client_backfill_ON" / "client_backfill_OFF")
+//      so future rows can be distinguished from any server-written rows
+//      (slot_id = "server_resolved") and from old NULL-slot_id rows.
+//
+// What did NOT change:
+//   - Dedup key (actual_event_time at minute precision) — keep as-is.
+//   - The chunked insert loop (CHUNK=50) — keep as-is.
+//   - The 30-day lookback window.
+//   - The slot-matching algorithm (closest slot by time-of-day).
+//
+// After deploying this patch:
+//   - All NEW backfilled rows will have duration_type, predicted_duration_min,
+//     actual_duration_min, confidence_score, and slot_id populated.
+//   - The existing 161 rows will still be NULL for those fields. To populate
+//     them retroactively, run the SQL script in
+//     /home/z/my-project/download/backfill_existing_rows.sql
+//   - Phase 4 (Bias Engine) in analyze-patterns.ts will activate once ~3-5
+//     new rows with duration data accumulate (typically 1-2 days of grid
+//     activity). Watch apppe.biasSampleCount in the API response — when it
+//     leaves 0, Phase 4 is live.
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function runBackfill(): Promise<{ inserted: number; skipped: number; error: string | null }> {
   const MAX_ALLOWED_ERROR_MIN = 150;
