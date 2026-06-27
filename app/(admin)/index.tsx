@@ -15,7 +15,7 @@ import { AR } from '../../constants/arabic';
 import { supabase } from '../../lib/supabase';
 
 // ── ADDED IMPORT: TMMS Simulator ─────────────────────────────────────────────
-import TMMSDebugSimulator from '../../components/TMMSDebugSimulator';
+import TMMSDebugSimulator from './TMMSDebugSimulator';
 
 // ── 3-day Accuracy Mini-Sparkline ───────────────────────────────────────────
 interface DayAccuracy { label: string; avg: number; count: number; }
