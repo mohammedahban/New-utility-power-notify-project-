@@ -368,13 +368,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const currentSlot = (() => {
     const slots = prediction?.daySchedule ?? [];
     const nowMs = Date.now();
-    // Only POSITIVE_OFFSET_PENDING injects a synthetic current-state slot at
-    // index 0 of daySchedule (engine applyOffsetToPrediction unshift).
-    // COMMUNITY_SYNCED does NOT inject at index 0 — the generated resynced slot
-    // sits at its natural position inside effectiveSlots (after any preCycleSlots)
-    // and is reliably found by the standard findIndex below.  Using slots[0] for
-    // COMMUNITY_SYNCED would return a past preCycleSlot, giving remainMinutes = 0.
-    if (atcMode === 'POSITIVE_OFFSET_PENDING' && slots.length > 0) {
+    // POSITIVE_OFFSET_PENDING and COMMUNITY_SYNCED inject the current held
+    // slot at index 0 of daySchedule — same pattern already used
+    // successfully in TodayTimeline. Scoped to the live atc mode (NOT the
+    // generic isResynced flag, which is also true for negative-offset's
+    // normal reconciliation and would otherwise pick a stale old slot).
+    if ((atcMode === 'POSITIVE_OFFSET_PENDING' || atcMode === 'COMMUNITY_SYNCED') && slots.length > 0) {
       return slots[0];
     }
     if (isHolding) return null;
@@ -959,16 +958,19 @@ function TodayTimeline({ prediction, anchorStartIso }: {
   // For POSITIVE_OFFSET_PENDING: the synthetic slot (injected at front) IS the active slot
   const atcMode = prediction?.atc?.mode;
   const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+  // COMMUNITY_SYNCED also injects the current held slot at index 0 of
+  // daySchedule — same pattern as POSITIVE_OFFSET_PENDING. Scoped to the
+  // live atc mode (NOT the generic isResynced flag, which is also true
+  // during negative-offset's normal reconciliation and would otherwise
+  // force a stale, old slot to be treated as the active one).
+  const isCommunitySynced = atcMode === 'COMMUNITY_SYNCED';
 
   const activeIdx = (() => {
-    // Only POSITIVE_OFFSET_PENDING injects a synthetic current-state slot at
-    // index 0 of daySchedule (engine applyOffsetToPrediction unshift).
-    // COMMUNITY_SYNCED does NOT inject at index 0 — the generated resynced
-    // slot sits at its natural position inside effectiveSlots (preceded by
-    // any preCycleSlots that are already in the past) and is reliably found
-    // by the standard findIndex: its startIso = resync.syncedAtIso (past),
-    // endIso = generatedCycleEndIso (future), so nowMs correctly falls inside.
-    if (isPositiveOffsetPending && slots.length > 0) {
+    // Synthetic lingering slot is always at index 0 when POSITIVE_OFFSET_PENDING
+    // or when the state is currently community-synced.
+    if ((isPositiveOffsetPending || isCommunitySynced) && slots.length > 0) {
+      // The first slot is synthetic (current held state ending at scheduledAutoTransitionIso,
+      // or the community-synced current state)
       return 0;
     }
     return slots.findIndex(s => {
@@ -991,14 +993,10 @@ function TodayTimeline({ prediction, anchorStartIso }: {
         const color = isOn ? T.success : T.danger;
         const slotKey = `${slot.state}|${Math.round(new Date(slot.startIso).getTime() / 60_000)}`;
 
-        // For the active POSITIVE_OFFSET_PENDING slot, override start time with
-        // anchorStartIso so the synthetic slot (injected by the engine at index 0)
-        // shows the correct reconciled start moment.
-        // For COMMUNITY_SYNCED, the engine's generated slot already carries the
-        // correct shiftedStartFormatted = fmtYemenTime(resync.syncedAtIso), so no
-        // override is needed — using the slot's own formatted value is accurate.
+        // For the active held slot — POSITIVE_OFFSET_PENDING or COMMUNITY_SYNCED —
+        // use anchorStartIso for start time, since it carries the corrected real start moment.
         let currentStartF: string;
-        if (isActive && isPositiveOffsetPending && anchorStartIso) {
+        if (isActive && (isPositiveOffsetPending || isCommunitySynced) && anchorStartIso) {
           currentStartF = new Date(anchorStartIso).toLocaleString('en-US', {
             timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
           }).replace('AM', ' ص').replace('PM', ' م');
@@ -1009,8 +1007,8 @@ function TodayTimeline({ prediction, anchorStartIso }: {
         if (!stableStartMapRef.current[slotKey] && currentStartF) {
           stableStartMapRef.current[slotKey] = currentStartF;
         }
-        const startF = isActive && isPositiveOffsetPending && anchorStartIso
-          ? currentStartF  // always use fresh anchor for the synthetic POSITIVE_OFFSET_PENDING slot
+        const startF = isActive && (isPositiveOffsetPending || isCommunitySynced) && anchorStartIso
+          ? currentStartF  // always use fresh anchor for active pending/synced slot
           : (stableStartMapRef.current[slotKey] ?? currentStartF);
 
         const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
@@ -1264,22 +1262,11 @@ export default function Home() {
   const { resyncPoint, clearResync, registerSnapshotCallback } = useResync();
   const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
   const { anchor } = useStateAnchor();
-
-  // TMMS V2 Q3-A: persist the community-derived offset to user_offsets the first
-  // time it is computed for a given resync session.  Q2-A already freezes it
-  // in-memory (communityOffsetFrozenRef inside useUserPredictions); this callback
-  // writes it to the DB so the value survives app restarts.  saveOffset() upserts
-  // the same user_offsets row used for manual DSD calibration.
-  const onCommunityOffsetComputed = useCallback((computedOffsetMinutes: number) => {
-    saveOffset(computedOffsetMinutes);
-  }, [saveOffset]);
-
   const { userPrediction, loading: predLoading } = useUserPredictions(
     offset?.offset_minutes ?? 0,
     resyncPoint,
     transitionMode,
     anchor?.startIso ?? null,
-    onCommunityOffsetComputed,
   );
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
