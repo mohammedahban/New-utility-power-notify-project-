@@ -1,9 +1,9 @@
 /**
- * TMMS V2 Debug Simulator — Expo / React Native port
+ * TMMS V2 Debug Simulator
  * ════════════════════════════════════════════════════════════════════════════
  * Development/debug tool only. Does NOT touch production users or data.
  *
- * Architecture (unchanged from the web version):
+ * Architecture (as required):
  *   UI Layer                 → this file (components only, no business logic)
  *   TMMS Engine Layer         → ./tmmsEngine.ts   (pure, reusable, copy-paste
  *                                                   ready for production)
@@ -12,46 +12,15 @@
  *   Debug Visualization Layer → the Timeline / Inspector components below,
  *                                which only ever READ engine/simulation output
  *
- * ./tmmsEngine.ts and ./tmmsSimulation.ts are NOT changed for this port — they
- * have zero DOM/React dependencies (pure TS, framework-agnostic by design), so
- * they run identically under Hermes/React Native. Only this file, which used
- * web-only primitives (div/button/input/svg + injected <style> CSS), needed a
- * real rewrite for React Native.
+ * No fake backend, no duplicate business models: every report, confirmation,
+ * and offset calculation you see here is the SAME function call production
+ * code makes (applyOffsetToPrediction from tmmsEngine.ts).
  *
- * REQUIRED DEPENDENCY (not in core React Native):
- *   npx expo install react-native-svg
- * Everything else here uses only core React Native components.
- *
- * NOTES / PLATFORM CAVEATS:
- *   - Uses flexbox `gap` (RN ≥0.71 / Expo SDK ≥49). If you're on an older SDK,
- *     replace the `gap` style props with explicit margins.
- *   - fmtYemenTime/fmtClock use Date#toLocaleString with a timeZone option,
- *     which needs full ICU data in Hermes (default on Expo SDK 47+). If dates
- *     render oddly on an older/bare RN setup, add the `Intl` polyfill (e.g.
- *     `@formatjs/intl-locale` + related polyfills) or swap to a date library.
- *   - No CSS gradient/box-shadow glow equivalents are used — kept to solid
- *     fills + Animated opacity pulses, which look right on every platform
- *     (iOS/Android/web-via-react-native-web) without extra libraries.
- *   - This is a component, not a screen: mount it behind your own admin/dev
- *     gate, e.g. inside a stack screen:
- *       {__DEV__ && <TMMSDebugSimulator />}
- *     Wrap it in your own SafeAreaView/SafeAreaProvider if you need inset
- *     handling — left out here so this drops into any navigator cleanly.
+ * Gate this behind your own dev/admin flag before mounting in a real app,
+ * e.g.: {__DEV__ && <TMMSDebugSimulator />}
  * ════════════════════════════════════════════════════════════════════════════
  */
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
-import {
-  View,
-  Text,
-  ScrollView,
-  Pressable,
-  TextInput,
-  Animated,
-  Easing,
-  Platform,
-  useWindowDimensions,
-} from 'react-native';
-import Svg, { Rect, Line, Text as SvgText, G } from 'react-native-svg';
 import {
   createInitialWorld,
   advanceTime,
@@ -62,46 +31,48 @@ import {
   setSchedule,
   submitReportOrConfirm,
   SCENARIOS,
-  SPEC_SCENARIOS,
   type SimWorld,
   type SimEvent,
   type ScheduleEntryTemplate,
   type ScenarioResult,
-  type SpecScenarioResult,
 } from './tmmsSimulation';
-import { type ReportRecord, type TrustLevel } from './tmmsEngine';
+// WIRED: import engine utilities via the simulation layer so all consumers
+// share a single import source (tmmsSimulation → tmmsEngine).
+import { fmtYemenTime, type ShiftedScheduleSlot } from './tmmsSimulation';
 
 // ════════════════════════════════════════════════════════════════════════════
-// THEME — instrument-panel / oscilloscope aesthetic (same palette as the web
-// version). Subject-grounded choice: this tool monitors an inverter's ON/OFF
-// cycles, so a dark control-panel look with LED-style semantic colors fits.
+// THEME — instrument-panel / oscilloscope aesthetic. Subject-grounded choice:
+// this tool monitors an electrical inverter's ON/OFF cycles, so a dark
+// control-panel look with LED-style semantic colors fits the domain directly.
 // ════════════════════════════════════════════════════════════════════════════
 const C = {
   bg: '#0A0E12',
+  bgGradient: 'radial-gradient(ellipse at top, #0D1218 0%, #0A0E12 60%)',
   panel: '#12181F',
+  panelAlt: '#161D26',
   panelDeep: '#0D1116',
   border: '#212A34',
   borderLight: '#2C3744',
   textPrimary: '#E4E9EE',
   textSecondary: '#8893A0',
   textMuted: '#525C68',
+  mono: "'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
+  sans: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
   on: '#3DDC84',
   onDim: '#1F6B40',
   off: '#5C7A99',
   offDim: '#2E3F4F',
   positive: '#4FA8FF',
+  positiveDim: '#1E4566',
   negative: '#FF6B5B',
+  negativeDim: '#5A2A24',
   neutral: '#9AA5B1',
   generated: '#C792EA',
+  generatedDim: '#4A3658',
   uncertain: '#FFB84D',
+  uncertainDim: '#5C4420',
   error: '#FF5C5C',
 };
-
-// System-font fallback — zero extra deps. Swap for loaded Google Fonts
-// (expo-font + @expo-google-fonts/jetbrains-mono / inter) if you want the
-// exact web look; FONT_MONO/FONT_SANS are the only two lines to change.
-const FONT_MONO = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }) as string;
-const FONT_SANS = Platform.select({ ios: 'System', android: 'sans-serif', default: 'System' }) as string;
 
 const stateColor = (s: 'ON' | 'OFF') => (s === 'ON' ? C.on : C.off);
 const signColor = (sign: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL') =>
@@ -114,57 +85,29 @@ const modeColor = (mode: string) => {
   return C.on;
 };
 
-// ════════════════════════════════════════════════════════════════════════════
-// ANIMATION HELPERS — replace the web version's CSS keyframes
-// (tmms-pulse / tmms-blink / tmms-fadein) with RN Animated equivalents.
-// ════════════════════════════════════════════════════════════════════════════
-
-/** Smooth opacity loop 1 → 0.4 → 1, ~1.4s — used for "LED" glow badges. */
-function usePulse(active: boolean): Animated.Value {
-  const opacity = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    if (!active) {
-      opacity.setValue(1);
-      return;
-    }
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(opacity, { toValue: 0.4, duration: 700, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-        Animated.timing(opacity, { toValue: 1, duration: 700, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-      ]),
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [active, opacity]);
-  return opacity;
-}
-
-/** Hard on/off blink every 500ms — used for the timeline's "NOW" cursor. */
-function useBlink(): boolean {
-  const [on, setOn] = useState(true);
-  useEffect(() => {
-    const id = setInterval(() => setOn(o => !o), 500);
-    return () => clearInterval(id);
-  }, []);
-  return on;
-}
-
-/** Fade + slide-in on mount — used for newly-appeared list rows (decision
- *  trace steps, event log lines, scenario results). */
-function FadeIn({ children, style }: { children: React.ReactNode; style?: any }) {
-  const opacity = useRef(new Animated.Value(0)).current;
-  const translateY = useRef(new Animated.Value(-4)).current;
-  useEffect(() => {
-    Animated.parallel([
-      Animated.timing(opacity, { toValue: 1, duration: 250, useNativeDriver: true }),
-      Animated.timing(translateY, { toValue: 0, duration: 250, useNativeDriver: true }),
-    ]).start();
-  }, [opacity, translateY]);
-  return <Animated.View style={[style, { opacity, transform: [{ translateY }] }]}>{children}</Animated.View>;
-}
-
-const AnimatedRect = Animated.createAnimatedComponent(Rect);
-const AnimatedLine = Animated.createAnimatedComponent(Line);
+const globalCss = `
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+  .tmms-root * { box-sizing: border-box; }
+  .tmms-root { font-family: ${C.sans}; }
+  .tmms-mono { font-family: ${C.mono}; }
+  .tmms-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+  .tmms-scroll::-webkit-scrollbar-track { background: ${C.panelDeep}; }
+  .tmms-scroll::-webkit-scrollbar-thumb { background: ${C.borderLight}; border-radius: 4px; }
+  .tmms-scroll::-webkit-scrollbar-thumb:hover { background: ${C.textMuted}; }
+  .tmms-btn { transition: all 0.12s ease; cursor: pointer; }
+  .tmms-btn:hover { filter: brightness(1.15); transform: translateY(-1px); }
+  .tmms-btn:active { transform: translateY(0); }
+  @keyframes tmms-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .tmms-led-pulse { animation: tmms-pulse 1.4s ease-in-out infinite; }
+  @keyframes tmms-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.15; } }
+  .tmms-cursor-blink { animation: tmms-blink 1s step-end infinite; }
+  .tmms-fade-in { animation: tmms-fadein 0.25s ease; }
+  @keyframes tmms-fadein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+  @media (max-width: 1100px) {
+    .tmms-grid { grid-template-columns: 1fr !important; }
+    .tmms-col { max-height: none !important; }
+  }
+`;
 
 // ════════════════════════════════════════════════════════════════════════════
 // PRIMITIVES
@@ -178,43 +121,43 @@ function Panel({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <View style={{
-      backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, borderRadius: 10,
-      marginBottom: 14, overflow: 'hidden', borderTopWidth: 2, borderTopColor: accent,
+    <div style={{
+      background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10,
+      marginBottom: 14, overflow: 'hidden', borderTop: `2px solid ${accent}`,
     }}>
-      <Pressable
-        onPress={() => collapsible && setOpen(o => !o)}
+      <div
+        onClick={() => collapsible && setOpen(o => !o)}
         style={{
-          flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-          paddingVertical: 10, paddingHorizontal: 14,
-          borderBottomWidth: open ? 1 : 0, borderBottomColor: C.border,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '10px 14px', cursor: collapsible ? 'pointer' : 'default',
+          userSelect: 'none', borderBottom: open ? `1px solid ${C.border}` : 'none',
         }}
       >
-        <View>
-          <Text style={{ fontSize: 12.5, fontWeight: '700', color: C.textPrimary, letterSpacing: 0.3, fontFamily: FONT_SANS }}>
-            {collapsible && <Text style={{ color: C.textMuted, fontSize: 10 }}>{open ? '▾ ' : '▸ '}</Text>}
+        <div>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: C.textPrimary, letterSpacing: 0.3 }}>
+            {collapsible && <span style={{ color: C.textMuted, marginRight: 6, fontSize: 10 }}>{open ? '▾' : '▸'}</span>}
             {title}
-          </Text>
-          {subtitle && <Text style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2, fontFamily: FONT_SANS }}>{subtitle}</Text>}
-        </View>
+          </div>
+          {subtitle && <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>{subtitle}</div>}
+        </div>
         {badge}
-      </Pressable>
-      {open && <View style={{ padding: 14 }}>{children}</View>}
-    </View>
+      </div>
+      {open && <div style={{ padding: 14 }}>{children}</div>}
+    </div>
   );
 }
 
 function Badge({ children, color = C.neutral, glow = false }: { children: React.ReactNode; color?: string; glow?: boolean }) {
-  const pulse = usePulse(glow);
   return (
-    <View style={{
-      flexDirection: 'row', alignItems: 'center', gap: 5,
-      paddingVertical: 3, paddingHorizontal: 9, borderRadius: 20,
-      backgroundColor: `${color}22`, borderWidth: 1, borderColor: `${color}55`,
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5,
+      padding: '3px 9px', borderRadius: 20, fontSize: 10.5, fontWeight: 700,
+      background: `${color}22`, color, border: `1px solid ${color}55`,
+      fontFamily: C.mono, letterSpacing: 0.3, whiteSpace: 'nowrap',
     }}>
-      <Animated.View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: color, opacity: glow ? pulse : 1 }} />
-      <Text style={{ fontSize: 10.5, fontWeight: '700', color, fontFamily: FONT_MONO, letterSpacing: 0.3 }}>{children}</Text>
-    </View>
+      <span className={glow ? 'tmms-led-pulse' : ''} style={{ width: 6, height: 6, borderRadius: '50%', background: color, boxShadow: `0 0 6px ${color}` }} />
+      {children}
+    </span>
   );
 }
 
@@ -225,30 +168,30 @@ function Btn({
   small?: boolean; disabled?: boolean; fullWidth?: boolean;
 }) {
   return (
-    <Pressable
-      onPress={disabled ? undefined : onClick}
+    <button
+      className="tmms-btn"
+      onClick={disabled ? undefined : onClick}
       disabled={disabled}
-      style={({ pressed }) => ({
-        backgroundColor: `${color}${pressed ? '38' : '1F'}`,
-        borderWidth: 1, borderColor: disabled ? C.border : `${color}70`,
-        borderRadius: 7, paddingVertical: small ? 5 : 7, paddingHorizontal: small ? 10 : 14,
-        opacity: disabled ? 0.5 : 1, width: fullWidth ? '100%' : undefined,
-        alignItems: 'center', justifyContent: 'center',
-      })}
+      style={{
+        background: `${color}1F`, color: disabled ? C.textMuted : textColor,
+        border: `1px solid ${disabled ? C.border : color + '70'}`,
+        borderRadius: 7, padding: small ? '5px 10px' : '7px 14px',
+        fontSize: small ? 11 : 12, fontWeight: 600, fontFamily: C.sans,
+        cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1,
+        width: fullWidth ? '100%' : undefined,
+      }}
     >
-      <Text style={{ color: disabled ? C.textMuted : textColor, fontSize: small ? 11 : 12, fontWeight: '600', fontFamily: FONT_SANS, textAlign: 'center' }}>
-        {children}
-      </Text>
-    </Pressable>
+      {children}
+    </button>
   );
 }
 
 function StatRow({ label, value, mono = true, valueColor }: { label: string; value: React.ReactNode; mono?: boolean; valueColor?: string }) {
   return (
-    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: C.border }}>
-      <Text style={{ fontSize: 11.5, color: C.textSecondary, fontFamily: FONT_SANS }}>{label}</Text>
-      <Text style={{ fontSize: 12, color: valueColor ?? C.textPrimary, fontFamily: mono ? FONT_MONO : FONT_SANS, fontWeight: '600' }}>{value}</Text>
-    </View>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 0', borderBottom: `1px solid ${C.border}` }}>
+      <span style={{ fontSize: 11.5, color: C.textSecondary }}>{label}</span>
+      <span style={{ fontSize: 12, color: valueColor ?? C.textPrimary, fontFamily: mono ? C.mono : C.sans, fontWeight: 600 }}>{value}</span>
+    </div>
   );
 }
 
@@ -287,44 +230,40 @@ function ScheduleBuilder({ world, onChange }: { world: SimWorld; onChange: (t: S
   const toggleState = (id: string) =>
     onChange(template.map(t => (t.id === id ? { ...t, state: t.state === 'ON' ? 'OFF' : 'ON' } : t)));
 
+  const totalMin = template.reduce((s, t) => s + t.durationMin, 0);
+
   return (
     <Panel title="① SCHEDULE BUILDER" subtitle="Defines the repeating ON/OFF pattern (the 'Growatt schedule')" accent={C.borderLight}>
       {/* Mini timeline preview */}
-      <View style={{ flexDirection: 'row', height: 22, borderRadius: 5, overflow: 'hidden', marginBottom: 12, borderWidth: 1, borderColor: C.border }}>
+      <div style={{ display: 'flex', height: 22, borderRadius: 5, overflow: 'hidden', marginBottom: 12, border: `1px solid ${C.border}` }}>
         {template.map(t => (
-          <View key={t.id} style={{ flex: t.durationMin, backgroundColor: t.state === 'ON' ? C.onDim : C.offDim, borderRightWidth: 1, borderRightColor: C.bg }} />
+          <div key={t.id} title={`${t.state} ${t.durationMin}m`} style={{
+            width: `${(t.durationMin / totalMin) * 100}%`, background: t.state === 'ON' ? C.onDim : C.offDim,
+            borderRight: `1px solid ${C.bg}`,
+          }} />
         ))}
-      </View>
+      </div>
 
       {template.map((t, i) => (
-        <View key={t.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-          <Pressable onPress={() => toggleState(t.id)} style={{
-            width: 46, paddingVertical: 4, borderRadius: 5, alignItems: 'center',
-            borderWidth: 1, borderColor: `${stateColor(t.state)}66`, backgroundColor: `${stateColor(t.state)}22`,
-          }}>
-            <Text style={{ color: stateColor(t.state), fontFamily: FONT_MONO, fontSize: 11, fontWeight: '700' }}>{t.state}</Text>
-          </Pressable>
-          <TextInput
-            value={String(t.durationMin)}
-            onChangeText={txt => update(t.id, parseInt(txt || '0', 10))}
-            keyboardType="numeric"
+        <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+          <button className="tmms-btn" onClick={() => toggleState(t.id)} style={{
+            width: 46, padding: '4px 0', borderRadius: 5, border: `1px solid ${stateColor(t.state)}66`,
+            background: `${stateColor(t.state)}22`, color: stateColor(t.state), fontFamily: C.mono, fontSize: 11, fontWeight: 700,
+          }}>{t.state}</button>
+          <input
+            type="number" min={1} value={t.durationMin}
+            onChange={e => update(t.id, parseInt(e.target.value || '0', 10))}
             style={{
-              width: 64, backgroundColor: C.panelDeep, borderWidth: 1, borderColor: C.border, borderRadius: 5,
-              color: C.textPrimary, fontFamily: FONT_MONO, fontSize: 12, paddingVertical: 5, paddingHorizontal: 7,
+              width: 64, background: C.panelDeep, border: `1px solid ${C.border}`, borderRadius: 5,
+              color: C.textPrimary, fontFamily: C.mono, fontSize: 12, padding: '5px 7px',
             }}
           />
-          <Text style={{ fontSize: 10, color: C.textMuted, width: 28, fontFamily: FONT_SANS }}>min</Text>
-          <View style={{ flex: 1 }} />
-          <Pressable onPress={() => move(i, -1)} disabled={i === 0} hitSlop={8}>
-            <Text style={{ color: i === 0 ? C.textMuted : C.textSecondary, fontSize: 13 }}>↑</Text>
-          </Pressable>
-          <Pressable onPress={() => move(i, 1)} disabled={i === template.length - 1} hitSlop={8}>
-            <Text style={{ color: i === template.length - 1 ? C.textMuted : C.textSecondary, fontSize: 13 }}>↓</Text>
-          </Pressable>
-          <Pressable onPress={() => remove(t.id)} hitSlop={8}>
-            <Text style={{ color: C.negative, fontSize: 13 }}>✕</Text>
-          </Pressable>
-        </View>
+          <span style={{ fontSize: 10, color: C.textMuted, width: 28 }}>min</span>
+          <div style={{ flex: 1 }} />
+          <button className="tmms-btn" onClick={() => move(i, -1)} disabled={i === 0} style={{ background: 'transparent', border: 'none', color: i === 0 ? C.textMuted : C.textSecondary, fontSize: 13 }}>↑</button>
+          <button className="tmms-btn" onClick={() => move(i, 1)} disabled={i === template.length - 1} style={{ background: 'transparent', border: 'none', color: i === template.length - 1 ? C.textMuted : C.textSecondary, fontSize: 13 }}>↓</button>
+          <button className="tmms-btn" onClick={() => remove(t.id)} style={{ background: 'transparent', border: 'none', color: C.negative, fontSize: 13 }}>✕</button>
+        </div>
       ))}
 
       <Btn onClick={add} small fullWidth color={C.on} textColor={C.on}>+ Add State</Btn>
@@ -336,10 +275,10 @@ function ScheduleBuilder({ world, onChange }: { world: SimWorld; onChange: (t: S
 // SECTION 2 — Growatt Simulator
 // ════════════════════════════════════════════════════════════════════════════
 function GrowattSimulator({
-  world, onForce, onAdvance, onReset,
+  world, onForce, onAdvance, onSetNow, onReset,
 }: {
   world: SimWorld; onForce: (s: 'ON' | 'OFF') => void; onAdvance: (min: number) => void;
-  onReset: () => void;
+  onSetNow: (ms: number) => void; onReset: () => void;
 }) {
   const elapsedMin = (world.simulatedNowMs - new Date(world.growattLastTransitionAt).getTime()) / 60_000;
   const raw = world.lastResult;
@@ -359,18 +298,18 @@ function GrowattSimulator({
       <StatRow label="Expected End (reference)" value={expectedEnd ? fmtClock(expectedEnd) : '—'} />
       <StatRow label="Simulated Clock" value={fmtClock(new Date(world.simulatedNowMs).toISOString())} valueColor={C.uncertain} />
 
-      <View style={{ flexDirection: 'row', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
         <Btn onClick={() => onForce('ON')} color={C.on} textColor={C.on}>Force ON</Btn>
         <Btn onClick={() => onForce('OFF')} color={C.off} textColor={C.off}>Force OFF</Btn>
         <Btn onClick={onReset} color={C.negative} textColor={C.negative}>Reset All</Btn>
-      </View>
-      <View style={{ flexDirection: 'row', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
         <Btn small onClick={() => onAdvance(15)}>+15m</Btn>
         <Btn small onClick={() => onAdvance(30)}>+30m</Btn>
         <Btn small onClick={() => onAdvance(60)}>+1h</Btn>
         <Btn small onClick={() => onAdvance(180)}>+3h</Btn>
         <Btn small onClick={() => onAdvance(360)}>+6h</Btn>
-      </View>
+      </div>
     </Panel>
   );
 }
@@ -389,7 +328,6 @@ function UserTimelineSimulator({ world }: { world: SimWorld }) {
   const effectiveOffset = world.frozenCommunityOffsetMinutes ?? world.offsetMinutes;
   const elapsedMin = r.currentStateStartIso ? (world.simulatedNowMs - new Date(r.currentStateStartIso).getTime()) / 60_000 : null;
   const remainingMin = activeSlot?.endIso ? (new Date(activeSlot.endIso).getTime() - world.simulatedNowMs) / 60_000 : null;
-  const verificationWindowActive = r.atc.mode === 'POSITIVE_OFFSET_PENDING' || r.atc.inValidationWindow;
 
   return (
     <Panel
@@ -406,11 +344,10 @@ function UserTimelineSimulator({ world }: { world: SimWorld }) {
       <StatRow label="Elapsed" value={fmtMin(elapsedMin)} />
       <StatRow label="Remaining" value={remainingMin !== null ? fmtMin(remainingMin) : '—'} valueColor={remainingMin !== null && remainingMin < 0 ? C.negative : undefined} />
       <StatRow label="Is Holding (ATC)" value={r.isHoldingState ? 'YES' : 'no'} valueColor={r.isHoldingState ? C.uncertain : C.textMuted} />
-      <StatRow label="Verification Window Active" value={verificationWindowActive ? 'YES' : 'no'} valueColor={verificationWindowActive ? C.positive : C.textMuted} />
       {r.atc.statusLine && (
-        <View style={{ marginTop: 10, padding: 8, backgroundColor: `${modeColor(r.atc.mode)}15`, borderWidth: 1, borderColor: `${modeColor(r.atc.mode)}40`, borderRadius: 6 }}>
-          <Text style={{ fontSize: 11, color: modeColor(r.atc.mode), textAlign: 'right', writingDirection: 'rtl' }}>{r.atc.statusLine}</Text>
-        </View>
+        <div style={{ marginTop: 10, padding: 8, background: `${modeColor(r.atc.mode)}15`, border: `1px solid ${modeColor(r.atc.mode)}40`, borderRadius: 6, fontSize: 11, color: modeColor(r.atc.mode), direction: 'rtl', textAlign: 'right' }}>
+          {r.atc.statusLine}
+        </div>
       )}
     </Panel>
   );
@@ -421,21 +358,17 @@ function UserTimelineSimulator({ world }: { world: SimWorld }) {
 // ════════════════════════════════════════════════════════════════════════════
 function ModeSelector({ world, onChange }: { world: SimWorld; onChange: (m: 'AUTO' | 'MANUAL') => void }) {
   return (
-    <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
-      <Text style={{ fontSize: 10, color: C.textMuted, marginRight: 2, fontFamily: FONT_MONO }}>④ MODE</Text>
-      {(['AUTO', 'MANUAL'] as const).map(m => {
-        const active = world.transitionMode === m;
-        return (
-          <Pressable key={m} onPress={() => onChange(m)} style={{
-            paddingVertical: 6, paddingHorizontal: 14, borderRadius: 7,
-            borderWidth: 1, borderColor: active ? C.positive : C.border,
-            backgroundColor: active ? `${C.positive}22` : 'transparent',
-          }}>
-            <Text style={{ fontSize: 11.5, fontWeight: '700', fontFamily: FONT_MONO, color: active ? C.positive : C.textSecondary }}>{m}</Text>
-          </Pressable>
-        );
-      })}
-    </View>
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+      <span style={{ fontSize: 10, color: C.textMuted, marginRight: 2, fontFamily: C.mono }}>④ MODE</span>
+      {(['AUTO', 'MANUAL'] as const).map(m => (
+        <button key={m} className="tmms-btn" onClick={() => onChange(m)} style={{
+          padding: '6px 14px', borderRadius: 7, fontSize: 11.5, fontWeight: 700, fontFamily: C.mono,
+          border: `1px solid ${world.transitionMode === m ? C.positive : C.border}`,
+          background: world.transitionMode === m ? `${C.positive}22` : 'transparent',
+          color: world.transitionMode === m ? C.positive : C.textSecondary,
+        }}>{m}</button>
+      ))}
+    </div>
   );
 }
 
@@ -444,16 +377,13 @@ function ModeSelector({ world, onChange }: { world: SimWorld; onChange: (m: 'AUT
 // ════════════════════════════════════════════════════════════════════════════
 function ReportSimulator({ onAction }: { onAction: (state: 'ON' | 'OFF', kind: 'report' | 'confirm') => void }) {
   return (
-    <Panel title="⑤ REPORT SIMULATOR" subtitle="Confirm looks up an existing report and bumps confidence only — it never creates its own transition" accent={C.generated}>
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 8 }}>
-        <View style={{ width: '48%' }}><Btn onClick={() => onAction('ON', 'report')} color={C.on} textColor={C.on} fullWidth>Report ON</Btn></View>
-        <View style={{ width: '48%' }}><Btn onClick={() => onAction('OFF', 'report')} color={C.off} textColor={C.off} fullWidth>Report OFF</Btn></View>
-        <View style={{ width: '48%' }}><Btn onClick={() => onAction('ON', 'confirm')} color={C.on} textColor={C.on} fullWidth>Confirm ON</Btn></View>
-        <View style={{ width: '48%' }}><Btn onClick={() => onAction('OFF', 'confirm')} color={C.off} textColor={C.off} fullWidth>Confirm OFF</Btn></View>
-      </View>
-      <Text style={{ fontSize: 10, color: C.textMuted, marginTop: 8, lineHeight: 15 }}>
-        Confirm = community confirmation of an existing report (uses the original report's timestamp — see Ledger panel below). If no matching report exists, a "bare" confirmation is itself treated as authoritative (Scenario Group C).
-      </Text>
+    <Panel title="⑤ REPORT SIMULATOR" subtitle="Executes the REAL TMMS V2 engine — not a simulation of it" accent={C.generated}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        <Btn onClick={() => onAction('ON', 'report')} color={C.on} textColor={C.on}>Report ON</Btn>
+        <Btn onClick={() => onAction('OFF', 'report')} color={C.off} textColor={C.off}>Report OFF</Btn>
+        <Btn onClick={() => onAction('ON', 'confirm')} color={C.on} textColor={C.on}>Confirm ON</Btn>
+        <Btn onClick={() => onAction('OFF', 'confirm')} color={C.off} textColor={C.off}>Confirm OFF</Btn>
+      </div>
     </Panel>
   );
 }
@@ -463,13 +393,10 @@ function ReportSimulator({ onAction }: { onAction: (state: 'ON' | 'OFF', kind: '
 // ════════════════════════════════════════════════════════════════════════════
 function GeneratedStateAnalyzer({ world }: { world: SimWorld }) {
   const meta = world.lastResult?.communityTransitionMeta;
-  const activeReport = world.resyncPoint
-    ? world.reports.find(r => r.state === world.resyncPoint!.syncedState && r.originalReportAtIso === world.resyncPoint!.syncedAtIso)
-    : undefined;
   if (!meta) {
     return (
       <Panel title="⑥ GENERATED STATE ANALYZER" accent={C.generated}>
-        <Text style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', paddingVertical: 10 }}>No active resync — submit a report or confirmation to create a generated state.</Text>
+        <div style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', padding: '10px 0' }}>No active resync — submit a report or confirmation to create a generated state.</div>
       </Panel>
     );
   }
@@ -485,72 +412,7 @@ function GeneratedStateAnalyzer({ world }: { world: SimWorld }) {
       <StatRow label="Generated State Start" value={fmtClock(meta.generatedCycleStartIso)} />
       <StatRow label="Generated State End" value={fmtClock(meta.generatedCycleEndIso)} />
       <StatRow label="Generated State Duration" value={fmtMin(durMin)} />
-      <StatRow label="Originating Event" value={activeReport ? (activeReport.confirmations.length > 0 ? `Report (+${activeReport.confirmations.length} confirmation${activeReport.confirmations.length > 1 ? 's' : ''})` : 'Report (unconfirmed)') : (world.resyncPoint ? 'Report/Confirmation' : '—')} />
-    </Panel>
-  );
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// SECTION 6B — Confidence & Community Confirmation Ledger (spec panels ⑯/⑰)
-// ════════════════════════════════════════════════════════════════════════════
-const trustColor = (t: TrustLevel) => (t === 'VERIFIED' ? C.on : t === 'HIGH' ? C.positive : t === 'MEDIUM' ? C.uncertain : C.textMuted);
-
-function ConfidenceConfirmationLedger({ world }: { world: SimWorld }) {
-  const reports = [...world.reports].sort((a, b) => new Date(b.originalReportAtIso).getTime() - new Date(a.originalReportAtIso).getTime());
-  const activeReport = world.resyncPoint
-    ? world.reports.find(r => r.state === world.resyncPoint!.syncedState && r.originalReportAtIso === world.resyncPoint!.syncedAtIso)
-    : undefined;
-
-  return (
-    <Panel
-      title="⑯ CONFIDENCE & COMMUNITY CONFIRMATION LEDGER"
-      subtitle="Confirmation Timestamp Rule — confirmations affect ONLY confidence, never the transition"
-      accent={C.positive}
-      collapsible
-      defaultOpen={true}
-      badge={<Badge color={C.positive}>{reports.length} report{reports.length === 1 ? '' : 's'}</Badge>}
-    >
-      {activeReport && (
-        <View style={{ marginBottom: 12, padding: 9, backgroundColor: `${trustColor(activeReport.trustLevel)}12`, borderWidth: 1, borderColor: `${trustColor(activeReport.trustLevel)}45`, borderRadius: 6 }}>
-          <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4, fontWeight: '700', letterSpacing: 0.3 }}>ACTIVE REPORT (drives current generated state)</Text>
-          <StatRow label="Original Report Timestamp" value={fmtClock(activeReport.originalReportAtIso)} valueColor={C.generated} />
-          <StatRow label="Processed" value={activeReport.processedAtIso ? `YES — ${fmtClock(activeReport.processedAtIso)}` : 'NO (pending — unprocessed report)'} valueColor={activeReport.processedAtIso ? C.on : C.uncertain} />
-          <StatRow label="Confidence Score" value={`${activeReport.confidenceScore} / 100`} valueColor={trustColor(activeReport.trustLevel)} />
-          <StatRow label="Trust Level" value={activeReport.trustLevel} valueColor={trustColor(activeReport.trustLevel)} />
-          <StatRow label="Confirmations Received" value={activeReport.confirmations.length} />
-          {activeReport.confirmations.length > 0 && (
-            <View style={{ marginTop: 6 }}>
-              {activeReport.confirmations.map((c, i) => (
-                <View key={i} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 3, borderTopWidth: 1, borderTopColor: C.border }}>
-                  <Text style={{ fontSize: 10, color: C.textSecondary }}>#{i + 1} {c.confirmerName ?? 'confirmer'}</Text>
-                  <Text style={{ fontSize: 10, color: C.textSecondary, fontFamily: FONT_MONO }}>{c.hoursAfterReport.toFixed(1)}h after report</Text>
-                  <Text style={{ fontSize: 10, color: C.positive, fontFamily: FONT_MONO }}>conf→{c.confidenceScoreAfter}</Text>
-                </View>
-              ))}
-            </View>
-          )}
-          <Text style={{ fontSize: 10, color: C.textMuted, marginTop: 8, lineHeight: 15 }}>
-            Generated state start, offset, and duration above are ALL still anchored to{' '}
-            <Text style={{ color: C.generated, fontFamily: FONT_MONO }}>{fmtClock(activeReport.originalReportAtIso)}</Text> — the original report time — never any confirmation's own timestamp, no matter how many confirmations arrived or how late.
-          </Text>
-        </View>
-      )}
-
-      <Text style={{ fontSize: 10.5, color: C.textMuted, marginTop: 4, marginBottom: 6, fontWeight: '700' }}>FULL PERSISTENT REPORT LEDGER (never cleared — Rule 2)</Text>
-      <ScrollView style={{ maxHeight: 240 }} nestedScrollEnabled>
-        {reports.length === 0 && <Text style={{ fontSize: 11, color: C.textMuted, textAlign: 'center', paddingVertical: 12 }}>No reports submitted yet this session.</Text>}
-        {reports.map(r => (
-          <View key={r.id} style={{
-            flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6, paddingHorizontal: 8, marginBottom: 3,
-            backgroundColor: C.panelDeep, borderRadius: 5, borderWidth: 1, borderColor: C.border,
-          }}>
-            <Text style={{ color: stateColor(r.state), fontFamily: FONT_MONO, fontWeight: '700', width: 32, fontSize: 10.5 }}>{r.state}</Text>
-            <Text style={{ color: C.textMuted, fontFamily: FONT_MONO, flex: 1, fontSize: 10.5 }}>{fmtClock(r.originalReportAtIso)}</Text>
-            <Text style={{ color: C.textSecondary, width: 50, textAlign: 'right', fontSize: 10.5 }}>{r.confirmations.length}✓</Text>
-            <Badge color={trustColor(r.trustLevel)}>{r.confidenceScore}</Badge>
-          </View>
-        ))}
-      </ScrollView>
+      <StatRow label="Source" value={world.resyncPoint?.reporterName?.includes('Confirm') ? 'Confirmation' : 'Report'} />
     </Panel>
   );
 }
@@ -563,7 +425,7 @@ function DurationSelectionInspector({ world }: { world: SimWorld }) {
   if (!meta) {
     return (
       <Panel title="⑦ DURATION SELECTION INSPECTOR" accent={C.generated}>
-        <Text style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', paddingVertical: 10 }}>No active resync — submit a report or confirmation to see Rule 3 duration selection.</Text>
+        <div style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', padding: '10px 0' }}>No active resync — submit a report or confirmation to see Rule 3 duration selection.</div>
       </Panel>
     );
   }
@@ -576,7 +438,7 @@ function DurationSelectionInspector({ world }: { world: SimWorld }) {
     <Panel title="⑦ DURATION SELECTION INSPECTOR" accent={C.generated}>
       <StatRow label="Progress at Interruption" value={`${(meta.progressRatio * 100).toFixed(1)}%`} />
       <StatRow label="Selected Rule" value={meta.durationSelectionRule} valueColor={C.generated} />
-      <Text style={{ fontSize: 10.5, color: C.textMuted, marginVertical: 6, lineHeight: 16 }}>{ruleLabel[meta.durationSelectionRule]}</Text>
+      <div style={{ fontSize: 10.5, color: C.textMuted, margin: '4px 0 10px', lineHeight: 1.5 }}>{ruleLabel[meta.durationSelectionRule]}</div>
       <StatRow label="Selected Schedule Entry" value={meta.durationSourceSlot ? `${meta.durationSourceSlot.state} (${meta.durationSourceSlot.durationLabel})` : 'fallback'} />
       <StatRow label="Selected Duration" value={fmtMin((new Date(meta.generatedCycleEndIso).getTime() - new Date(meta.generatedCycleStartIso).getTime()) / 60_000)} valueColor={C.generated} />
     </Panel>
@@ -591,33 +453,40 @@ function OffsetCalculationInspector({ world }: { world: SimWorld }) {
   if (!meta) {
     return (
       <Panel title="⑧ OFFSET CALCULATION INSPECTOR" accent={C.borderLight}>
-        <Text style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', paddingVertical: 10 }}>No active resync — submit a report or confirmation to see Rule 4/5 offset calculation.</Text>
+        <div style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', padding: '10px 0' }}>No active resync — submit a report or confirmation to see Rule 4/5 offset calculation.</div>
       </Panel>
     );
   }
+  const refLabel: Record<string, string> = {
+    GROWATT_ON_START_ACTUAL: 'Growatt ON Start (actual)',
+    GROWATT_ON_END_EXPECTED: 'Growatt ON End (expected, from raw schedule)',
+    GROWATT_OFF_END_EXPECTED: 'Growatt OFF End (expected, from raw schedule)',
+    GROWATT_OFF_START_ACTUAL: 'Growatt OFF Start (actual)',
+  };
   return (
     <Panel title="⑧ OFFSET CALCULATION INSPECTOR" accent={signColor(meta.offsetSign)} badge={<Badge color={signColor(meta.offsetSign)}>{meta.offsetSign}</Badge>}>
       <StatRow label="Reference Kind" value={meta.offsetReferenceKind ?? '(frozen — not re-derived)'} />
       <StatRow label="Reference Time" value={fmtClock(meta.offsetReferenceIso)} />
       <StatRow label="Generated State Start" value={fmtClock(meta.generatedCycleStartIso)} />
-      <View style={{ marginVertical: 10, padding: 9, backgroundColor: C.panelDeep, borderWidth: 1, borderColor: C.border, borderRadius: 6 }}>
-        <Text style={{ fontSize: 11, fontFamily: FONT_MONO, color: C.textSecondary, lineHeight: 19 }}>Offset = GeneratedStateStart − ReferenceGrowattTime</Text>
-        <Text style={{ fontSize: 11, fontFamily: FONT_MONO, color: C.textSecondary, lineHeight: 19 }}>Offset = {fmtClock(meta.generatedCycleStartIso)} − {fmtClock(meta.offsetReferenceIso)}</Text>
-        <Text style={{ fontSize: 11, fontFamily: FONT_MONO, color: C.textSecondary, lineHeight: 19 }}>
-          Offset = <Text style={{ color: signColor(meta.offsetSign), fontWeight: '700' }}>{meta.offsetMinutes > 0 ? '+' : ''}{meta.offsetMinutes}m</Text>
-        </Text>
-      </View>
+      <div style={{
+        margin: '10px 0', padding: 9, background: C.panelDeep, border: `1px solid ${C.border}`, borderRadius: 6,
+        fontSize: 11, fontFamily: C.mono, color: C.textSecondary, lineHeight: 1.7,
+      }}>
+        Offset = GeneratedStateStart − ReferenceGrowattTime<br />
+        Offset = {fmtClock(meta.generatedCycleStartIso)} − {fmtClock(meta.offsetReferenceIso)}<br />
+        Offset = <span style={{ color: signColor(meta.offsetSign), fontWeight: 700 }}>{meta.offsetMinutes > 0 ? '+' : ''}{meta.offsetMinutes}m</span>
+      </div>
       <StatRow label="Calculated Offset" value={`${meta.offsetMinutes > 0 ? '+' : ''}${meta.offsetMinutes}m`} valueColor={signColor(meta.offsetSign)} />
       <StatRow label="Offset Type" value={meta.offsetSign} valueColor={signColor(meta.offsetSign)} />
-      <Text style={{ fontSize: 10.5, color: C.textMuted, marginTop: 8, lineHeight: 16 }}>
+      <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 8, lineHeight: 1.5 }}>
         {meta.offsetSign === 'POSITIVE' && 'Reason: generated timeline started AFTER the Growatt reference — user is behind Growatt.'}
         {meta.offsetSign === 'NEGATIVE' && 'Reason: generated timeline started BEFORE the Growatt reference — user is ahead of Growatt.'}
         {meta.offsetSign === 'NEUTRAL' && 'Reason: generated timeline start exactly matches the Growatt reference.'}
-      </Text>
+      </div>
       {!meta.isFreshOffsetComputation && (
-        <Text style={{ marginTop: 8, fontSize: 10, color: C.textMuted, fontStyle: 'italic' }}>
+        <div style={{ marginTop: 8, fontSize: 10, color: C.textMuted, fontStyle: 'italic' }}>
           ⓘ Frozen value reused (Q2-A) — reference detail only shown at the moment of original computation.
-        </Text>
+        </div>
       )}
     </Panel>
   );
@@ -631,37 +500,33 @@ function TransitionDecisionInspector({ world }: { world: SimWorld }) {
   if (!trace || trace.length === 0) {
     return (
       <Panel title="⑨ TRANSITION DECISION INSPECTOR" accent={C.borderLight}>
-        <Text style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', paddingVertical: 10 }}>No decisions traced yet.</Text>
+        <div style={{ fontSize: 11.5, color: C.textMuted, textAlign: 'center', padding: '10px 0' }}>No decisions traced yet.</div>
       </Panel>
     );
   }
   return (
     <Panel title="⑨ TRANSITION DECISION INSPECTOR" subtitle="Step-by-step engine trace for the active resync" accent={C.borderLight}>
       {trace.map(step => (
-        <View key={step.step} style={{ flexDirection: 'row', gap: 10, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: C.border }}>
-          <View style={{
-            width: 22, height: 22, borderRadius: 11, backgroundColor: C.panelDeep, borderWidth: 1, borderColor: C.borderLight,
-            alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-          }}>
-            <Text style={{ fontSize: 10, fontFamily: FONT_MONO, color: C.textSecondary }}>{step.step}</Text>
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={{ fontSize: 11.5, fontWeight: '700', color: C.textPrimary }}>{step.label}</Text>
-            <Text style={{ fontSize: 10.5, color: C.textMuted, marginTop: 1 }}>{step.detail}</Text>
-          </View>
-        </View>
+        <div key={step.step} style={{ display: 'flex', gap: 10, padding: '7px 0', borderBottom: `1px solid ${C.border}` }}>
+          <div style={{
+            width: 22, height: 22, borderRadius: '50%', background: C.panelDeep, border: `1px solid ${C.borderLight}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontFamily: C.mono, color: C.textSecondary, flexShrink: 0,
+          }}>{step.step}</div>
+          <div>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: C.textPrimary }}>{step.label}</div>
+            <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 1 }}>{step.detail}</div>
+          </div>
+        </div>
       ))}
     </Panel>
   );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 10 — Timeline Visualization (signature element, react-native-svg)
+// SECTION 10 — Timeline Visualization (signature element)
 // ════════════════════════════════════════════════════════════════════════════
 function TimelineViz({ world }: { world: SimWorld }) {
   const r = world.lastResult;
-  const blinkOn = useBlink();
-  const uncertainPulse = usePulse(r?.atc.mode === 'UNCERTAIN_ZONE');
   if (!r) return null;
 
   const W = 1000, H = 150;
@@ -681,56 +546,49 @@ function TimelineViz({ world }: { world: SimWorld }) {
 
   return (
     <Panel title="⑩ TIMELINE VISUALIZATION" subtitle="Growatt vs User timeline — live" accent={C.uncertain}>
-      <View style={{ backgroundColor: C.panelDeep, borderRadius: 8, borderWidth: 1, borderColor: C.border, overflow: 'hidden' }}>
-        <Svg viewBox={`0 0 ${W} ${H}`} width="100%" height={170}>
-          {/* Track labels */}
-          <SvgText x={6} y={26} fontSize={9} fill={C.textMuted} fontFamily={FONT_MONO}>GROWATT</SvgText>
-          <SvgText x={6} y={96} fontSize={9} fill={C.textMuted} fontFamily={FONT_MONO}>USER</SvgText>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block', background: C.panelDeep, borderRadius: 8, border: `1px solid ${C.border}` }}>
+        {/* Track labels */}
+        <text x={6} y={26} fontSize={9} fill={C.textMuted} fontFamily={C.mono}>GROWATT</text>
+        <text x={6} y={96} fontSize={9} fill={C.textMuted} fontFamily={C.mono}>USER</text>
 
-          {/* Growatt track (single segment showing current state since last transition) */}
-          <Rect x={Math.max(0, growattX)} y={34} width={Math.max(0, W - Math.max(0, growattX))} height={26} fill={stateColor(world.growattCurrentState)} opacity={0.35} rx={3} />
-          <SvgText x={Math.max(4, growattX + 4)} y={51} fontSize={10} fill={stateColor(world.growattCurrentState)} fontFamily={FONT_MONO} fontWeight="700">{world.growattCurrentState}</SvgText>
+        {/* Growatt track (single segment showing current state since last transition) */}
+        <rect x={Math.max(0, growattX)} y={34} width={Math.max(0, W - Math.max(0, growattX))} height={26} fill={stateColor(world.growattCurrentState)} opacity={0.35} rx={3} />
+        <text x={Math.max(4, growattX + 4)} y={51} fontSize={10} fill={stateColor(world.growattCurrentState)} fontFamily={C.mono} fontWeight={700}>{world.growattCurrentState}</text>
 
-          {/* User track — render each schedule slot */}
-          {slots.map((s, i) => {
-            const x1 = Math.max(0, xOf(new Date(s.startIso).getTime()));
-            const x2 = Math.min(W, xOf(s.endIso ? new Date(s.endIso).getTime() : endMs));
-            const isGen = (s as any).isResynced;
-            const fill = isGen ? C.generated : stateColor(s.state);
-            return (
-              <G key={i}>
-                <Rect x={x1} y={104} width={Math.max(1, x2 - x1)} height={26} fill={fill} opacity={isGen ? 0.55 : 0.32} rx={3}
-                  stroke={isGen ? C.generated : 'none'} strokeWidth={isGen ? 1.5 : 0} strokeDasharray={isGen ? '3,2' : undefined} />
-                {x2 - x1 > 38 && <SvgText x={x1 + 4} y={121} fontSize={9} fill={fill} fontFamily={FONT_MONO}>{s.state}{isGen ? '★' : ''}</SvgText>}
-              </G>
-            );
-          })}
+        {/* User track — render each schedule slot */}
+        {slots.map((s, i) => {
+          const x1 = Math.max(0, xOf(new Date(s.startIso).getTime()));
+          const x2 = Math.min(W, xOf(s.endIso ? new Date(s.endIso).getTime() : endMs));
+          const isGen = (s as any).isResynced;
+          const fill = isGen ? C.generated : stateColor(s.state);
+          return (
+            <g key={i}>
+              <rect x={x1} y={104} width={Math.max(1, x2 - x1)} height={26} fill={fill} opacity={isGen ? 0.55 : 0.32} rx={3}
+                stroke={isGen ? C.generated : 'none'} strokeWidth={isGen ? 1.5 : 0} strokeDasharray={isGen ? '3,2' : undefined} />
+              {x2 - x1 > 38 && <text x={x1 + 4} y={121} fontSize={9} fill={fill} fontFamily={C.mono}>{s.state}{isGen ? '★' : ''}</text>}
+            </g>
+          );
+        })}
 
-          {/* UNCERTAIN_ZONE / mode indicator band — pulses via Animated opacity */}
-          {r.atc.mode === 'UNCERTAIN_ZONE' && (
-            <AnimatedRect x={Math.max(0, nowX - 60)} y={104} width={60} height={26} fill={C.negative} opacity={uncertainPulse as any} rx={3} />
-          )}
+        {/* UNCERTAIN_ZONE / mode indicator band */}
+        {r.atc.mode === 'UNCERTAIN_ZONE' && (
+          <rect x={Math.max(0, nowX - 60)} y={104} width={60} height={26} fill={C.negative} opacity={0.25} rx={3} className="tmms-led-pulse" />
+        )}
 
-          {/* Now cursor — blinks via boolean toggle */}
-          <Line x1={nowX} y1={10} x2={nowX} y2={H - 10} stroke={C.textPrimary} strokeWidth={1.5} strokeDasharray="3,3" opacity={blinkOn ? 1 : 0.15} />
-          <SvgText x={nowX + 4} y={142} fontSize={9} fill={C.textPrimary} fontFamily={FONT_MONO}>NOW</SvgText>
-        </Svg>
-      </View>
-      <View style={{ flexDirection: 'row', gap: 14, marginTop: 10, flexWrap: 'wrap' }}>
+        {/* Now cursor */}
+        <line x1={nowX} y1={10} x2={nowX} y2={H - 10} stroke={C.textPrimary} strokeWidth={1.5} strokeDasharray="3,3" className="tmms-cursor-blink" />
+        <text x={nowX + 4} y={142} fontSize={9} fill={C.textPrimary} fontFamily={C.mono}>NOW</text>
+      </svg>
+      <div style={{ display: 'flex', gap: 14, marginTop: 10, flexWrap: 'wrap' }}>
         <LegendDot color={C.on} label="ON" /><LegendDot color={C.off} label="OFF" />
         <LegendDot color={C.generated} label="Generated (★)" />
         <LegendDot color={C.negative} label="UNCERTAIN_ZONE" />
-      </View>
+      </div>
     </Panel>
   );
 }
 function LegendDot({ color, label }: { color: string; label: string }) {
-  return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
-      <View style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: color }} />
-      <Text style={{ fontSize: 10, color: C.textMuted }}>{label}</Text>
-    </View>
-  );
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: C.textMuted }}><span style={{ width: 8, height: 8, borderRadius: 2, background: color }} />{label}</div>;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -750,13 +608,13 @@ function UncertainZoneSimulator({ world, onForceExit, onJumpToOverrun }: { world
       <StatRow label="Overrun Minutes" value={fmtMin(r.atc.overrunMinutes)} valueColor={r.atc.overrunMinutes > 0 ? C.negative : undefined} />
       <StatRow label="Why Entry Occurred" value={inZone ? 'Negative offset + cycle overran prediction range' : '—'} mono={false} />
       <StatRow label="Reconciled Start (lost-time result)" value={fmtClock(r.reconciledCycleStartIso)} valueColor={r.reconciledCycleStartIso ? C.on : undefined} />
-      <View style={{ flexDirection: 'row', gap: 6, marginTop: 10 }}>
+      <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
         <Btn small onClick={onJumpToOverrun} color={C.uncertain} textColor={C.uncertain}>Jump to Overrun (+25m past cycle end)</Btn>
-      </View>
-      <View style={{ flexDirection: 'row', gap: 6, marginTop: 6 }}>
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
         <Btn small onClick={() => onForceExit('ON')} color={C.on} textColor={C.on}>Exit via Growatt → ON</Btn>
         <Btn small onClick={() => onForceExit('OFF')} color={C.off} textColor={C.off}>Exit via Growatt → OFF</Btn>
-      </View>
+      </div>
     </Panel>
   );
 }
@@ -777,13 +635,13 @@ function ScheduleContinuityInspector({ world }: { world: SimWorld }) {
     <Panel title="⑫ SCHEDULE CONTINUITY INSPECTOR" collapsible defaultOpen={false} accent={C.borderLight}>
       <StatRow label="Current Position" value={current ? `${current.state} (${current.durationLabel ?? '—'})` : '—'} valueColor={current ? stateColor(current.state) : undefined} />
       <StatRow label="Next Position" value={upcoming[0] ? `${upcoming[0].state} (${upcoming[0].durationLabel ?? '—'})` : '—'} />
-      <Text style={{ fontSize: 10.5, color: C.textMuted, marginTop: 10, marginBottom: 6, fontWeight: '700' }}>FUTURE STATES (expected progression)</Text>
+      <div style={{ fontSize: 10.5, color: C.textMuted, margin: '10px 0 6px', fontWeight: 700 }}>FUTURE STATES (expected progression)</div>
       {upcoming.map((s, i) => (
-        <View key={i} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 4 }}>
-          <Text style={{ color: stateColor(s.state), fontFamily: FONT_MONO, fontWeight: '700', fontSize: 11 }}>{s.state}</Text>
-          <Text style={{ color: C.textMuted, fontFamily: FONT_MONO, fontSize: 11 }}>{fmtClock(s.startIso)} → {fmtClock(s.endIso)}</Text>
-          <Text style={{ color: C.textSecondary, fontSize: 11 }}>{s.durationLabel}</Text>
-        </View>
+        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: 11 }}>
+          <span style={{ color: stateColor(s.state), fontFamily: C.mono, fontWeight: 700 }}>{s.state}</span>
+          <span style={{ color: C.textMuted, fontFamily: C.mono }}>{fmtClock(s.startIso)} → {fmtClock(s.endIso)}</span>
+          <span style={{ color: C.textSecondary }}>{s.durationLabel}</span>
+        </div>
       ))}
     </Panel>
   );
@@ -798,26 +656,26 @@ function PersistentTimelineInspector({ world }: { world: SimWorld }) {
   const history = r.daySchedule.filter(s => new Date(s.startIso).getTime() < world.simulatedNowMs).slice(-8);
   return (
     <Panel title="⑬ PERSISTENT TIMELINE INSPECTOR" subtitle="Generated states are never deleted" collapsible defaultOpen={false} accent={C.generated}>
-      <ScrollView style={{ maxHeight: 220 }} nestedScrollEnabled>
+      <div className="tmms-scroll" style={{ maxHeight: 220, overflowY: 'auto' }}>
         {history.map((s, i) => {
           const isGen = (s as any).isResynced;
           return (
-            <View key={i} style={{
-              flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 5, paddingHorizontal: 8, marginBottom: 3,
-              backgroundColor: isGen ? `${C.generated}15` : 'transparent', borderRadius: 5,
-              borderWidth: 1, borderColor: isGen ? `${C.generated}40` : 'transparent',
+            <div key={i} style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 8px', marginBottom: 3,
+              background: isGen ? `${C.generated}15` : 'transparent', borderRadius: 5,
+              border: isGen ? `1px solid ${C.generated}40` : `1px solid transparent`, fontSize: 10.5,
             }}>
-              <Text style={{ color: stateColor(s.state), fontFamily: FONT_MONO, fontWeight: '700', fontSize: 10.5 }}>{s.state}</Text>
-              <Text style={{ color: C.textMuted, fontFamily: FONT_MONO, fontSize: 10.5 }}>{fmtClock(s.startIso)}</Text>
+              <span style={{ color: stateColor(s.state), fontFamily: C.mono, fontWeight: 700 }}>{s.state}</span>
+              <span style={{ color: C.textMuted, fontFamily: C.mono }}>{fmtClock(s.startIso)}</span>
               {isGen && <Badge color={C.generated}>GENERATED</Badge>}
               {(s as any).isEstimated && !isGen && <Badge color={C.textMuted}>estimated</Badge>}
-            </View>
+            </div>
           );
         })}
-      </ScrollView>
-      <Text style={{ fontSize: 10, color: C.textMuted, marginTop: 8 }}>
+      </div>
+      <div style={{ fontSize: 10, color: C.textMuted, marginTop: 8 }}>
         Showing last {history.length} historical slots. Mode changes, offsets, and resync events are in the Event Log (⑮).
-      </Text>
+      </div>
     </Panel>
   );
 }
@@ -840,106 +698,28 @@ function ScenarioRunner({
       badge={ranCount > 0 ? <Badge color={passCount === SCENARIOS.length ? C.on : C.uncertain}>{passCount}/{SCENARIOS.length} PASS</Badge> : undefined}
     >
       <Btn onClick={onRunAll} fullWidth color={C.on} textColor={C.on}>▶ Run All 15 Scenarios</Btn>
-      <ScrollView style={{ maxHeight: 360, marginTop: 10 }} nestedScrollEnabled>
+      <div className="tmms-scroll" style={{ maxHeight: 360, overflowY: 'auto', marginTop: 10 }}>
         {SCENARIOS.map(sc => {
           const res = results[sc.id];
           return (
-            <View key={sc.id} style={{ paddingVertical: 8, paddingHorizontal: 4, borderBottomWidth: 1, borderBottomColor: C.border }}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                <Text style={{ fontSize: 11, fontWeight: '600', color: C.textPrimary, flex: 1 }}>#{sc.id} {sc.name}</Text>
-                <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center', flexShrink: 0 }}>
+            <div key={sc.id} style={{ padding: '8px 4px', borderBottom: `1px solid ${C.border}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: C.textPrimary }}>#{sc.id} {sc.name}</div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
                   {res && <Badge color={res.pass ? C.on : C.error}>{res.pass ? 'PASS' : 'FAIL'}</Badge>}
-                  <Pressable onPress={() => onRun(sc.id)} style={{ borderWidth: 1, borderColor: C.border, borderRadius: 5, paddingVertical: 3, paddingHorizontal: 8 }}>
-                    <Text style={{ color: C.textSecondary, fontSize: 10 }}>Run</Text>
-                  </Pressable>
-                  {res && (
-                    <Pressable onPress={() => onLoadWorld(res.world)} style={{ borderWidth: 1, borderColor: C.border, borderRadius: 5, paddingVertical: 3, paddingHorizontal: 8 }}>
-                      <Text style={{ color: C.positive, fontSize: 10 }}>Inspect</Text>
-                    </Pressable>
-                  )}
-                </View>
-              </View>
+                  <button className="tmms-btn" onClick={() => onRun(sc.id)} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.textSecondary, fontSize: 10, padding: '3px 8px' }}>Run</button>
+                  {res && <button className="tmms-btn" onClick={() => onLoadWorld(res.world)} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.positive, fontSize: 10, padding: '3px 8px' }}>Inspect</button>}
+                </div>
+              </div>
               {res && (
-                <FadeIn style={{ marginTop: 4 }}>
-                  <Text style={{ fontSize: 10, color: C.textMuted, fontFamily: FONT_MONO }}>expected: {res.expected}</Text>
-                  <Text style={{ fontSize: 10, color: C.textMuted, fontFamily: FONT_MONO }}>actual: {res.actual}</Text>
-                </FadeIn>
+                <div className="tmms-fade-in" style={{ fontSize: 10, color: C.textMuted, marginTop: 4, fontFamily: C.mono }}>
+                  expected: {res.expected}<br />actual: {res.actual}
+                </div>
               )}
-            </View>
+            </div>
           );
         })}
-      </ScrollView>
-    </Panel>
-  );
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// SECTION 14B — Master TMMS V2 Spec Validator (Scenario Groups A-K, 50 cases)
-// ════════════════════════════════════════════════════════════════════════════
-function SpecScenarioRunner({
-  results, onRunAll, onLoadWorld,
-}: {
-  results: Record<string, SpecScenarioResult>; onRunAll: () => void; onLoadWorld: (w: SimWorld) => void;
-}) {
-  const groups = useMemo(() => {
-    const order: string[] = [];
-    for (const sc of SPEC_SCENARIOS) if (!order.includes(sc.group)) order.push(sc.group);
-    return order;
-  }, []);
-  const passCount = Object.values(results).filter(r => r.pass).length;
-  const ranCount = Object.keys(results).length;
-  const allPass = ranCount === SPEC_SCENARIOS.length && passCount === SPEC_SCENARIOS.length;
-
-  return (
-    <Panel
-      title="⑭ᴮ MASTER TMMS V2 SPEC VALIDATOR"
-      subtitle="50 scenarios · Groups A-K · the literal spec scenario set, against the Master Test Schedule"
-      accent={C.positive}
-      badge={ranCount > 0 ? <Badge color={allPass ? C.on : C.uncertain} glow={allPass}>{passCount}/{SPEC_SCENARIOS.length} PASS</Badge> : undefined}
-    >
-      <Btn onClick={onRunAll} fullWidth color={C.positive} textColor={C.positive}>▶ Run All 50 Spec Scenarios (A–K)</Btn>
-      <ScrollView style={{ maxHeight: 480, marginTop: 10 }} nestedScrollEnabled>
-        {groups.map(group => {
-          const scs = SPEC_SCENARIOS.filter(s => s.group === group);
-          const groupPass = scs.filter(s => results[s.id]?.pass).length;
-          const groupRan = scs.filter(s => results[s.id] !== undefined).length;
-          return (
-            <View key={group} style={{ marginBottom: 6 }}>
-              <View style={{
-                flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-                paddingVertical: 6, paddingHorizontal: 4, borderTopWidth: 1, borderTopColor: C.border, marginTop: 4,
-              }}>
-                <Text style={{ fontSize: 10.5, fontWeight: '700', color: C.textSecondary }}>{group}</Text>
-                {groupRan > 0 && <Badge color={groupPass === scs.length ? C.on : C.uncertain}>{groupPass}/{scs.length}</Badge>}
-              </View>
-              {scs.map(sc => {
-                const res = results[sc.id];
-                return (
-                  <View key={sc.id} style={{ paddingVertical: 6, paddingHorizontal: 4, borderBottomWidth: 1, borderBottomColor: C.border }}>
-                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                      <Text style={{ fontSize: 10.5, fontWeight: '600', color: C.textPrimary, flex: 1 }}>{sc.id} — {sc.name}</Text>
-                      <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center', flexShrink: 0 }}>
-                        {res && <Badge color={res.pass ? C.on : C.error}>{res.pass ? 'PASS' : 'FAIL'}</Badge>}
-                        {res && (
-                          <Pressable onPress={() => onLoadWorld(res.world)} style={{ borderWidth: 1, borderColor: C.border, borderRadius: 5, paddingVertical: 2, paddingHorizontal: 7 }}>
-                            <Text style={{ color: C.positive, fontSize: 9.5 }}>Inspect</Text>
-                          </Pressable>
-                        )}
-                      </View>
-                    </View>
-                    {res && (
-                      <FadeIn style={{ marginTop: 3 }}>
-                        <Text style={{ fontSize: 9.5, color: C.textMuted, fontFamily: FONT_MONO }}>expected: {res.expected}</Text>
-                        <Text style={{ fontSize: 9.5, color: C.textMuted, fontFamily: FONT_MONO }}>actual: {res.actual}</Text>
-                      </FadeIn>
-                    )}
-                  </View>
-                );
-              })}
-            </View>
-          );
-        })}
-      </ScrollView>
+      </div>
     </Panel>
   );
 }
@@ -952,30 +732,27 @@ const eventKindColor: Record<SimEvent['kind'], string> = {
   offset: C.positive, zone: C.negative, error: C.error, time: C.textSecondary,
 };
 function DebugEventLog({ events, onClear }: { events: SimEvent[]; onClear: () => void }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
   const reversed = useMemo(() => [...events].reverse(), [events]);
   return (
     <Panel
       title="⑮ DEBUG EVENT LOG"
       subtitle={`${events.length} events`}
       accent={C.borderLight}
-      badge={
-        <Pressable onPress={onClear} style={{ borderWidth: 1, borderColor: C.border, borderRadius: 5, paddingVertical: 3, paddingHorizontal: 8 }}>
-          <Text style={{ color: C.textMuted, fontSize: 10 }}>Clear</Text>
-        </Pressable>
-      }
+      badge={<button className="tmms-btn" onClick={onClear} style={{ background: 'transparent', border: `1px solid ${C.border}`, borderRadius: 5, color: C.textMuted, fontSize: 10, padding: '3px 8px' }}>Clear</button>}
     >
-      <ScrollView style={{ maxHeight: 420 }} nestedScrollEnabled>
+      <div ref={scrollRef} className="tmms-scroll" style={{ maxHeight: 420, overflowY: 'auto', fontFamily: C.mono }}>
         {reversed.map(ev => (
-          <FadeIn key={ev.id} style={{ paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: C.border }}>
-            <View style={{ flexDirection: 'row', gap: 8, alignItems: 'baseline' }}>
-              <Text style={{ fontSize: 9.5, color: C.textMuted, flexShrink: 0, fontFamily: FONT_MONO }}>{fmtClock(ev.simTimeIso)}</Text>
-              <Text style={{ fontSize: 11, color: eventKindColor[ev.kind], fontWeight: '700', fontFamily: FONT_MONO }}>{ev.action}</Text>
-            </View>
-            {ev.result && <Text style={{ fontSize: 10, color: C.textSecondary, marginLeft: 4, marginTop: 2, fontFamily: FONT_MONO }}>→ {ev.result}</Text>}
-          </FadeIn>
+          <div key={ev.id} className="tmms-fade-in" style={{ padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+              <span style={{ fontSize: 9.5, color: C.textMuted, flexShrink: 0 }}>{fmtClock(ev.simTimeIso)}</span>
+              <span style={{ fontSize: 11, color: eventKindColor[ev.kind], fontWeight: 700 }}>{ev.action}</span>
+            </div>
+            {ev.result && <div style={{ fontSize: 10, color: C.textSecondary, marginLeft: 4, marginTop: 2 }}>→ {ev.result}</div>}
+          </div>
         ))}
-        {events.length === 0 && <Text style={{ fontSize: 11, color: C.textMuted, textAlign: 'center', paddingVertical: 20 }}>No events yet.</Text>}
-      </ScrollView>
+        {events.length === 0 && <div style={{ fontSize: 11, color: C.textMuted, textAlign: 'center', padding: '20px 0' }}>No events yet.</div>}
+      </div>
     </Panel>
   );
 }
@@ -984,16 +761,13 @@ function DebugEventLog({ events, onClear }: { events: SimEvent[]; onClear: () =>
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════════════════════
 export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: SimWorld } = {}) {
-  const { width } = useWindowDimensions();
-  const isWide = width >= 1000; // matches the web version's 1100px breakpoint, adjusted for RN's narrower default chrome
-
   const [world, setWorld] = useState<SimWorld>(() => initialWorld ?? createInitialWorld());
   const [scenarioResults, setScenarioResults] = useState<Record<number, ScenarioResult>>({});
-  const [specResults, setSpecResults] = useState<Record<string, SpecScenarioResult>>({});
 
   const handleForce = useCallback((s: 'ON' | 'OFF') => setWorld(w => forceGrowattState(w, s)), []);
   const handleAdvance = useCallback((min: number) => setWorld(w => advanceTime(w, min)), []);
-  const handleReset = useCallback(() => { setWorld(resetWorld()); setScenarioResults({}); setSpecResults({}); }, []);
+  const handleSetNow = useCallback((ms: number) => setWorld(w => setSimulatedNow(w, ms)), []);
+  const handleReset = useCallback(() => { setWorld(resetWorld()); setScenarioResults({}); }, []);
   const handleModeChange = useCallback((m: 'AUTO' | 'MANUAL') => setWorld(w => setTransitionMode(w, m)), []);
   const handleScheduleChange = useCallback((t: ScheduleEntryTemplate[]) => setWorld(w => setSchedule(w, t)), []);
   const handleReportAction = useCallback((s: 'ON' | 'OFF', kind: 'report' | 'confirm') => setWorld(w => submitReportOrConfirm(w, s, kind)), []);
@@ -1021,65 +795,58 @@ export default function TMMSDebugSimulator({ initialWorld }: { initialWorld?: Si
     for (const sc of SCENARIOS) results[sc.id] = sc.run();
     setScenarioResults(results);
   }, []);
-  const handleRunAllSpec = useCallback(() => {
-    const results: Record<string, SpecScenarioResult> = {};
-    for (const sc of SPEC_SCENARIOS) results[sc.id] = sc.run();
-    setSpecResults(results);
-  }, []);
   const handleLoadWorld = useCallback((w: SimWorld) => setWorld(w), []);
   const handleClearLog = useCallback(() => setWorld(w => ({ ...w, eventLog: [] })), []);
 
   const r = world.lastResult;
 
   return (
-    <ScrollView style={{ flex: 1, backgroundColor: C.bg }} contentContainerStyle={{ padding: 16, paddingBottom: 48 }}>
+    <div className="tmms-root" style={{ minHeight: '100vh', background: C.bgGradient, color: C.textPrimary, padding: 18 }}>
+      <style>{globalCss}</style>
+
       {/* Header */}
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, gap: 10 }}>
-        <View>
-          <Text style={{ fontSize: 17, fontWeight: '800', letterSpacing: 0.5, color: C.textPrimary, fontFamily: FONT_SANS }}>
-            TMMS V2 <Text style={{ color: C.uncertain }}>DEBUG SIMULATOR</Text>
-          </Text>
-          <Text style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>
-            Development tool only · drives the real engine, not a mock · 50 spec scenarios (A–K) + 15 mechanism tests
-          </Text>
-        </View>
-        <View style={{ flexDirection: 'row', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, flexWrap: 'wrap', gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 17, fontWeight: 800, letterSpacing: 0.5 }}>
+            TMMS V2 <span style={{ color: C.uncertain }}>DEBUG SIMULATOR</span>
+          </div>
+          <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>Development tool only · drives the real engine, not a mock</div>
+        </div>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           {r && <Badge color={modeColor(r.atc.mode)} glow={r.atc.mode === 'UNCERTAIN_ZONE'}>{r.atc.mode}</Badge>}
           <ModeSelector world={world} onChange={handleModeChange} />
           <Btn onClick={handleReset} color={C.negative} textColor={C.negative} small>⟲ Reset</Btn>
-        </View>
-      </View>
+        </div>
+      </div>
 
-      {/* Responsive layout: 3 columns side-by-side when wide enough, stacked otherwise */}
-      <View style={{ flexDirection: isWide ? 'row' : 'column', gap: 16, alignItems: 'flex-start' }}>
+      {/* 3-column grid */}
+      <div className="tmms-grid" style={{ display: 'grid', gridTemplateColumns: '300px 1fr 320px', gap: 16, alignItems: 'start' }}>
         {/* LEFT: controls */}
-        <View style={{ width: isWide ? 300 : '100%' }}>
+        <div className="tmms-col">
           <ScheduleBuilder world={world} onChange={handleScheduleChange} />
-          <GrowattSimulator world={world} onForce={handleForce} onAdvance={handleAdvance} onReset={handleReset} />
+          <GrowattSimulator world={world} onForce={handleForce} onAdvance={handleAdvance} onSetNow={handleSetNow} onReset={handleReset} />
           <ReportSimulator onAction={handleReportAction} />
-        </View>
+        </div>
 
         {/* CENTER: visualization + inspectors */}
-        <View style={{ flex: isWide ? 1 : undefined, width: isWide ? undefined : '100%' }}>
+        <div className="tmms-col">
           <TimelineViz world={world} />
           <UserTimelineSimulator world={world} />
           <GeneratedStateAnalyzer world={world} />
-          <ConfidenceConfirmationLedger world={world} />
           <DurationSelectionInspector world={world} />
           <OffsetCalculationInspector world={world} />
           <TransitionDecisionInspector world={world} />
           <UncertainZoneSimulator world={world} onForceExit={handleForce} onJumpToOverrun={handleJumpToOverrun} />
           <ScheduleContinuityInspector world={world} />
           <PersistentTimelineInspector world={world} />
-        </View>
+        </div>
 
-        {/* RIGHT: scenario runners + event log */}
-        <View style={{ width: isWide ? 320 : '100%' }}>
-          <SpecScenarioRunner results={specResults} onRunAll={handleRunAllSpec} onLoadWorld={handleLoadWorld} />
+        {/* RIGHT: scenario runner + event log */}
+        <div className="tmms-col" style={{ position: 'sticky', top: 18, maxHeight: 'calc(100vh - 36px)', overflowY: 'auto' }}>
           <ScenarioRunner results={scenarioResults} onRun={handleRunScenario} onRunAll={handleRunAll} onLoadWorld={handleLoadWorld} />
           <DebugEventLog events={world.eventLog} onClear={handleClearLog} />
-        </View>
-      </View>
-    </ScrollView>
+        </div>
+      </div>
+    </div>
   );
 }
