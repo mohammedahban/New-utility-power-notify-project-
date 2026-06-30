@@ -14,6 +14,8 @@ import { useAdminResyncHistory, useUnreviewedConflictsCount } from '../../hooks/
 import { AR } from '../../constants/arabic';
 import { supabase } from '../../lib/supabase';
 
+// ── ADDED IMPORT: TMMS Simulator ─────────────────────────────────────────────
+import TMMSDebugSimulator from './TMMSDebugSimulator';
 
 // ── 3-day Accuracy Mini-Sparkline ───────────────────────────────────────────
 interface DayAccuracy { label: string; avg: number; count: number; }
@@ -472,7 +474,17 @@ export default function AdminDashboard() {
         </View>
       </View>
 
-      
+      {/* ── ADDED COMPONENT: TMMS Debug Simulator Wrapper ───────────────────── */}
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>⚙️ جهاز محاكاة TMMS (بيئة التطوير)</Text>
+        </View>
+        <View style={styles.simulatorWrapper}>
+          <TMMSDebugSimulator/>
+        </View>
+      </View>
+      {/* ──────────────────────────────────────────────────────────────────── */}
+
       <View style={styles.navRow}>
         <TouchableOpacity style={[styles.navBtn, { flex: 1 }]} onPress={() => router.push('/(admin)/settings')} activeOpacity={0.75}>
           <Text style={styles.navBtnText}>{AR.settingsNav}</Text>
