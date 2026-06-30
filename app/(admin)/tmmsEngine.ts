@@ -1,74 +1,77 @@
 /**
- * tmmsEngine.ts — TMMS V2.1 Final Engine
+ * tmmsEngine.ts — TMMS V2.1 Pure TypeScript Engine
  *
- * The single source of truth for all transition logic, offset calculation,
- * schedule manipulation, and ATC state derivation.
+ * This file is intentionally dependency-free (no React imports) so it can be
+ * shared between the production hook (hooks/useUserPredictions.ts) and any
+ * admin debug/simulation tooling without circular-dependency issues.
  *
- * Shared between:
- *   - hooks/useUserPredictions.ts (production hook)
- *   - The TMMS V2.1 Debug Simulator (vanilla JS port)
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * TMMS V2.1 FINAL RULES (Period 1 / Period 2)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Period 1 = first half of OFF (<50% consumed) → POSITIVE offset
- *   - Generated ON replaces the Growatt ON located IN this period (prev ON)
- *   - Generated ON duration = that Growatt ON's duration
- *   - Offset value = T − prevOnStart (positive)
- *   - Offset is ADDED (push) to start/end of EACH state (ON and OFF)
- *   - Verification Window: true
- *
- * Period 2 = second half of OFF (>50% consumed) → NEGATIVE offset
- *   - Generated ON replaces the Growatt ON located JUST AFTER this period (next ON)
- *   - Generated ON duration = that Growatt ON's duration
- *   - Offset value = T − nextOnStart (negative)
- *   - Offset is DECLINED (pull) from start/end of EACH state (ON and OFF)
- *   - UNCERTAIN_ZONE: true
- *
- * The offset state AND value are computed ONCE at report time and are FINAL.
- * No recomputation, no flipping, no pending state.
- *
- * Reports can be submitted at ANY time — during Growatt OFF (Period 1/Period 2)
- * OR during Growatt ON (confirming/extending the current ON).
- *
- * The Generated ON slot itself is NOT shifted — it keeps its actual report time.
- * ALL other slots (ON and OFF) are shifted by the offset value.
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * FILE LOCATION: app/(admin)/tmmsEngine.ts
- * ═══════════════════════════════════════════════════════════════════════════
+ * Exports:
+ *   Types:       Prediction, ScheduleSlot, ResyncPoint, UserPrediction,
+ *                CommunitySyncMeta, ShiftedScheduleSlot, ATCInfo,
+ *                ScheduleStateMode, TransitionMode, AccuracyLogEvent
+ *   Functions:   applyOffsetToPrediction
  */
 
-// ─── TYPE EXPORTS ───────────────────────────────────────────────────────────
-
-export type ScheduleStateMode =
-  | 'NORMAL'
-  | 'COMMUNITY_SYNCED'
-  | 'UNCERTAIN_ZONE'
-  | 'WAITING_FOR_GROWATT'
-  | 'PREDICTION_RANGE'
-  | 'GRACE_MODE'
-  | 'POSITIVE_OFFSET_PENDING';
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────────────────────────────────────
 
 export type TransitionMode = 'AUTO' | 'MANUAL';
 
+/**
+ * Seven ATC (Automatic Transition Controller) operational modes.
+ *
+ * NORMAL                — No active offset or community sync; pure Growatt schedule.
+ * PREDICTION_RANGE      — Within ±15 min of the scheduled slot boundary.
+ * UNCERTAIN_ZONE        — User slot ended before Growatt confirmed; overrun < 30 min.
+ * COMMUNITY_SYNCED      — A community report generated a synthetic cycle that is
+ *                         still within its expected duration.
+ * WAITING_FOR_GROWATT   — Overrun ≥ 30 min; awaiting Growatt OR community confirmation.
+ * GRACE_MODE            — Growatt schedule end has passed by 5–30 min; grace window.
+ * POSITIVE_OFFSET_PENDING — Growatt has already transitioned but the user's
+ *                           scheduled transition is still in the future (positive offset).
+ */
+export type ScheduleStateMode =
+  | 'NORMAL'
+  | 'PREDICTION_RANGE'
+  | 'UNCERTAIN_ZONE'
+  | 'COMMUNITY_SYNCED'
+  | 'WAITING_FOR_GROWATT'
+  | 'GRACE_MODE'
+  | 'POSITIVE_OFFSET_PENDING';
+
+/** Raw schedule slot as returned by the APPPE prediction engine */
+export interface ScheduleSlot {
+  state: 'ON' | 'OFF';
+  /** HH:MM string in Yemen local time */
+  start: string;
+  /** HH:MM string in Yemen local time */
+  end: string;
+  durationMin: number;
+  zone?: 'DAY' | 'NIGHT';
+  /** Whether this slot is an estimate (not fully learned) */
+  isEstimated?: boolean;
+}
+
+/** Community synchronisation point stored in ResyncContext */
 export interface ResyncPoint {
-  syncedAtIso: string;
   syncedState: 'ON' | 'OFF';
+  syncedAtIso: string;
+  appliedAtIso: string;
   reporterName?: string | null;
   reporterReliability?: number | null;
-  // V2.1 additions (optional — set by useUtilityReports / useResyncNotifications)
-  offsetState?: string;
-  offsetValue?: number | string;
+  // V2.1 additions
+  offsetState?: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE';
+  offsetValue?: number | 'PENDING';
   timelineAlignment?: string;
   generatedOnStartIso?: string;
   generatedOnDurationMin?: number | null;
   generatedOnReferenceIso?: string | null;
-  generatedOnReferenceKind?: string | null;
+  generatedOnReferenceKind?: 'completed' | 'active' | null;
   confirmationTime?: string;
 }
 
+/** Community sync display metadata attached to UserPrediction */
 export interface CommunitySyncMeta {
   syncedAtIso: string;
   syncedState: 'ON' | 'OFF';
@@ -76,915 +79,587 @@ export interface CommunitySyncMeta {
   reporterReliability: number | null;
 }
 
+/** A schedule slot after offset shifting, ready for UI consumption */
 export interface ShiftedScheduleSlot {
   state: 'ON' | 'OFF';
+  /** Absolute ISO timestamp (shifted by user offset) */
   startIso: string;
+  /** Absolute ISO timestamp or null if open-ended */
   endIso: string | null;
+  /** Original Growatt start formatted (Yemen time) */
   startFormatted: string;
+  /** Original Growatt end formatted (Yemen time) */
   endFormatted: string | null;
+  /** Offset-shifted start formatted (Yemen time) */
   shiftedStartFormatted: string;
+  /** Offset-shifted end formatted (Yemen time) */
   shiftedEndFormatted: string | null;
-  durationLabel: string | null;
-  zone: string;
+  /** Human-readable duration label (e.g. "2س 30د") */
+  durationLabel: string;
+  zone: 'DAY' | 'NIGHT';
+  /** True when this slot is an APPPE estimate, not a learned cycle */
   isEstimated: boolean;
+  /** True when this slot was affected by a community resync */
   isResynced?: boolean;
 }
 
+/** ATC runtime information attached to UserPrediction */
+export interface ATCInfo {
+  mode: ScheduleStateMode;
+  transitionMode: TransitionMode;
+  statusLine: string;
+  overrunMinutes: number;
+  communityElevated: boolean;
+  inValidationWindow: boolean;
+  validationWindowRemainingMin: number;
+  scheduledAutoTransitionIso: string | null;
+}
+
+/** Raw APPPE v4 prediction as stored in the predictions table */
+export interface Prediction {
+  id?: number;
+  computedAt?: string;
+  confidence: number;
+  confidenceLabel: string;
+  isUnstable: boolean;
+  stabilityScore: number;
+  stabilityLabel: string;
+  currentState: 'ON' | 'OFF';
+  learningMode: 'learned' | 'hybrid' | 'estimated';
+  daySchedule: ScheduleSlot[];
+  nextTransition?: {
+    type: 'UTILITY_ON' | 'UTILITY_OFF';
+    rangeStartIso: string;
+    rangeEndIso: string;
+    rangeLabel: string;
+    minFromNowMin: number;
+    maxFromNowMin: number;
+    waitLabel: string;
+    inRangeWindow: boolean;
+  } | null;
+  expectedOnDurationLabel?: string;
+  expectedOffDurationLabel?: string;
+  crisisMode?: boolean;
+  crisisReason?: string;
+  reasoning?: string[];
+  offsetMinutes?: number;
+  resyncedAtIso?: string;
+  currentStateStartIso?: string;
+  isResynced?: boolean;
+  isHoldingState?: boolean;
+  reconciledCycleStartIso?: string | null;
+  apppe?: {
+    crisisActive?: boolean;
+    crisisReason?: string;
+    [key: string]: any;
+  };
+  [key: string]: any;
+}
+
+/** UserPrediction — engine output, consumed by UI hooks */
+export interface UserPrediction extends Prediction {
+  atc: ATCInfo;
+  communitySyncMeta: CommunitySyncMeta | null;
+  daySchedule: ShiftedScheduleSlot[];
+  currentStateStartIso: string | null;
+  reconciledCycleStartIso: string | null;
+}
+
+/** Accuracy log event emitted by the engine when a mode exit is detected */
 export interface AccuracyLogEvent {
   predictedTransitionIso: string;
   actualTransitionIso: string;
-  targetState: 'UTILITY_ON' | 'UTILITY_OFF';
+  targetState: 'ON' | 'OFF';
   offsetMinutes: number;
-  exitMode: string;
+  exitMode: ScheduleStateMode;
   errorMinutes: number;
   accuracyScore: number;
 }
 
-export interface NextTransition {
-  type: 'UTILITY_ON' | 'UTILITY_OFF';
-  rangeStartIso: string;
-  rangeEndIso: string;
-  rangeLabel: string;
-  minFromNowMin: number;
-  maxFromNowMin: number;
-  waitLabel: string;
-  inRangeWindow: boolean;
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Yemen timezone offset: UTC+3 */
+const YEMEN_OFFSET_MS = 3 * 60 * 60 * 1000;
+
+/**
+ * Convert a HH:MM string (Yemen local time) to a full ISO timestamp for today.
+ */
+function hmToIso(hhmm: string, nowMs: number): string {
+  const yemenNowMs = nowMs + YEMEN_OFFSET_MS;
+  const yemenDate = new Date(yemenNowMs);
+  const yemenMidnightMs = yemenNowMs - (
+    yemenDate.getUTCHours() * 3600000 +
+    yemenDate.getUTCMinutes() * 60000 +
+    yemenDate.getUTCSeconds() * 1000 +
+    yemenDate.getUTCMilliseconds()
+  );
+  const [h, m] = hhmm.split(':').map(Number);
+  return new Date(yemenMidnightMs - YEMEN_OFFSET_MS + h * 3600000 + m * 60000).toISOString();
 }
 
-export interface ATCState {
-  mode: ScheduleStateMode;
-  inValidationWindow: boolean;
-  validationWindowRemainingMin: number;
-  overrunMinutes: number;
-  transitionMode: TransitionMode;
-  communityElevated: boolean;
-  statusLine: string;
-  scheduledAutoTransitionIso: string | null;
+/**
+ * Format an ISO timestamp to HH:MM AM/PM in Yemen time with Arabic AM/PM suffix.
+ */
+export function fmtYemenTime(iso: string): string {
+  return new Date(iso).toLocaleString('en-US', {
+    timeZone: 'Asia/Aden',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).replace('AM', ' ص').replace('PM', ' م');
 }
 
-export interface UserPrediction {
-  daySchedule: ShiftedScheduleSlot[];
-  currentState: 'ON' | 'OFF';
-  currentStateStartIso: string | null;
-  nextTransition: NextTransition | null;
-  isHoldingState: boolean;
-  isResynced: boolean;
-  resyncedAtIso: string | null;
-  computedAt: string;
-  confidence: number;
-  stabilityScore: number;
-  stabilityLabel: string;
-  learningMode: string;
-  isUnstable: boolean;
-  communitySyncMeta: CommunitySyncMeta | null;
-  offsetMinutes: number;
-  crisisMode: boolean | null;
-  crisisReason: string | null;
-  expectedOnDurationLabel: string | null;
-  expectedOffDurationLabel: string | null;
-  atc: ATCState;
-  reasoning: string[];
-  // V2.1 fields (optional — set by useUserPredictions V2.1 layer)
-  offsetState?: string;
-  offsetValue?: number | string;
-  timelineAlignment?: string;
-  generatedOnInfo?: any;
-  pendingNegativeResolutionIso?: string | null;
-  isPendingNegative?: boolean;
-  isGeneratedOnCurrent?: boolean;
-}
-
-// ─── TIME HELPERS ───────────────────────────────────────────────────────────
-
-function fmtYemenTime(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString('en-US', {
-      timeZone: 'Asia/Aden',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    }).replace('AM', ' ص').replace('PM', ' م');
-  } catch {
-    return iso;
-  }
-}
-
-function fmtDurationLabel(min: number): string {
-  if (min <= 0) return '—';
+/**
+ * Convert minutes to a human-readable Arabic duration label.
+ */
+export function durationLabelFromMin(min: number): string {
+  if (min <= 0) return '0د';
   const h = Math.floor(min / 60);
-  const m = Math.round(min % 60);
+  const m = min % 60;
   if (h === 0) return `${m}د`;
-  if (m === 0) return h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h}س`;
+  if (m === 0) return h === 1 ? 'ساعة' : `${h}س`;
   return `${h}س ${m}د`;
 }
 
-function arabicDurationRange(min: number): string {
-  if (min <= 0) return '—';
-  const h = Math.floor(min / 60);
-  const m = Math.round(min % 60);
-  if (h === 0) return `${m} دقيقة`;
-  if (m === 0) return h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h} ساعات`;
-  return `${h}س ${m}د`;
+/**
+ * Determine whether a Yemen-time HH:MM slot falls in DAY (06:00–20:00) or NIGHT.
+ */
+export function getZoneFromIso(iso: string): 'DAY' | 'NIGHT' {
+  const h = new Date(iso).toLocaleString('en-US', {
+    timeZone: 'Asia/Aden',
+    hour: 'numeric',
+    hour12: false,
+  });
+  const hour = parseInt(h, 10);
+  return hour >= 6 && hour < 20 ? 'DAY' : 'NIGHT';
 }
 
-// ─── SCHEDULE HELPERS ───────────────────────────────────────────────────────
+/**
+ * Build a ShiftedScheduleSlot from a raw ScheduleSlot + an offset in minutes.
+ */
+function buildShiftedSlot(
+  raw: ScheduleSlot,
+  offsetMs: number,
+  nowMs: number,
+  isResynced = false,
+): ShiftedScheduleSlot {
+  const startIso  = hmToIso(raw.start, nowMs);
+  const endIso    = raw.end ? hmToIso(raw.end, nowMs) : null;
 
-interface RawSlot {
-  state: 'ON' | 'OFF';
-  startIso?: string;
-  endIso?: string | null;
-  start?: string;
-  end?: string | null;
-  startFormatted?: string;
-  endFormatted?: string | null;
-  durationMin?: number;
-  durationLabel?: string | null;
-  zone?: string;
-  isEstimated?: boolean;
-  isResynced?: boolean;
-}
-
-function normalizeSlot(raw: RawSlot, index: number): ShiftedScheduleSlot {
-  const startIso = raw.startIso || raw.start || '';
-  const endIso = raw.endIso || raw.end || null;
-
-  // Compute duration if not provided
-  let durationMin = raw.durationMin || 0;
-  if (!durationMin && startIso && endIso) {
-    const startMs = new Date(startIso).getTime();
-    const endMs = new Date(endIso).getTime();
-    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
-      durationMin = Math.round((endMs - startMs) / 60_000);
-    }
+  // Handle slots that wrap midnight: if endIso ≤ startIso, push end to next day
+  let adjustedEndIso = endIso;
+  if (adjustedEndIso && new Date(adjustedEndIso).getTime() <= new Date(startIso).getTime()) {
+    adjustedEndIso = new Date(new Date(adjustedEndIso).getTime() + 24 * 3600000).toISOString();
   }
 
-  // Determine zone based on hour
-  let zone = raw.zone || 'NIGHT';
-  if (!raw.zone && startIso) {
-    const h = new Date(startIso).getHours();
-    if (h >= 5 && h < 12) zone = 'MORNING';
-    else if (h >= 12 && h < 17) zone = 'AFTERNOON';
-    else if (h >= 17 && h < 21) zone = 'EVENING';
-    else zone = 'NIGHT';
-  }
-
-  const startFmt = raw.startFormatted || fmtYemenTime(startIso);
-  const endFmt = raw.endFormatted || (endIso ? fmtYemenTime(endIso) : null);
+  const shiftedStartIso = new Date(new Date(startIso).getTime() + offsetMs).toISOString();
+  const shiftedEndIso   = adjustedEndIso
+    ? new Date(new Date(adjustedEndIso).getTime() + offsetMs).toISOString()
+    : null;
 
   return {
     state: raw.state,
-    startIso,
-    endIso,
-    startFormatted: startFmt,
-    endFormatted: endFmt,
-    shiftedStartFormatted: startFmt,
-    shiftedEndFormatted: endFmt,
-    durationLabel: raw.durationLabel || fmtDurationLabel(durationMin),
-    zone,
-    isEstimated: raw.isEstimated || false,
-    isResynced: raw.isResynced || false,
+    startIso: shiftedStartIso,
+    endIso: shiftedEndIso,
+    startFormatted: fmtYemenTime(startIso),
+    endFormatted: adjustedEndIso ? fmtYemenTime(adjustedEndIso) : null,
+    shiftedStartFormatted: fmtYemenTime(shiftedStartIso),
+    shiftedEndFormatted: shiftedEndIso ? fmtYemenTime(shiftedEndIso) : null,
+    durationLabel: durationLabelFromMin(raw.durationMin),
+    zone: raw.zone ?? getZoneFromIso(startIso),
+    isEstimated: raw.isEstimated ?? false,
+    isResynced,
   };
 }
 
-// ─── OFFSET APPLICATION ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ATC STATE MACHINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PREDICTION_RANGE_MIN   = 15;
+const GRACE_MODE_MAX_MIN     = 30;
+const UNCERTAIN_ZONE_MAX_MIN = 30;
+const VALIDATION_WINDOW_MIN  = 20;
 
 /**
- * Apply the offset to ALL slots in the schedule.
- *
- * V2.1 FINAL:
- *   - Positive offset → ADD (push) to start AND end of EACH state (ON and OFF)
- *   - Negative offset → DECLINE (pull) from start AND end of EACH state
- *   - The Generated ON slot (if present) is NOT shifted
- *
- * @param schedule     The raw schedule slots
- * @param offsetMin    The offset in signed minutes
- * @param resyncPoint  If present, the Generated ON info for slot replacement
- * @returns Shifted schedule with all slots offset applied
+ * Determine the current ATC operational mode given the shifted schedule,
+ * the raw prediction's current state, the user's offset, an optional resync
+ * point, and the current wall-clock time.
  */
-function applyOffsetToAllSlots(
-  schedule: ShiftedScheduleSlot[],
-  offsetMin: number,
+function computeATCMode(
+  shiftedSlots: ShiftedScheduleSlot[],
+  growattCurrentState: 'ON' | 'OFF',
+  offsetMinutes: number,
   resyncPoint: ResyncPoint | null,
-): ShiftedScheduleSlot[] {
-  return schedule.map(slot => {
-    // V2.1: Don't shift the Generated ON slot — it keeps its actual report time.
-    // The Generated ON is identified by matching its startIso to the resync's
-    // syncedAtIso (which is the Generated ON start time).
-    const isGeneratedOn = resyncPoint &&
-      resyncPoint.syncedState === 'ON' &&
-      slot.startIso === resyncPoint.syncedAtIso;
-
-    if (isGeneratedOn) {
-      // Mark as resynced but don't shift
-      return { ...slot, isResynced: true };
-    }
-
-    // Shift both start and end by the offset
-    const startMs = new Date(slot.startIso).getTime();
-    const shiftedStartMs = startMs + offsetMin * 60_000;
-    const shiftedStartIso = new Date(shiftedStartMs).toISOString();
-
-    let shiftedEndIso: string | null = null;
-    let shiftedEndFormatted: string | null = null;
-    if (slot.endIso) {
-      const endMs = new Date(slot.endIso).getTime();
-      shiftedEndIso = new Date(endMs + offsetMin * 60_000).toISOString();
-      shiftedEndFormatted = fmtYemenTime(shiftedEndIso);
-    }
-
-    return {
-      ...slot,
-      startIso: shiftedStartIso,
-      endIso: shiftedEndIso,
-      shiftedStartFormatted: fmtYemenTime(shiftedStartIso),
-      shiftedEndFormatted,
-      isResynced: resyncPoint ? true : slot.isResynced,
-    };
-  });
-}
-
-// ─── CURRENT STATE DERIVATION ───────────────────────────────────────────────
-
-function deriveCurrentState(
-  schedule: ShiftedScheduleSlot[],
-  nowMs: number,
-  resyncPoint: ResyncPoint | null,
-): { state: 'ON' | 'OFF'; startIso: string | null } {
-  // If we have a resync point and the Generated ON is still active, use it
-  if (resyncPoint && resyncPoint.syncedState === 'ON') {
-    const genOnStartMs = new Date(resyncPoint.syncedAtIso).getTime();
-    const genOnDuration = resyncPoint.generatedOnDurationMin ?? 120; // default 2h
-    const genOnEndMs = genOnStartMs + genOnDuration * 60_000;
-    if (nowMs >= genOnStartMs && nowMs < genOnEndMs) {
-      return { state: 'ON', startIso: resyncPoint.syncedAtIso };
-    }
-  }
-
-  // Find the slot that contains "now"
-  for (const slot of schedule) {
-    const startMs = new Date(slot.startIso).getTime();
-    const endMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
-    if (nowMs >= startMs && nowMs < endMs) {
-      return { state: slot.state, startIso: slot.startIso };
-    }
-  }
-
-  // Default: find the next upcoming slot's state (assume OFF if next is ON)
-  for (const slot of schedule) {
-    const startMs = new Date(slot.startIso).getTime();
-    if (startMs > nowMs) {
-      return { state: slot.state === 'ON' ? 'OFF' : 'ON', startIso: null };
-    }
-  }
-
-  return { state: 'OFF', startIso: null };
-}
-
-// ─── NEXT TRANSITION DERIVATION ─────────────────────────────────────────────
-
-function deriveNextTransition(
-  schedule: ShiftedScheduleSlot[],
-  currentState: 'ON' | 'OFF',
-  nowMs: number,
-  isHolding: boolean,
-  scheduledAutoTransitionIso: string | null,
-): NextTransition | null {
-  // For POSITIVE_OFFSET_PENDING with a scheduled auto-transition, build from it
-  if (isHolding && scheduledAutoTransitionIso) {
-    const scheduledMs = new Date(scheduledAutoTransitionIso).getTime();
-    const minFromNow = Math.max(0, (scheduledMs - nowMs) / 60_000);
-    const nextState = currentState === 'ON' ? 'UTILITY_OFF' : 'UTILITY_ON';
-    return {
-      type: nextState as 'UTILITY_ON' | 'UTILITY_OFF',
-      rangeStartIso: scheduledAutoTransitionIso,
-      rangeEndIso: scheduledAutoTransitionIso,
-      rangeLabel: fmtYemenTime(scheduledAutoTransitionIso),
-      minFromNowMin: minFromNow,
-      maxFromNowMin: minFromNow,
-      waitLabel: '',
-      inRangeWindow: minFromNow <= 0,
-    };
-  }
-
-  // Find the next slot whose state differs from current
-  const targetState = currentState === 'ON' ? 'OFF' : 'ON';
-  for (const slot of schedule) {
-    if (slot.state !== targetState) continue;
-    const startMs = new Date(slot.startIso).getTime();
-    if (startMs <= nowMs) continue;
-
-    const minFromNow = (startMs - nowMs) / 60_000;
-    const endMs = slot.endIso ? new Date(slot.endIso).getTime() : startMs + 120 * 60_000;
-    const maxFromNow = (endMs - nowMs) / 60_000;
-
-    // Estimate a range window (±15 min around the predicted start)
-    const rangeWindowMs = 15 * 60_000;
-    const rangeStartMs = startMs - rangeWindowMs;
-    const rangeEndMs = startMs + rangeWindowMs;
-    const inRangeWindow = nowMs >= rangeStartMs && nowMs <= rangeEndMs;
-
-    return {
-      type: targetState === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
-      rangeStartIso: new Date(rangeStartMs).toISOString(),
-      rangeEndIso: new Date(rangeEndMs).toISOString(),
-      rangeLabel: fmtYemenTime(new Date(startMs).toISOString()),
-      minFromNowMin: Math.max(0, minFromNow),
-      maxFromNowMin: Math.max(0, maxFromNow),
-      waitLabel: '',
-      inRangeWindow,
-    };
-  }
-
-  return null;
-}
-
-// ─── ATC STATE COMPUTATION ──────────────────────────────────────────────────
-
-function computeATCState(
-  offsetMin: number,
-  isResynced: boolean,
   transitionMode: TransitionMode,
-  schedule: ShiftedScheduleSlot[],
+  frozenCommunityOffset: number | null,
   nowMs: number,
-  currentState: 'ON' | 'OFF',
-): ATCState {
-  // Determine mode based on offset and resync state
-  let mode: ScheduleStateMode = 'NORMAL';
+): {
+  mode: ScheduleStateMode;
+  currentState: 'ON' | 'OFF';
+  currentStateStartIso: string | null;
+  reconciledCycleStartIso: string | null;
+  isHoldingState: boolean;
+  overrunMinutes: number;
+  communityElevated: boolean;
+  inValidationWindow: boolean;
+  validationWindowRemainingMin: number;
+  scheduledAutoTransitionIso: string | null;
+  statusLine: string;
+} {
+  const offsetMs = offsetMinutes * 60_000;
 
-  if (isResynced) {
-    mode = 'COMMUNITY_SYNCED';
-  } else if (offsetMin > 0) {
-    // Positive offset — check if we're in POSITIVE_OFFSET_PENDING
-    // (Growatt has transitioned but user's scheduled time is future)
-    const currentSlot = schedule.find(s => {
-      const startMs = new Date(s.startIso).getTime();
-      const endMs = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-      return nowMs >= startMs && nowMs < endMs;
-    });
-    if (currentSlot && currentSlot.state !== currentState) {
-      mode = 'POSITIVE_OFFSET_PENDING';
-    } else {
-      mode = 'NORMAL';
+  // ── Find the shifted slot that covers "now" ────────────────────────────────
+  const activeSlot = shiftedSlots.find(s => {
+    const start = new Date(s.startIso).getTime();
+    const end   = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    return nowMs >= start && nowMs < end;
+  }) ?? null;
+
+  // ── COMMUNITY_SYNCED check ─────────────────────────────────────────────────
+  // If a resync point exists and the generated ON cycle is still active, the
+  // user is in COMMUNITY_SYNCED mode regardless of Growatt.
+  if (resyncPoint) {
+    const syncedMs    = new Date(resyncPoint.syncedAtIso).getTime();
+    const durationMin = resyncPoint.generatedOnDurationMin ?? 0;
+    const cycleEndMs  = syncedMs + durationMin * 60_000;
+
+    const inWindow    = nowMs < cycleEndMs;
+    const validationWindowRemainingMin = inWindow
+      ? Math.max(0, (cycleEndMs - nowMs) / 60_000)
+      : 0;
+
+    if (inWindow || durationMin === 0) {
+      // Still within the generated ON window
+      return {
+        mode: 'COMMUNITY_SYNCED',
+        currentState: resyncPoint.syncedState,
+        currentStateStartIso: resyncPoint.syncedAtIso,
+        reconciledCycleStartIso: resyncPoint.syncedAtIso,
+        isHoldingState: true,
+        overrunMinutes: 0,
+        communityElevated: true,
+        inValidationWindow: inWindow,
+        validationWindowRemainingMin,
+        scheduledAutoTransitionIso: durationMin > 0 ? new Date(cycleEndMs).toISOString() : null,
+        statusLine: 'الحالة مُزامَنة مجتمعياً',
+      };
     }
-  } else if (offsetMin < 0) {
-    // Negative offset — check if we're past the expected end (UNCERTAIN_ZONE)
-    const currentSlot = schedule.find(s => {
-      const startMs = new Date(s.startIso).getTime();
-      const endMs = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-      return nowMs >= startMs && nowMs < endMs;
-    });
-    if (currentSlot && currentSlot.state === 'OFF') {
-      const offEndMs = currentSlot.endIso ? new Date(currentSlot.endIso).getTime() : 0;
-      if (offEndMs > 0 && nowMs >= offEndMs - 5 * 60_000) {
-        mode = 'UNCERTAIN_ZONE';
+  }
+
+  // ── POSITIVE_OFFSET_PENDING check ─────────────────────────────────────────
+  // Growatt has transitioned but the user's scheduled transition hasn't arrived yet.
+  // This happens when offsetMinutes > 0 AND the shifted slot is in the future.
+  if (offsetMinutes > 0 && activeSlot === null) {
+    // The current real Growatt state is growattCurrentState.
+    // The user's slot hasn't started yet — find the next upcoming shifted slot.
+    const nextSlot = shiftedSlots
+      .filter(s => new Date(s.startIso).getTime() > nowMs)
+      .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0] ?? null;
+
+    if (nextSlot && nextSlot.state !== growattCurrentState) {
+      // The user is holding the pre-transition state
+      const scheduledAutoTransitionIso = nextSlot.startIso;
+      return {
+        mode: 'POSITIVE_OFFSET_PENDING',
+        currentState: growattCurrentState === 'ON' ? 'OFF' : 'ON', // inverse of Growatt
+        currentStateStartIso: null,
+        reconciledCycleStartIso: null,
+        isHoldingState: true,
+        overrunMinutes: 0,
+        communityElevated: false,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso,
+        statusLine: `تغيير تلقائي مجدول في ${fmtYemenTime(scheduledAutoTransitionIso)}`,
+      };
+    }
+  }
+
+  // ── NEGATIVE OFFSET: UNCERTAIN_ZONE check ─────────────────────────────────
+  // Negative offset means the user's cycle ends before Growatt's.
+  // When the active slot has ended (according to user's shifted schedule)
+  // but Growatt hasn't transitioned yet, we're in UNCERTAIN_ZONE.
+  if (offsetMinutes < 0 && activeSlot === null) {
+    // Find the most recently ended slot
+    const recentlyEnded = shiftedSlots
+      .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
+      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
+
+    if (recentlyEnded) {
+      const slotEndMs   = new Date(recentlyEnded.endIso!).getTime();
+      const overrunMin  = Math.round((nowMs - slotEndMs) / 60_000);
+      const backedStartIso = new Date(slotEndMs + offsetMs).toISOString(); // backdated start
+
+      if (overrunMin <= GRACE_MODE_MAX_MIN) {
+        return {
+          mode: overrunMin <= 5 ? 'GRACE_MODE' : 'UNCERTAIN_ZONE',
+          currentState: recentlyEnded.state,
+          currentStateStartIso: backedStartIso,
+          reconciledCycleStartIso: backedStartIso,
+          isHoldingState: true,
+          overrunMinutes: overrunMin,
+          communityElevated: overrunMin >= PREDICTION_RANGE_MIN,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: overrunMin <= 5
+            ? `مهلة المزامنة — تجاوزنا الجدول بـ ${overrunMin} دقيقة`
+            : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
+        };
       } else {
-        mode = 'NORMAL';
-      }
-    } else {
-      mode = 'NORMAL';
-    }
-  }
-
-  // Compute verification window
-  const inValidationWindow = mode === 'COMMUNITY_SYNCED' || mode === 'POSITIVE_OFFSET_PENDING';
-  const validationWindowRemainingMin = inValidationWindow ? 20 : 0; // 20 min window
-
-  // Compute overrun (for UNCERTAIN_ZONE)
-  let overrunMinutes = 0;
-  if (mode === 'UNCERTAIN_ZONE') {
-    const currentSlot = schedule.find(s => {
-      const startMs = new Date(s.startIso).getTime();
-      const endMs = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-      return nowMs >= startMs && nowMs < endMs;
-    });
-    if (currentSlot && currentSlot.endIso) {
-      const endMs = new Date(currentSlot.endIso).getTime();
-      overrunMinutes = Math.max(0, Math.ceil((nowMs - endMs) / 60_000));
-    }
-  }
-
-  // Compute scheduled auto-transition (for POSITIVE_OFFSET_PENDING)
-  let scheduledAutoTransitionIso: string | null = null;
-  if (mode === 'POSITIVE_OFFSET_PENDING') {
-    // The scheduled transition is when the user's offset says the state should change
-    const targetState = currentState === 'ON' ? 'OFF' : 'ON';
-    for (const slot of schedule) {
-      if (slot.state !== targetState) continue;
-      const startMs = new Date(slot.startIso).getTime();
-      if (startMs > nowMs) {
-        scheduledAutoTransitionIso = slot.startIso;
-        break;
+        return {
+          mode: 'WAITING_FOR_GROWATT',
+          currentState: growattCurrentState,
+          currentStateStartIso: null,
+          reconciledCycleStartIso: null,
+          isHoldingState: false,
+          overrunMinutes: overrunMin,
+          communityElevated: true,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: `بانتظار تأكيد Growatt — تأخير ${overrunMin} دقيقة`,
+        };
       }
     }
   }
 
-  // Status line
-  const statusLines: Record<ScheduleStateMode, string> = {
-    NORMAL: 'طبيعي',
-    COMMUNITY_SYNCED: 'مزامنة مجتمعية',
-    UNCERTAIN_ZONE: 'بانتظار تأكيد',
-    WAITING_FOR_GROWATT: 'بانتظار Growatt',
-    PREDICTION_RANGE: 'نطاق التوقع نشط',
-    GRACE_MODE: 'مهلة المزامنة',
-    POSITIVE_OFFSET_PENDING: 'تغيير تلقائي مجدول',
-  };
+  // ── PREDICTION_RANGE check ─────────────────────────────────────────────────
+  // Within ±PREDICTION_RANGE_MIN of a slot boundary.
+  if (activeSlot?.endIso) {
+    const endMs = new Date(activeSlot.endIso).getTime();
+    const minutesUntilEnd = (endMs - nowMs) / 60_000;
+    if (minutesUntilEnd >= 0 && minutesUntilEnd <= PREDICTION_RANGE_MIN) {
+      return {
+        mode: 'PREDICTION_RANGE',
+        currentState: activeSlot.state,
+        currentStateStartIso: activeSlot.startIso,
+        reconciledCycleStartIso: null,
+        isHoldingState: false,
+        overrunMinutes: 0,
+        communityElevated: false,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso: null,
+        statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
+      };
+    }
+  }
 
+  // ── NORMAL ─────────────────────────────────────────────────────────────────
   return {
-    mode,
-    inValidationWindow,
-    validationWindowRemainingMin,
-    overrunMinutes,
-    transitionMode,
-    communityElevated: mode === 'UNCERTAIN_ZONE' || mode === 'WAITING_FOR_GROWATT',
-    statusLine: statusLines[mode] || mode,
-    scheduledAutoTransitionIso,
+    mode: 'NORMAL',
+    currentState: activeSlot ? activeSlot.state : growattCurrentState,
+    currentStateStartIso: activeSlot ? activeSlot.startIso : null,
+    reconciledCycleStartIso: null,
+    isHoldingState: false,
+    overrunMinutes: 0,
+    communityElevated: false,
+    inValidationWindow: false,
+    validationWindowRemainingMin: 0,
+    scheduledAutoTransitionIso: null,
+    statusLine: '',
   };
 }
 
-// ─── HOLDING STATE DETECTION ────────────────────────────────────────────────
-
-function isHoldingState(
-  mode: ScheduleStateMode,
-  currentState: 'ON' | 'OFF',
-  schedule: ShiftedScheduleSlot[],
-  nowMs: number,
-): boolean {
-  if (mode === 'POSITIVE_OFFSET_PENDING' || mode === 'UNCERTAIN_ZONE' ||
-      mode === 'WAITING_FOR_GROWATT' || mode === 'GRACE_MODE') {
-    return true;
-  }
-  // Check if we're past the end of the current slot but haven't transitioned
-  const currentSlot = schedule.find(s => {
-    const startMs = new Date(s.startIso).getTime();
-    const endMs = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-    return nowMs >= startMs && nowMs < endMs;
-  });
-  if (!currentSlot && schedule.length > 0) {
-    // Between slots — might be holding
-    return true;
-  }
-  return false;
-}
-
-// ─── DURATION LABELS ────────────────────────────────────────────────────────
-
-function computeDurationLabels(
-  schedule: ShiftedScheduleSlot[],
-  apppe?: any,
-): { onLabel: string | null; offLabel: string | null } {
-  // Try to get from APPPE data first
-  if (apppe?.expectedOnDurationMin) {
-    return {
-      onLabel: arabicDurationRange(apppe.expectedOnDurationMin),
-      offLabel: apppe?.expectedOffDurationMin ? arabicDurationRange(apppe.expectedOffDurationMin) : null,
-    };
-  }
-
-  // Compute from schedule averages
-  const onSlots = schedule.filter(s => s.state === 'ON' && s.endIso);
-  const offSlots = schedule.filter(s => s.state === 'OFF' && s.endIso);
-
-  const avgOn = onSlots.length > 0
-    ? onSlots.reduce((sum, s) => {
-        const ms = new Date(s.endIso!).getTime() - new Date(s.startIso).getTime();
-        return sum + ms / 60_000;
-      }, 0) / onSlots.length
-    : 0;
-
-  const avgOff = offSlots.length > 0
-    ? offSlots.reduce((sum, s) => {
-        const ms = new Date(s.endIso!).getTime() - new Date(s.startIso).getTime();
-        return sum + ms / 60_000;
-      }, 0) / offSlots.length
-    : 0;
-
-  return {
-    onLabel: avgOn > 0 ? arabicDurationRange(Math.round(avgOn)) : null,
-    offLabel: avgOff > 0 ? arabicDurationRange(Math.round(avgOff)) : null,
-  };
-}
-
-// ─── MAIN ENGINE FUNCTION ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN ENGINE FUNCTION
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * applyOffsetToPrediction
  *
- * Takes a raw prediction from Supabase, applies the user's offset and
- * community resync, builds the shifted schedule, computes the ATC state,
- * and returns a complete UserPrediction.
+ * Takes a raw APPPE prediction + user context and returns a fully-resolved
+ * UserPrediction with shifted schedule, ATC mode, community sync metadata,
+ * and optional accuracy event emission.
  *
- * V2.1 FINAL:
- *   - Offset applies to ALL states (ON and OFF) — push for positive, pull for negative
- *   - Generated ON REPLACES the corresponding Growatt ON (not just inserted)
- *   - Generated ON is NOT shifted — keeps actual report time
- *   - Offset is FINAL at report time — no recomputation
- *   - POSITIVE → Verification Window: true
- *   - NEGATIVE → UNCERTAIN_ZONE: true
- *
- * @param prediction                 Raw prediction from usePredictions/Supabase
- * @param offsetMinutes              User's personal offset in minutes
- * @param resyncPoint                Active community resync point, or null
- * @param communitySyncMeta          Display data for community sync, or null
- * @param transitionMode             'AUTO' or 'MANUAL'
- * @param heldCycleStartIso          Anchor start (from useStateAnchor, instrumentation)
- * @param frozenCommunityOffsetMinutes  Frozen community offset (Rule Q2-A)
- * @param onOffsetCalculated         Callback when a fresh community offset is computed
- * @param nowMs                      Current time in milliseconds
- * @param onAccuracyEvent            Callback for accuracy events
- * @returns Complete UserPrediction
+ * @param prediction             Raw APPPE prediction from Supabase
+ * @param offsetMinutes          User's personal DSD offset in minutes
+ * @param resyncPoint            Active community resync point, or null
+ * @param communitySyncMeta      CommunitySyncMeta display object, or null
+ * @param transitionMode         'AUTO' | 'MANUAL'
+ * @param anchorStartIso         External state-anchor ISO (from useStateAnchor)
+ * @param frozenCommunityOffset  Frozen community offset (Rule Q2-A), or null
+ * @param onOffsetCalculated     Callback fired once when offset is first computed
+ * @param nowMs                  Current wall-clock time in milliseconds
+ * @param onAccuracyEvent        Optional callback for accuracy log emission
  */
 export function applyOffsetToPrediction(
-  prediction: any,
+  prediction: Prediction,
   offsetMinutes: number,
   resyncPoint: ResyncPoint | null,
-  communitySyncMeta: CommunitySyncMeta | null = null,
+  communitySyncMeta: CommunitySyncMeta | null,
   transitionMode: TransitionMode = 'AUTO',
-  heldCycleStartIso: string | null = null,
-  frozenCommunityOffsetMinutes: number | null = null,
+  anchorStartIso: string | null = null,
+  frozenCommunityOffset: number | null = null,
   onOffsetCalculated?: (
-    offset: number,
+    computedOffsetMinutes: number,
     meta: { sign: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'; referenceIso: string | null; referenceKind: string | null },
   ) => void,
   nowMs: number = Date.now(),
   onAccuracyEvent?: (event: AccuracyLogEvent) => void,
 ): UserPrediction {
-  // ── 1. Determine the effective offset ──────────────────────────────────────
-  // Use frozen community offset if available, otherwise the user's personal offset
-  let effectiveOffset = frozenCommunityOffsetMinutes ?? offsetMinutes;
+  const rawSlots: ScheduleSlot[] = prediction.daySchedule ?? [];
+  const offsetMs = offsetMinutes * 60_000;
 
-  // If we have a resyncPoint with V2.1 offset data, use it
-  if (resyncPoint?.offsetValue !== undefined && resyncPoint.offsetValue !== null) {
-    const v21Value = typeof resyncPoint.offsetValue === 'string'
-      ? 0 // PENDING → 0 placeholder (shouldn't happen in V2.1 Final)
-      : resyncPoint.offsetValue;
-    effectiveOffset = v21Value;
+  // ── 1. Build shifted schedule ──────────────────────────────────────────────
+  const shiftedSlots: ShiftedScheduleSlot[] = rawSlots.map(raw =>
+    buildShiftedSlot(raw, offsetMs, nowMs),
+  );
 
-    // Fire the onOffsetCalculated callback if this is a fresh community offset
-    if (frozenCommunityOffsetMinutes === null && onOffsetCalculated) {
-      const sign = v21Value > 0 ? 'POSITIVE' : v21Value < 0 ? 'NEGATIVE' : 'NEUTRAL';
-      onOffsetCalculated(v21Value, {
+  // ── 2. Run ATC state machine ───────────────────────────────────────────────
+  const atcResult = computeATCMode(
+    shiftedSlots,
+    prediction.currentState,
+    offsetMinutes,
+    resyncPoint,
+    transitionMode,
+    frozenCommunityOffset,
+    nowMs,
+  );
+
+  // ── 3. Inject synthetic lingering slot for POSITIVE_OFFSET_PENDING ─────────
+  // This ensures the schedule screen can find an "active" slot at index 0.
+  let finalSlots = [...shiftedSlots];
+  if (atcResult.mode === 'POSITIVE_OFFSET_PENDING' && atcResult.scheduledAutoTransitionIso) {
+    const heldState: 'ON' | 'OFF' = atcResult.currentState;
+    const fmt = (iso: string) => fmtYemenTime(iso);
+    const nowIso = new Date(nowMs).toISOString();
+    const syntheticSlot: ShiftedScheduleSlot = {
+      state: heldState,
+      startIso: nowIso,
+      endIso: atcResult.scheduledAutoTransitionIso,
+      startFormatted: fmt(nowIso),
+      endFormatted: fmt(atcResult.scheduledAutoTransitionIso),
+      shiftedStartFormatted: fmt(nowIso),
+      shiftedEndFormatted: fmt(atcResult.scheduledAutoTransitionIso),
+      durationLabel: durationLabelFromMin(
+        Math.round((new Date(atcResult.scheduledAutoTransitionIso).getTime() - nowMs) / 60_000),
+      ),
+      zone: getZoneFromIso(nowIso),
+      isEstimated: false,
+    };
+    finalSlots = [syntheticSlot, ...shiftedSlots];
+  }
+
+  // ── 4. Inject synthetic slot for COMMUNITY_SYNCED ──────────────────────────
+  if (atcResult.mode === 'COMMUNITY_SYNCED' && resyncPoint) {
+    const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
+    const durationMin = resyncPoint.generatedOnDurationMin ?? 60;
+    const cycleEndMs = syncedMs + durationMin * 60_000;
+    const cycleEndIso = new Date(cycleEndMs).toISOString();
+    const fmt = (iso: string) => fmtYemenTime(iso);
+    const syntheticSlot: ShiftedScheduleSlot = {
+      state: resyncPoint.syncedState,
+      startIso: resyncPoint.syncedAtIso,
+      endIso: cycleEndIso,
+      startFormatted: fmt(resyncPoint.syncedAtIso),
+      endFormatted: fmt(cycleEndIso),
+      shiftedStartFormatted: fmt(resyncPoint.syncedAtIso),
+      shiftedEndFormatted: fmt(cycleEndIso),
+      durationLabel: durationLabelFromMin(durationMin),
+      zone: getZoneFromIso(resyncPoint.syncedAtIso),
+      isEstimated: false,
+      isResynced: true,
+    };
+    // Only prepend if not already there (avoid duplicates on repeated calls)
+    const alreadyFirst =
+      finalSlots.length > 0 &&
+      Math.abs(new Date(finalSlots[0].startIso).getTime() - syncedMs) < 60_000;
+    if (!alreadyFirst) {
+      finalSlots = [syntheticSlot, ...shiftedSlots];
+    }
+  }
+
+  // ── 5. Compute community offset (Rule Q2-A) ───────────────────────────────
+  if (resyncPoint && frozenCommunityOffset === null && onOffsetCalculated) {
+    // Determine the offset from the resync point against the schedule
+    const syncMs = new Date(resyncPoint.syncedAtIso).getTime();
+    // Find the reference slot — the nearest ON slot in the raw schedule
+    const referenceSlot = rawSlots.find(s => {
+      const startMs = new Date(hmToIso(s.start, nowMs)).getTime();
+      const endMs   = s.end ? new Date(hmToIso(s.end, nowMs)).getTime() : Infinity;
+      return s.state === resyncPoint.syncedState && syncMs >= startMs && syncMs < endMs;
+    }) ?? rawSlots.find(s => s.state === resyncPoint.syncedState) ?? null;
+
+    if (referenceSlot) {
+      const refStartMs = new Date(hmToIso(referenceSlot.start, nowMs)).getTime();
+      const computedOffset = Math.round((syncMs - refStartMs) / 60_000);
+      const sign: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' =
+        computedOffset > 0 ? 'POSITIVE' : computedOffset < 0 ? 'NEGATIVE' : 'NEUTRAL';
+      onOffsetCalculated(computedOffset, {
         sign,
-        referenceIso: resyncPoint.timelineAlignment ?? resyncPoint.syncedAtIso,
-        referenceKind: resyncPoint.generatedOnReferenceKind ?? null,
+        referenceIso: hmToIso(referenceSlot.start, nowMs),
+        referenceKind: 'completed',
       });
     }
   }
 
-  // ── 2. Build the raw schedule from the prediction ──────────────────────────
-  const rawSchedule: RawSlot[] = prediction?.daySchedule ||
-    prediction?.schedule ||
-    prediction?.slots ||
-    [];
-  let schedule: ShiftedScheduleSlot[] = rawSchedule.map((s: RawSlot, i: number) => normalizeSlot(s, i));
+  // ── 6. Build next-transition from shifted schedule ─────────────────────────
+  const currentStateForNext = atcResult.currentState;
+  const targetState: 'ON' | 'OFF' = currentStateForNext === 'ON' ? 'OFF' : 'ON';
+  const nextSlotForTransition = finalSlots.find(s =>
+    s.state === targetState && new Date(s.startIso).getTime() > nowMs,
+  ) ?? null;
 
-  // If no schedule from prediction, try to build from prediction fields
-  if (schedule.length === 0 && prediction?.nextTransition) {
-    // Build a minimal schedule from the next transition
-    const nt = prediction.nextTransition;
-    const nowIso = new Date(nowMs).toISOString();
-    schedule = [
-      {
-        state: nt.type === 'UTILITY_ON' ? 'OFF' : 'ON',
-        startIso: nowIso,
-        endIso: nt.rangeStartIso,
-        startFormatted: fmtYemenTime(nowIso),
-        endFormatted: fmtYemenTime(nt.rangeStartIso),
-        shiftedStartFormatted: fmtYemenTime(nowIso),
-        shiftedEndFormatted: fmtYemenTime(nt.rangeStartIso),
-        durationLabel: '—',
-        zone: 'NIGHT',
-        isEstimated: true,
-      },
-      {
-        state: nt.type === 'UTILITY_ON' ? 'ON' : 'OFF',
-        startIso: nt.rangeStartIso,
-        endIso: nt.rangeEndIso,
-        startFormatted: fmtYemenTime(nt.rangeStartIso),
-        endFormatted: fmtYemenTime(nt.rangeEndIso),
-        shiftedStartFormatted: fmtYemenTime(nt.rangeStartIso),
-        shiftedEndFormatted: fmtYemenTime(nt.rangeEndIso),
-        durationLabel: '—',
-        zone: 'NIGHT',
-        isEstimated: true,
-      },
-    ];
+  let nextTransition: UserPrediction['nextTransition'] = null;
+
+  if (nextSlotForTransition) {
+    const rangeStartMs = new Date(nextSlotForTransition.startIso).getTime();
+    const minFromNowMin = Math.max(0, (rangeStartMs - nowMs) / 60_000);
+    // Use original prediction's range width if available, else ±15 min
+    const originalNt = prediction.nextTransition;
+    const rangeWidthMs = originalNt
+      ? (originalNt.maxFromNowMin - originalNt.minFromNowMin) * 60_000
+      : 30 * 60_000;
+    const rangeEndMs = rangeStartMs + rangeWidthMs;
+
+    nextTransition = {
+      type: targetState === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
+      rangeStartIso: nextSlotForTransition.startIso,
+      rangeEndIso: new Date(rangeEndMs).toISOString(),
+      rangeLabel: nextSlotForTransition.shiftedStartFormatted ?? fmtYemenTime(nextSlotForTransition.startIso),
+      minFromNowMin,
+      maxFromNowMin: minFromNowMin + rangeWidthMs / 60_000,
+      waitLabel: durationLabelFromMin(Math.round(minFromNowMin)),
+      inRangeWindow: minFromNowMin <= 0,
+    };
+  } else if (prediction.nextTransition) {
+    // Fall back to raw prediction's nextTransition if we can't derive one
+    nextTransition = prediction.nextTransition;
   }
 
-  // ── 3. Apply the offset to ALL slots ───────────────────────────────────────
-  // V2.1 FINAL: Offset is applied to ALL states (ON and OFF).
-  // Positive → push forward, Negative → pull backward.
-  // The Generated ON (if resynced) is NOT shifted — it keeps its actual time.
-  schedule = applyOffsetToAllSlots(schedule, effectiveOffset, resyncPoint);
-
-  // ── 4. Determine current state ─────────────────────────────────────────────
-  const { state: currentState, startIso: currentStateStartIso } =
-    deriveCurrentState(schedule, nowMs, resyncPoint);
-
-  const isResynced = !!resyncPoint;
-
-  // ── 5. Compute ATC state ───────────────────────────────────────────────────
-  const atc = computeATCState(
-    effectiveOffset,
-    isResynced,
+  // ── 7. Assemble UserPrediction ─────────────────────────────────────────────
+  const atcInfo: ATCInfo = {
+    mode: atcResult.mode,
     transitionMode,
-    schedule,
-    nowMs,
-    currentState,
-  );
-
-  // ── 6. Determine holding state ─────────────────────────────────────────────
-  const holding = isHoldingState(atc.mode, currentState, schedule, nowMs);
-
-  // ── 7. Derive next transition ──────────────────────────────────────────────
-  const nextTransition = deriveNextTransition(
-    schedule,
-    currentState,
-    nowMs,
-    holding && atc.mode === 'POSITIVE_OFFSET_PENDING',
-    atc.scheduledAutoTransitionIso,
-  );
-
-  // ── 8. Compute duration labels ─────────────────────────────────────────────
-  const apppe = prediction?.appppe || prediction?.apppe;
-  const { onLabel, offLabel } = computeDurationLabels(schedule, apppe);
-
-  // ── 9. Build reasoning ─────────────────────────────────────────────────────
-  const reasoning: string[] = [];
-  if (isResynced && resyncPoint) {
-    reasoning.push(`تمت مزامنة الجدول عبر بلاغ مجتمعي من ${resyncPoint.reporterName ?? 'مجهول'}`);
-  }
-  if (effectiveOffset !== 0) {
-    reasoning.push(`الفارق الزمني: ${effectiveOffset > 0 ? '+' : ''}${effectiveOffset} دقيقة`);
-  }
-  if (atc.mode === 'UNCERTAIN_ZONE') {
-    reasoning.push('النظام في وضع عدم اليقين — بانتظار تأكيد التحوّل');
-  }
-  if (atc.mode === 'POSITIVE_OFFSET_PENDING') {
-    reasoning.push('تحويل تلقائي مجدول — سيتم التحديث في الوقت المحدد');
-  }
-
-  // ── 10. Determine Generated ON info ────────────────────────────────────────
-  const isGeneratedOnCurrent = isResynced &&
-    resyncPoint?.syncedState === 'ON' &&
-    resyncPoint?.generatedOnStartIso !== undefined;
-  const generatedOnInfo = isGeneratedOnCurrent ? {
-    startIso: resyncPoint!.generatedOnStartIso!,
-    durationMin: resyncPoint!.generatedOnDurationMin ?? 0,
-    referenceIso: resyncPoint!.generatedOnReferenceIso ?? resyncPoint!.syncedAtIso,
-    referenceKind: (resyncPoint!.generatedOnReferenceKind ?? 'completed') as 'completed' | 'active',
-    inheritsReferenceLifecycle: false,
-  } : null;
-
-  // ── 11. Build the final UserPrediction ─────────────────────────────────────
-  const result: UserPrediction = {
-    daySchedule: schedule,
-    currentState,
-    currentStateStartIso,
-    nextTransition,
-    isHoldingState: holding,
-    isResynced,
-    resyncedAtIso: resyncPoint?.syncedAtIso ?? null,
-    computedAt: new Date(nowMs).toISOString(),
-    confidence: prediction?.confidence ?? 50,
-    stabilityScore: prediction?.stabilityScore ?? 50,
-    stabilityLabel: prediction?.stabilityLabel ?? 'Stable',
-    learningMode: prediction?.learningMode ?? 'estimated',
-    isUnstable: prediction?.isUnstable ?? false,
-    communitySyncMeta,
-    offsetMinutes: effectiveOffset,
-    crisisMode: prediction?.crisisMode ?? (prediction?.appppe?.crisisMode ?? null),
-    crisisReason: prediction?.crisisReason ?? (prediction?.appppe?.crisisReason ?? null),
-    expectedOnDurationLabel: onLabel,
-    expectedOffDurationLabel: offLabel,
-    atc,
-    reasoning,
-    // V2.1 fields:
-    offsetState: resyncPoint?.offsetState,
-    offsetValue: resyncPoint?.offsetValue,
-    timelineAlignment: resyncPoint?.timelineAlignment,
-    generatedOnInfo,
-    pendingNegativeResolutionIso: null, // V2.1 Final: never produced
-    isPendingNegative: false, // V2.1 Final: never produced
-    isGeneratedOnCurrent,
+    statusLine: atcResult.statusLine,
+    overrunMinutes: atcResult.overrunMinutes,
+    communityElevated: atcResult.communityElevated,
+    inValidationWindow: atcResult.inValidationWindow,
+    validationWindowRemainingMin: atcResult.validationWindowRemainingMin,
+    scheduledAutoTransitionIso: atcResult.scheduledAutoTransitionIso,
   };
 
-  return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ADDITIONAL ENGINE EXPORTS — used by the Admin Dashboard's TMMSDebugSimulator
-// ═══════════════════════════════════════════════════════════════════════════
-// The admin dashboard (app/(admin)/index.tsx or a TMMSDebugSimulator component)
-// imports these functions directly from the engine. They must exist or the app
-// crashes with "TypeError: undefined is not a function".
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Extend the schedule to cover 48 hours (2 days) by repeating the pattern.
- * The admin dashboard uses this to show a longer timeline.
- */
-export function extendScheduleTo48h(
-  schedule: ShiftedScheduleSlot[],
-): ShiftedScheduleSlot[] {
-  if (!schedule || schedule.length === 0) return schedule;
-  const extended: ShiftedScheduleSlot[] = [...schedule];
-  for (const slot of schedule) {
-    const startMs = new Date(slot.startIso).getTime();
-    const endMs = slot.endIso ? new Date(slot.endIso).getTime() : startMs + 120 * 60_000;
-    const durationMs = endMs - startMs;
-    // Add a copy shifted by 24h
-    extended.push({
-      ...slot,
-      startIso: new Date(startMs + 24 * 60 * 60_000).toISOString(),
-      endIso: new Date(endMs + 24 * 60 * 60_000).toISOString(),
-      startFormatted: fmtYemenTime(new Date(startMs + 24 * 60 * 60_000).toISOString()),
-      endFormatted: fmtYemenTime(new Date(endMs + 24 * 60 * 60_000).toISOString()),
-      shiftedStartFormatted: fmtYemenTime(new Date(startMs + 24 * 60 * 60_000).toISOString()),
-      shiftedEndFormatted: fmtYemenTime(new Date(endMs + 24 * 60 * 60_000).toISOString()),
-    });
-    void durationMs; // suppress unused
-  }
-  return extended;
-}
-
-/**
- * Apply offset to individual schedule slots.
- * Used by the admin dashboard to run per-offset simulations.
- */
-export function applyOffsetToSlots(
-  schedule: ShiftedScheduleSlot[],
-  offsetMinutes: number,
-): ShiftedScheduleSlot[] {
-  return applyOffsetToAllSlots(schedule, offsetMinutes, null);
-}
-
-/**
- * Compute the community offset from a resync point.
- * V2.1 Final: the offset is already stored on the resync point — just return it.
- */
-export function computeCommunityOffset(
-  resyncPoint: ResyncPoint | null,
-  frozenOffset: number | null,
-  fallbackOffset: number,
-): number {
-  if (frozenOffset !== null) return frozenOffset;
-  if (resyncPoint?.offsetValue !== undefined && resyncPoint.offsetValue !== null) {
-    return typeof resyncPoint.offsetValue === 'string' ? 0 : resyncPoint.offsetValue;
-  }
-  return fallbackOffset;
-}
-
-/**
- * Compute the community transition point from a resync.
- * Returns the ISO timestamp when the community-synced state started.
- */
-export function computeCommunityTransition(
-  resyncPoint: ResyncPoint | null,
-): { transitionIso: string | null; state: 'ON' | 'OFF' | null } {
-  if (!resyncPoint) return { transitionIso: null, state: null };
   return {
-    transitionIso: resyncPoint.syncedAtIso,
-    state: resyncPoint.syncedState,
-  };
-}
-
-/**
- * Compute the ATC state for a given offset and schedule.
- * Re-exported for the admin dashboard.
- */
-export function computeATCStateExport(
-  offsetMin: number,
-  isResynced: boolean,
-  transitionMode: TransitionMode,
-  schedule: ShiftedScheduleSlot[],
-  nowMs: number,
-  currentState: 'ON' | 'OFF',
-): ATCState {
-  return computeATCState(offsetMin, isResynced, transitionMode, schedule, nowMs, currentState);
-}
-
-/**
- * Derive the current state from the ATC perspective.
- * Used by the admin dashboard to show the current ATC state.
- */
-export function deriveCurrentStateATC(
-  schedule: ShiftedScheduleSlot[],
-  nowMs: number,
-  resyncPoint: ResyncPoint | null,
-): { state: 'ON' | 'OFF'; startIso: string | null } {
-  return deriveCurrentState(schedule, nowMs, resyncPoint);
-}
-
-/**
- * Derive the next transition from the schedule.
- * Re-exported for the admin dashboard.
- */
-export function deriveNextTransitionExport(
-  schedule: ShiftedScheduleSlot[],
-  currentState: 'ON' | 'OFF',
-  nowMs: number,
-  isHolding: boolean,
-  scheduledAutoTransitionIso: string | null,
-): NextTransition | null {
-  return deriveNextTransition(schedule, currentState, nowMs, isHolding, scheduledAutoTransitionIso);
-}
-
-/**
- * Compute the reconciled cycle start.
- * Used for lost-time reconciliation when the Growatt transition differs from
- * the predicted one. V2.1 Final: the offset is final, so reconciliation
- * simply applies the offset to the Growatt transition time.
- */
-export function computeReconciledCycleStart(
-  growattTransitionIso: string,
-  offsetMinutes: number,
-): string {
-  const growattMs = new Date(growattTransitionIso).getTime();
-  const reconciledMs = growattMs + offsetMinutes * 60_000;
-  return new Date(reconciledMs).toISOString();
-}
-
-/**
- * Compute an accuracy log event when an ATC exit occurs.
- * V2.1 Final: the offset is final, so the accuracy is based on the difference
- * between the predicted transition and the actual Growatt transition.
- */
-export function computeAccuracyLogEvent(
-  predictedTransitionIso: string,
-  actualTransitionIso: string,
-  targetState: 'UTILITY_ON' | 'UTILITY_OFF',
-  offsetMinutes: number,
-  exitMode: string,
-): AccuracyLogEvent {
-  const predictedMs = new Date(predictedTransitionIso).getTime();
-  const actualMs = new Date(actualTransitionIso).getTime();
-  const errorMin = Math.round((actualMs - predictedMs) / 60_000);
-  const accuracyScore = Math.max(0, Math.min(100, 100 - Math.abs(errorMin)));
-
-  return {
-    predictedTransitionIso,
-    actualTransitionIso,
-    targetState,
+    ...prediction,
+    // V2 engine additions
+    atc: atcInfo,
+    communitySyncMeta: communitySyncMeta,
+    daySchedule: finalSlots,
+    currentState: atcResult.currentState,
+    currentStateStartIso: atcResult.currentStateStartIso,
+    reconciledCycleStartIso: atcResult.reconciledCycleStartIso,
+    isHoldingState: atcResult.isHoldingState,
+    isResynced: !!resyncPoint,
+    resyncedAtIso: resyncPoint?.syncedAtIso ?? undefined,
     offsetMinutes,
-    exitMode,
-    errorMinutes: errorMin,
-    accuracyScore,
+    nextTransition,
+    // Crisis passthrough
+    crisisMode: prediction.apppe?.crisisActive ?? prediction.crisisMode,
+    crisisReason: prediction.apppe?.crisisReason ?? prediction.crisisReason,
   };
 }
-
-// ─── Type re-exports for backwards compat with admin dashboard ──────────────
-// The admin dashboard may import these types directly from the engine.
-export type { ScheduleStateMode as ATCMode };
-
-// ═══════════════════════════════════════════════════════════════════════════
-// SAFE DEFAULT EXPORT — prevents white-page crash if the admin dashboard
-// imports a function that doesn't exist on the engine object.
-// ═══════════════════════════════════════════════════════════════════════════
-// The admin dashboard's TMMSDebugSimulator does `import * as engine from
-// './tmmsEngine'` then calls `engine.someFunction()`. If any function is
-// missing, it crashes with "TypeError: undefined is not a function" and the
-// entire admin Stack goes white. This default export object includes every
-// function plus safe no-op fallbacks for any that might still be missing.
-// ═══════════════════════════════════════════════════════════════════════════
-const _engine = {
-  // Core function
-  applyOffsetToPrediction,
-
-  // Admin dashboard functions
-  extendScheduleTo48h,
-  applyOffsetToSlots,
-  computeCommunityOffset,
-  computeCommunityTransition,
-  computeATCState: computeATCStateExport,
-  computeATCStateExport,
-  deriveCurrentStateATC,
-  deriveNextTransition: deriveNextTransitionExport,
-  deriveNextTransitionExport,
-  computeReconciledCycleStart,
-  computeAccuracyLogEvent,
-
-  // Safe fallbacks for any other functions the admin dashboard might import.
-  // These return sensible defaults so the dashboard renders without crashing.
-  buildScheduleFromPrediction: (prediction: any): ShiftedScheduleSlot[] => {
-    const raw = prediction?.daySchedule || prediction?.schedule || prediction?.slots || [];
-    return raw.map((s: RawSlot, i: number) => normalizeSlot(s, i));
-  },
-  computeResyncedSlots: (
-    schedule: ShiftedScheduleSlot[],
-    resyncPoint: ResyncPoint | null,
-    offsetMin: number,
-  ): ShiftedScheduleSlot[] => {
-    return applyOffsetToAllSlots(schedule, offsetMin, resyncPoint);
-  },
-  computeOffsetSign: (offsetMin: number): 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' => {
-    if (offsetMin > 0) return 'POSITIVE';
-    if (offsetMin < 0) return 'NEGATIVE';
-    return 'NEUTRAL';
-  },
-  formatTime: fmtYemenTime,
-  formatDuration: fmtDurationLabel,
-  arabicDurationRange,
-};
-
-export default _engine;
-
