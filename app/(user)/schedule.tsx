@@ -5,7 +5,6 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
@@ -35,7 +34,7 @@ function parseFormattedTime(label: string): number | null {
 // ─────────────────────────────────────────────────────────────────────────────
 // Schedule Block
 // ─────────────────────────────────────────────────────────────────────────────
-function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted, stableEndFormatted, isPendingNegative }: {
+function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted, stableEndFormatted }: {
   slot: ShiftedScheduleSlot;
   index: number;
   resyncEvents: any[];
@@ -44,24 +43,12 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
   isHolding?: boolean;
   stableStartFormatted?: string;
   stableEndFormatted?: string;
-  // V2.1: passed down so future ON slots can be marked "Estimated (Pending Offset)"
-  // when the user's Offset State is PendingNegative (PDF §"Pending Negative").
-  isPendingNegative?: boolean;
 }) {
   const isOn = slot.state === 'ON';
   const color = isOn ? T.success : T.danger;
   const startTime = stableStartFormatted ?? slot.shiftedStartFormatted ?? slot.startFormatted;
   const endTime = stableEndFormatted ?? slot.shiftedEndFormatted ?? slot.endFormatted;
   const zoneAr = (AR as any)[slot.zone] ?? slot.zone;
-
-  // V2.1: read the slot-level V2.1 flags (set by useUserPredictions).
-  // - isGeneratedOn: this slot is a Generated ON event (a permanent timeline
-  //   event created from a community ON report). Renders a green "⚡ مُولّدة" badge.
-  // - isEstimatedPendingOffset: this is a FUTURE ON slot whose precise start
-  //   time is unknown because the user's offset is PendingNegative.
-  //   Renders an amber "تقديري معلَّق" badge.
-  const isGeneratedOn = (slot as any).isGeneratedOn === true;
-  const isEstimatedPendingOffset = (slot as any).isEstimatedPendingOffset === true;
 
   const slotStartMs = startTime ? parseFormattedTime(startTime) : null;
   const slotEndMs = endTime ? parseFormattedTime(endTime) : null;
@@ -109,24 +96,6 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
           {slot.isEstimated && (
             <View style={sbStyles.estBadge}><Text style={sbStyles.estText}>{AR.estBadge}</Text></View>
           )}
-          {/* V2.1: Generated ON badge — permanently marks slots that were
-              created as a Generated ON event. PDF §"GENERATED ON IS A REAL
-              TIMELINE EVENT": "Never delete Generated ON later. Never replace
-              it. Never hide it." The badge makes this visible in the schedule. */}
-          {isGeneratedOn && (
-            <View style={sbStyles.genOnBadge}>
-              <Text style={sbStyles.genOnBadgeText}>⚡ مُولّدة</Text>
-            </View>
-          )}
-          {/* V2.1: Estimated (Pending Offset) badge — marks future ON slots
-              whose precise start time is unknown because the user's offset
-              is PendingNegative. PDF §"Pending Negative": "Future ON
-              predictions must be displayed as: Estimated (Pending Offset)". */}
-          {isEstimatedPendingOffset && (
-            <View style={sbStyles.pendingOffsetBadge}>
-              <Text style={sbStyles.pendingOffsetBadgeText}>تقديري معلَّق</Text>
-            </View>
-          )}
           {isActive && (
             <View style={[sbStyles.nowBadge, { backgroundColor: color + '22', borderColor: color + '88' }]}>
               <Text style={[sbStyles.nowBadgeText, { color }]}>{AR.nowBadge}</Text>
@@ -134,17 +103,6 @@ function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding
           )}
           <Text style={[sbStyles.state, { color }]}>{isOn ? AR.gridOn : AR.gridOff}</Text>
         </View>
-
-        {/* V2.1: Generated ON info panel — only for Generated ON slots.
-            Shows that this slot is a permanent timeline event created from
-            a community ON report. Mirrors the HistoryCard's genOnRow. */}
-        {isGeneratedOn && (
-          <View style={sbStyles.genOnInfo}>
-            <Text style={sbStyles.genOnInfoText}>
-              ⚡ حدث تشغيل مُولّدة — دائم في الخطّ الزمني، لا يُحذف ولا يُستبدل.
-            </Text>
-          </View>
-        )}
 
         <View style={sbStyles.timeRow}>
           {!endTime && <Text style={sbStyles.ongoing}>{AR.ongoing}</Text>}
@@ -352,38 +310,16 @@ const ehStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DSD Chip — V2.1 upgraded
+// DSD Chip
 // ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.1: the DSD chip now also surfaces the Offset STATE (Positive /
-// Negative / Neutral / PendingNegative), not just the numeric value. When
-// the state is PendingNegative, the numeric value displays as "معلَّق"
-// (pending) and the pulse animation runs — matching the visual language of
-// the existing pendingDSD indicator.
-function DSDChip({ offsetMinutes, isPending, offsetState }: {
-  offsetMinutes: number;
-  isPending: boolean;
-  offsetState?: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE' | null;
-}) {
-  // V2.1: derive display color from the Offset State when available, falling
-  // back to the legacy sign-based color logic for backwards compatibility.
-  const stateColor = offsetState === 'PENDING_NEGATIVE'
-    ? T.warning
-    : offsetState === 'POSITIVE'
-      ? T.success
-      : offsetState === 'NEGATIVE'
-        ? T.warning
-        : offsetState === 'NEUTRAL'
-          ? T.textMuted
-          : (offsetMinutes < 0 ? '#f97316' : offsetMinutes > 0 ? '#22c55e' : '#94a3b8');
-
-  // V2.1: when PendingNegative, show "معلَّق" instead of a number.
-  const label = (offsetState === 'PENDING_NEGATIVE' || isPending)
-    ? 'معلَّق'
-    : `${offsetMinutes > 0 ? '+' : ''}${offsetMinutes}د`;
+function DSDChip({ offsetMinutes, isPending }: { offsetMinutes: number; isPending: boolean }) {
+  const isNeg = offsetMinutes < 0;
+  const color = isNeg ? '#f97316' : offsetMinutes > 0 ? '#22c55e' : '#94a3b8';
+  const label = `${offsetMinutes > 0 ? '+' : ''}${offsetMinutes}د`;
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
   useEffect(() => {
-    if (!isPending && offsetState !== 'PENDING_NEGATIVE') { pulseAnim.setValue(1); return; }
+    if (!isPending) { pulseAnim.setValue(1); return; }
     const loop = Animated.loop(
       Animated.sequence([
         Animated.timing(pulseAnim, { toValue: 0.25, duration: 700, useNativeDriver: true }),
@@ -392,26 +328,15 @@ function DSDChip({ offsetMinutes, isPending, offsetState }: {
     );
     loop.start();
     return () => loop.stop();
-  }, [isPending, offsetState]);
-
-  // V2.1: short state label under the value
-  const stateLabel = offsetState === 'POSITIVE'
-    ? 'إيجابي'
-    : offsetState === 'NEGATIVE'
-      ? 'سلبي'
-      : offsetState === 'NEUTRAL'
-        ? 'محايد'
-        : offsetState === 'PENDING_NEGATIVE'
-          ? 'معلَّق'
-          : 'الفارق';
+  }, [isPending]);
 
   return (
-    <View style={[dsdStyles.wrap, { borderColor: stateColor + '44', backgroundColor: stateColor + '12' }]}>
-      {(isPending || offsetState === 'PENDING_NEGATIVE') && (
-        <Animated.View style={[dsdStyles.pendingDot, { opacity: pulseAnim, backgroundColor: stateColor }]} />
+    <View style={[dsdStyles.wrap, { borderColor: color + '44', backgroundColor: color + '12' }]}>
+      {isPending && (
+        <Animated.View style={[dsdStyles.pendingDot, { opacity: pulseAnim, backgroundColor: color }]} />
       )}
-      <Text style={[dsdStyles.value, { color: stateColor }]}>{label}</Text>
-      <Text style={dsdStyles.label}>{stateLabel}</Text>
+      <Text style={[dsdStyles.value, { color }]}>{label}</Text>
+      <Text style={dsdStyles.label}>الفارق</Text>
     </View>
   );
 }
@@ -430,8 +355,7 @@ export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
-  const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode, anchor?.startIso ?? null);
+  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint);
   const { history: resyncHistory } = useResyncNotifications();
   const { anchor } = useStateAnchor();
 
@@ -532,11 +456,7 @@ export default function ScheduleScreen() {
           <Text style={styles.infoLabel}>الاستقرار</Text>
         </View>
         <View style={styles.infoDivider} />
-        <DSDChip
-          offsetMinutes={offset?.offset_minutes ?? 0}
-          isPending={!!pendingDSD}
-          offsetState={(userPrediction as any)?.offsetState ?? null}
-        />
+        <DSDChip offsetMinutes={offset?.offset_minutes ?? 0} isPending={!!pendingDSD} />
       </View>
 
       {/* Legend */}
@@ -549,20 +469,6 @@ export default function ScheduleScreen() {
             </View>
           </View>
         )}
-        {/* V2.1: Generated ON legend entry */}
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>مُولّدة</Text>
-          <View style={[styles.legendBadge, { borderColor: T.success + '55', backgroundColor: '#052e16' }]}>
-            <Text style={[styles.legendBadgeText, { color: T.success, fontStyle: 'normal', fontWeight: '700' }]}>⚡</Text>
-          </View>
-        </View>
-        {/* V2.1: Estimated (Pending Offset) legend entry */}
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>تقديري معلَّق</Text>
-          <View style={[styles.legendBadge, { borderColor: T.warning + '55', backgroundColor: '#1a0e00' }]}>
-            <Text style={[styles.legendBadgeText, { color: T.warning, fontStyle: 'normal', fontWeight: '700' }]}>⏳</Text>
-          </View>
-        </View>
         <View style={styles.legendItem}>
           <Text style={styles.legendText}>توقع</Text>
           <View style={[styles.legendBadge]}><Text style={styles.legendBadgeText}>{AR.estBadge}</Text></View>
@@ -626,7 +532,6 @@ export default function ScheduleScreen() {
                 isHolding={userPrediction?.isHoldingState}
                 stableStartFormatted={stableStart}
                 stableEndFormatted={stableEnd}
-                isPendingNegative={(userPrediction as any)?.isPendingNegative ?? false}
               />
             );
           })}

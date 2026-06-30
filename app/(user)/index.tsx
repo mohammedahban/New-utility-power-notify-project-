@@ -156,189 +156,7 @@ function fmtTimeAr(iso: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.1: GENERATED ON BANNER
-// PDF §"GENERATED ON IS A REAL TIMELINE EVENT": when the user's current
-// state is a Generated ON (created from their own ON report or cloned from
-// a reporter they approved), the Home Screen must surface this prominently.
-// The banner shows: start time, duration, reference ON kind, and lifecycle
-// inheritance status (if the reference ON is still active, the Generated ON
-// inherits its full lifecycle — verification window, UNCERTAIN_ZONE,
-// duration reconciliation).
-// ───────────────────────────────────────────────────────────────────────
-function GeneratedOnBanner({ prediction }: { prediction: UserPrediction | null }) {
-  const genOn = prediction?.generatedOnInfo;
-  // V2.1: only render when current state IS the Generated ON.
-  if (!genOn || !prediction?.isGeneratedOnCurrent) return null;
-
-  const isOn = prediction.currentState === 'ON';
-  const color = T.success;
-  const startTime = new Date(genOn.startIso).toLocaleString('en-US', {
-    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
-  }).replace('AM', ' ص').replace('PM', ' م');
-  const durationLabel = genOn.durationMin >= 60
-    ? `${Math.floor(genOn.durationMin / 60)}س ${genOn.durationMin % 60}د`
-    : `${genOn.durationMin}د`;
-  const refTime = new Date(genOn.referenceIso).toLocaleString('en-US', {
-    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
-  }).replace('AM', ' ص').replace('PM', ' م');
-
-  return (
-    <View style={goStyles.banner}>
-      <View style={goStyles.iconWrap}>
-        <Text style={{ fontSize: 22 }}>⚡</Text>
-      </View>
-      <View style={{ flex: 1 }}>
-        <Text style={goStyles.title}>حالة تشغيل مُولّدة</Text>
-        <Text style={goStyles.body}>
-          بدأت في <Text style={{ fontWeight: '800', color: T.accent }}>{startTime}</Text>
-          {' '}· المدّة المنسوخة من أقرب دورة تشغيل منطقية:{' '}
-          <Text style={{ fontWeight: '800', color }}>{durationLabel}</Text>
-        </Text>
-        <Text style={goStyles.ref}>
-          {genOn.referenceKind === 'active'
-            ? `🔄 تتبّع دورة مرجعية نشطة (بدأت ${refTime}) — ستتوارث نافذة التحقق ومنطقة UNCERTAIN وإصلاح المدة تلقائياً`
-            : `📍 مرجع مكتمل (دورة سابقة بدأت ${refTime}) — المدّة نهائية`}
-        </Text>
-        <Text style={goStyles.note}>
-          ⚡ هذه الحالة حدث فعلي دائم في خطّك الزمني — لا يُحذف ولا يُستبدل.
-        </Text>
-      </View>
-    </View>
-  );
-}
-
-const goStyles = StyleSheet.create({
-  banner: {
-    flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12,
-    backgroundColor: '#052e16', borderRadius: 16, padding: 14, marginBottom: 12,
-    borderWidth: 1.5, borderColor: T.success + '66',
-  },
-  iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.success, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 6 },
-  ref: { color: T.textMuted, fontSize: 10, lineHeight: 15, textAlign: 'right', marginBottom: 4 },
-  note: { color: T.success + 'aa', fontSize: 10, fontStyle: 'italic', textAlign: 'right' },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.1: PENDING NEGATIVE BANNER
-// PDF §Rule 2: when OFF Progress >50% at report time, the Offset State is
-// PendingNegative and the Offset Value is "Waiting for next Growatt ON".
-// The Home Screen must surface this so the user understands WHY future ON
-// predictions are marked "Estimated (Pending Offset)" and WHEN the
-// resolution will happen (when Growatt finally transitions to ON).
-// ───────────────────────────────────────────────────────────────────────
-function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | null }) {
-  const isPending = prediction?.isPendingNegative ?? false;
-  const resolutionIso = prediction?.pendingNegativeResolutionIso ?? null;
-  if (!isPending) return null;
-
-  // Countdown to expected Growatt ON
-  const [tick, setTick] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
-  let countdownLabel = 'بانتظار تحوّل Growatt القادم';
-  if (resolutionIso) {
-    const ms = new Date(resolutionIso).getTime() - Date.now();
-    if (ms > 0) {
-      const h = Math.floor(ms / 3600000);
-      const m = Math.floor((ms % 3600000) / 60000);
-      const s = Math.floor((ms % 60000) / 1000);
-      countdownLabel = `≈ ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    } else {
-      countdownLabel = 'الآن — بانتظار Growatt';
-    }
-  }
-
-  return (
-    <View style={pn2Styles.banner}>
-      <View style={pn2Styles.iconWrap}>
-        <Text style={{ fontSize: 22 }}>⏳</Text>
-      </View>
-      <View style={{ flex: 1 }}>
-        <Text style={pn2Styles.title}>فارق معلَّق (Pending Negative)</Text>
-        <Text style={pn2Styles.body}>
-          بلاغك أو بلاغ المُبلِّغ وصل في النصف الثاني من فترة الانطفاء المتوقّعة.
-          الفارق الزمني سيُحسب تلقائياً بمجرد أن يتحوّل Growatt إلى تشغيل.
-        </Text>
-        <View style={pn2Styles.countdownRow}>
-          <Text style={pn2Styles.countdownLabel}>توقّع الحل:</Text>
-          <Text style={pn2Styles.countdownValue}>{countdownLabel}</Text>
-        </View>
-        <Text style={pn2Styles.note}>
-          ⚠ تنبؤات التشغيل القادمة تُعرض كـ "تقديري (فارق معلّق)" حتى يُحلّ الفارق.
-        </Text>
-      </View>
-    </View>
-  );
-}
-
-const pn2Styles = StyleSheet.create({
-  banner: {
-    flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12,
-    backgroundColor: '#1a0e00', borderRadius: 16, padding: 14, marginBottom: 12,
-    borderWidth: 1.5, borderColor: T.warning + '66',
-  },
-  iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.warning, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 8 },
-  countdownRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 6 },
-  countdownLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
-  countdownValue: { color: T.warning, fontSize: 16, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
-  note: { color: T.warning + 'aa', fontSize: 10, fontStyle: 'italic', textAlign: 'right' },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.1: OFFSET STATE CHIP
-// Renders a small chip showing the current OffsetState (Positive / Negative /
-// Neutral / PendingNegative) alongside the numeric OffsetValue. Used in the
-// PersonalStatusCard to give the user at-a-glance visibility into which TMMS
-// rules their timeline is currently following.
-// ───────────────────────────────────────────────────────────────────────
-function OffsetStateChip({ prediction }: { prediction: UserPrediction | null }) {
-  const state = prediction?.offsetState;
-  const value = prediction?.offsetValue;
-  if (!state) return null;
-
-  const stateLabelAr: Record<string, string> = {
-    POSITIVE: 'فارق إيجابي',
-    NEGATIVE: 'فارق سلبي',
-    NEUTRAL: 'فارق محايد',
-    PENDING_NEGATIVE: 'فارق معلَّق',
-  };
-  const stateColor: Record<string, string> = {
-    POSITIVE: T.success,
-    NEGATIVE: T.warning,
-    NEUTRAL: T.textMuted,
-    PENDING_NEGATIVE: T.warning,
-  };
-  const color = stateColor[state] ?? T.textMuted;
-  const label = stateLabelAr[state] ?? state;
-  const valueLabel = value === 'PENDING' || state === 'PENDING_NEGATIVE'
-    ? 'بانتظار Growatt'
-    : (typeof value === 'number' ? `${value > 0 ? '+' : ''}${value}د` : '');
-
-  return (
-    <View style={[osStyles.chip, { borderColor: color + '55', backgroundColor: color + '12' }]}>
-      <Text style={[osStyles.label, { color }]}>{label}</Text>
-      {valueLabel ? <Text style={[osStyles.value, { color }]}>{valueLabel}</Text> : null}
-    </View>
-  );
-}
-
-const osStyles = StyleSheet.create({
-  chip: {
-    flexDirection: 'row-reverse', alignItems: 'center', gap: 8,
-    borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1,
-    alignSelf: 'flex-start', marginBottom: 12,
-  },
-  label: { fontSize: 11, fontWeight: '700' },
-  value: { fontSize: 13, fontWeight: '900' },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
+// POSITIVE OFFSET PENDING BANNER (User B)
 // Shows when Growatt has already transitioned but user's scheduled time is future.
 // Spec §POSITIVE OFFSET BEHAVIOR: "سيتم تغيير حالتك تلقائياً في الساعة [HH:MM]"
 // ─────────────────────────────────────────────────────────────────────────────
@@ -539,14 +357,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const isOn = prediction?.currentState === 'ON';
   const color = isOn ? T.success : T.danger;
 
-  // TMMS V2.1: surface the Offset State (Positive/Negative/Neutral/PendingNegative)
-  // prominently so the user understands which TMMS rules their timeline is
-  // currently following. The chip renders just below the status text.
-  // V2.1: the chip is unconditional — Rules of Hooks requires it to be called
-  // before any early return, even if atcMode === 'COMMUNITY_SYNCED' renders
-  // a slightly different layout. The chip itself only renders when state is set.
-  const offsetStateChip = <OffsetStateChip prediction={prediction} />;
-
   // Elapsed — driven by persistent anchor, never resets on prediction refresh
   const elapsed = useElapsedFromIso(anchorStartIso);
 
@@ -558,13 +368,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const currentSlot = (() => {
     const slots = prediction?.daySchedule ?? [];
     const nowMs = Date.now();
-    // Only POSITIVE_OFFSET_PENDING injects a synthetic current-state slot at
-    // index 0 of daySchedule (engine applyOffsetToPrediction unshift).
-    // COMMUNITY_SYNCED does NOT inject at index 0 — the generated resynced slot
-    // sits at its natural position inside effectiveSlots (after any preCycleSlots)
-    // and is reliably found by the standard findIndex below.  Using slots[0] for
-    // COMMUNITY_SYNCED would return a past preCycleSlot, giving remainMinutes = 0.
-    if (atcMode === 'POSITIVE_OFFSET_PENDING' && slots.length > 0) {
+    // POSITIVE_OFFSET_PENDING and COMMUNITY_SYNCED inject the current held
+    // slot at index 0 of daySchedule — same pattern already used
+    // successfully in TodayTimeline. Scoped to the live atc mode (NOT the
+    // generic isResynced flag, which is also true for negative-offset's
+    // normal reconciliation and would otherwise pick a stale old slot).
+    if ((atcMode === 'POSITIVE_OFFSET_PENDING' || atcMode === 'COMMUNITY_SYNCED') && slots.length > 0) {
       return slots[0];
     }
     if (isHolding) return null;
@@ -668,8 +477,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{isOn ? '⚡' : '🔴'}</Animated.Text>
           <Text style={[psStyles.statusText, { color }]}>{isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}</Text>
         </View>
-        {/* V2.1: Offset State chip — shows what was cloned from the reporter */}
-        {offsetStateChip}
         <View style={[psStyles.communityBanner, { borderColor: T.accent + '44' }]}>
           <View style={{ flex: 1 }}>
             <Text style={psStyles.communityBannerTitle}>تمت مزامنة الحالة عبر المجتمع 🤝</Text>
@@ -686,12 +493,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
             {meta?.syncedAtIso && (
               <Text style={psStyles.communityBannerTime}>تم تأكيد هذه الحالة منذ: {syncElapsed || 'للتو'}</Text>
             )}
-            {/* V2.1: confirmation-only note. PDF §"COMMUNITY CONFIRMATION":
-                confirmation never modifies timeline calculations — only
-                confidence/trust. The note makes this explicit. */}
-            <Text style={psStyles.communityBannerNote}>
-              ⚠ تأكيدك لا يغيّر وقت البلاغ الأصلي ولا الفارق — يُؤثّر فقط على موثوقية المُبلِّغ.
-            </Text>
           </View>
           <Text style={{ fontSize: 30 }}>👥</Text>
         </View>
@@ -736,9 +537,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{icon}</Animated.Text>
         <Text style={[psStyles.statusText, { color }]}>{statusText}</Text>
       </View>
-      {/* V2.1: Offset State chip — visible in NORMAL / ATC modes too */}
-      {offsetStateChip}
-
       <View style={psStyles.timeRow}>
         {elapsed ? (
           <View style={psStyles.timeBlock}>
@@ -812,8 +610,6 @@ const psStyles = StyleSheet.create({
   communityBannerRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 4 },
   communityBannerReporter: { color: T.textSecondary, fontSize: 13, textAlign: 'right' },
   communityBannerTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
-  // V2.1: confirmation-only note inside the community banner
-  communityBannerNote: { color: T.warning + 'aa', fontSize: 10, fontStyle: 'italic', marginTop: 6, textAlign: 'right', lineHeight: 15 },
   reliabilityChip: { backgroundColor: T.success + '20', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: T.success + '44' },
   reliabilityChipText: { color: T.success, fontSize: 10, fontWeight: '700' },
   revertBtn: {
@@ -1162,16 +958,19 @@ function TodayTimeline({ prediction, anchorStartIso }: {
   // For POSITIVE_OFFSET_PENDING: the synthetic slot (injected at front) IS the active slot
   const atcMode = prediction?.atc?.mode;
   const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+  // COMMUNITY_SYNCED also injects the current held slot at index 0 of
+  // daySchedule — same pattern as POSITIVE_OFFSET_PENDING. Scoped to the
+  // live atc mode (NOT the generic isResynced flag, which is also true
+  // during negative-offset's normal reconciliation and would otherwise
+  // force a stale, old slot to be treated as the active one).
+  const isCommunitySynced = atcMode === 'COMMUNITY_SYNCED';
 
   const activeIdx = (() => {
-    // Only POSITIVE_OFFSET_PENDING injects a synthetic current-state slot at
-    // index 0 of daySchedule (engine applyOffsetToPrediction unshift).
-    // COMMUNITY_SYNCED does NOT inject at index 0 — the generated resynced
-    // slot sits at its natural position inside effectiveSlots (preceded by
-    // any preCycleSlots that are already in the past) and is reliably found
-    // by the standard findIndex: its startIso = resync.syncedAtIso (past),
-    // endIso = generatedCycleEndIso (future), so nowMs correctly falls inside.
-    if (isPositiveOffsetPending && slots.length > 0) {
+    // Synthetic lingering slot is always at index 0 when POSITIVE_OFFSET_PENDING
+    // or when the state is currently community-synced.
+    if ((isPositiveOffsetPending || isCommunitySynced) && slots.length > 0) {
+      // The first slot is synthetic (current held state ending at scheduledAutoTransitionIso,
+      // or the community-synced current state)
       return 0;
     }
     return slots.findIndex(s => {
@@ -1194,14 +993,10 @@ function TodayTimeline({ prediction, anchorStartIso }: {
         const color = isOn ? T.success : T.danger;
         const slotKey = `${slot.state}|${Math.round(new Date(slot.startIso).getTime() / 60_000)}`;
 
-        // For the active POSITIVE_OFFSET_PENDING slot, override start time with
-        // anchorStartIso so the synthetic slot (injected by the engine at index 0)
-        // shows the correct reconciled start moment.
-        // For COMMUNITY_SYNCED, the engine's generated slot already carries the
-        // correct shiftedStartFormatted = fmtYemenTime(resync.syncedAtIso), so no
-        // override is needed — using the slot's own formatted value is accurate.
+        // For the active held slot — POSITIVE_OFFSET_PENDING or COMMUNITY_SYNCED —
+        // use anchorStartIso for start time, since it carries the corrected real start moment.
         let currentStartF: string;
-        if (isActive && isPositiveOffsetPending && anchorStartIso) {
+        if (isActive && (isPositiveOffsetPending || isCommunitySynced) && anchorStartIso) {
           currentStartF = new Date(anchorStartIso).toLocaleString('en-US', {
             timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
           }).replace('AM', ' ص').replace('PM', ' م');
@@ -1212,8 +1007,8 @@ function TodayTimeline({ prediction, anchorStartIso }: {
         if (!stableStartMapRef.current[slotKey] && currentStartF) {
           stableStartMapRef.current[slotKey] = currentStartF;
         }
-        const startF = isActive && isPositiveOffsetPending && anchorStartIso
-          ? currentStartF  // always use fresh anchor for the synthetic POSITIVE_OFFSET_PENDING slot
+        const startF = isActive && (isPositiveOffsetPending || isCommunitySynced) && anchorStartIso
+          ? currentStartF  // always use fresh anchor for active pending/synced slot
           : (stableStartMapRef.current[slotKey] ?? currentStartF);
 
         const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
@@ -1242,17 +1037,6 @@ function TodayTimeline({ prediction, anchorStartIso }: {
                 )}
                 {slot.isResynced && (
                   <View style={tlStyles.syncChip}><Text style={tlStyles.syncChipText}>👥</Text></View>
-                )}
-                {/* V2.1: Generated ON badge — marks slots that were created as a
-                    Generated ON event (PDF §"GENERATED ON IS A REAL TIMELINE EVENT"). */}
-                {(slot as any).isGeneratedOn && (
-                  <View style={tlStyles.genOnChip}><Text style={tlStyles.genOnChipText}>⚡ مُولّدة</Text></View>
-                )}
-                {/* V2.1: Estimated (Pending Offset) badge — marks future ON slots
-                    whose precise start time is unknown because the user's offset
-                    is currently PendingNegative (PDF §"Pending Negative"). */}
-                {(slot as any).isEstimatedPendingOffset && (
-                  <View style={tlStyles.pendingChip}><Text style={tlStyles.pendingChipText}>تقديري معلَّق</Text></View>
                 )}
                 <Text style={[tlStyles.stateText, { color }]}>
                   {isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}
@@ -1293,12 +1077,6 @@ const tlStyles = StyleSheet.create({
   estChipText: { color: T.textMuted, fontSize: 9, fontStyle: 'italic' },
   syncChip: { backgroundColor: '#001a2e', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
   syncChipText: { fontSize: 10 },
-  // V2.1: Generated ON badge styles
-  genOnChip: { backgroundColor: '#052e16', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.success + '44' },
-  genOnChipText: { color: T.success, fontSize: 9, fontWeight: '700' },
-  // V2.1: Estimated (Pending Offset) badge styles
-  pendingChip: { backgroundColor: '#1a0e00', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.warning + '44' },
-  pendingChipText: { color: T.warning, fontSize: 9, fontWeight: '700' },
   timeText: { color: T.textSecondary, fontSize: 13, fontWeight: '600', textAlign: 'right', marginBottom: 2 },
   durText: { fontSize: 11, fontWeight: '600', textAlign: 'right' },
 });
@@ -1484,22 +1262,11 @@ export default function Home() {
   const { resyncPoint, clearResync, registerSnapshotCallback } = useResync();
   const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
   const { anchor } = useStateAnchor();
-
-  // TMMS V2 Q3-A: persist the community-derived offset to user_offsets the first
-  // time it is computed for a given resync session.  Q2-A already freezes it
-  // in-memory (communityOffsetFrozenRef inside useUserPredictions); this callback
-  // writes it to the DB so the value survives app restarts.  saveOffset() upserts
-  // the same user_offsets row used for manual DSD calibration.
-  const onCommunityOffsetComputed = useCallback((computedOffsetMinutes: number) => {
-    saveOffset(computedOffsetMinutes);
-  }, [saveOffset]);
-
   const { userPrediction, loading: predLoading } = useUserPredictions(
     offset?.offset_minutes ?? 0,
     resyncPoint,
     transitionMode,
     anchor?.startIso ?? null,
-    onCommunityOffsetComputed,
   );
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
@@ -1699,17 +1466,6 @@ export default function Home() {
 
       <ParticipationNudge userId={profile?.id} />
       <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
-
-      {/* V2.1: Generated ON banner — shown when the user's current state is a
-          Generated ON event (created from their own ON report or cloned from
-          a reporter they approved). */}
-      <GeneratedOnBanner prediction={stablePrediction} />
-
-      {/* V2.1: Pending Negative banner — shown when the user's OffsetState is
-          PendingNegative, surfaced BEFORE the PositiveOffsetPendingBanner so
-          the user understands why future ON predictions are estimated. */}
-      <PendingNegativeBanner prediction={stablePrediction} />
-
       <PositiveOffsetPendingBanner prediction={stablePrediction} />
       <ValidationWindowToast prediction={stablePrediction} />
       <PersonalStatusCard

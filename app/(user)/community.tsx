@@ -9,10 +9,7 @@ import { useRouter } from 'expo-router';
 import * as Location from 'expo-location';
 import { useNearbyUsers } from '../../hooks/useNearbyUsers';
 import { useFollows } from '../../hooks/useFollows';
-import { useUtilityReports, TimeOption } from '../../hooks/useUtilityReports';
-// TMMS V2.1: ReportedState import removed — V2.1 is ON-ONLY reporting.
-// The hook still exports it for backwards compatibility, but the V2.1 UI
-// never accepts anything other than 'UTILITY_ON'.
+import { useUtilityReports, TimeOption, ReportedState } from '../../hooks/useUtilityReports';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { supabase } from '../../lib/supabase';
@@ -20,8 +17,9 @@ import { useAuth } from '../../contexts/AuthContext';
 import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
-import { useUserOffset } from '../../hooks/useUserOffset';
 import { useTransitionMode } from '../../hooks/useTransitionMode';
+import { useStateAnchor } from '../../hooks/useStateAnchor';
+import { useUserOffset } from '../../hooks/useUserOffset';
 import { useUserPredictions } from '../../hooks/useUserPredictions';
 import { AR } from '../../constants/arabic';
 
@@ -51,17 +49,12 @@ const TIME_LABELS_AR: Record<string, string> = {
 };
 
 // ── Report Modal ──────────────────────────────────────────────────────────────
-// TMMS V2.1 §"WHY ONLY ON REPORTS?": users NEVER report OFF. The state
-// selector row has been removed entirely — the modal is a single-purpose
-// "Report Electricity ON" dialog. The reporter's OffsetState (Positive /
-// Negative / Neutral / PendingNegative) is computed by the engine at
-// submission time, NOT chosen by the user.
 function ReportModal({ visible, onClose, onSubmit, submitting }: {
   visible: boolean; onClose: () => void;
-  // V2.1: signature changed — no `state` param. Always UTILITY_ON.
-  onSubmit: (time: TimeOption) => void;
+  onSubmit: (state: ReportedState, time: TimeOption) => void;
   submitting: boolean;
 }) {
+  const [state, setState] = useState<ReportedState>('UTILITY_ON');
   const [time, setTime] = useState<TimeOption>('now');
 
   return (
@@ -69,22 +62,24 @@ function ReportModal({ visible, onClose, onSubmit, submitting }: {
       <View style={rmStyles.overlay}>
         <View style={rmStyles.sheet}>
           <View style={rmStyles.handle} />
-          <Text style={rmStyles.title}>⚡ الإبلاغ عن تشغيل الكهرباء</Text>
-          <Text style={rmStyles.sub}>
-            أبلغ فقط عندما تشتعل الكهرباء. النظام يتعامل مع الإطفاء تلقائياً
-            حسب التوقّعات ولا يحتاج إلى بلاغ منك. سيتم إنشاء "حالة تشغيل
-            مُولّدة" فوراً وتُحدَّث الجداول لديك ولدى من يتابعك.
-          </Text>
+          <Text style={rmStyles.title}>{AR.reportUtilityTransition}</Text>
+          <Text style={rmStyles.sub}>{AR.reportSubtitle}</Text>
 
-          {/* V2.1: ON-only info banner. Replaces the old state selector row. */}
-          <View style={rmStyles.onOnlyBanner}>
-            <Text style={rmStyles.onOnlyEmoji}>⚡</Text>
-            <View style={{ flex: 1 }}>
-              <Text style={rmStyles.onOnlyTitle}>بلاغ تشغيل فقط</Text>
-              <Text style={rmStyles.onOnlySub}>
-                لا حاجة للإبلاغ عن الانطفاء — النظام يتوقّعه ويُنهيه تلقائياً.
-              </Text>
-            </View>
+          <Text style={rmStyles.sectionLabel}>{AR.whatHappened}</Text>
+          <View style={rmStyles.stateRow}>
+            {(['UTILITY_ON', 'UTILITY_OFF'] as ReportedState[]).map(s => (
+              <TouchableOpacity
+                key={s}
+                style={[rmStyles.stateBtn, state === s && (s === 'UTILITY_ON' ? rmStyles.stateBtnOnActive : rmStyles.stateBtnOffActive)]}
+                onPress={() => setState(s)}
+                activeOpacity={0.8}
+              >
+                <Text style={rmStyles.stateEmoji}>{s === 'UTILITY_ON' ? '⚡' : '🔴'}</Text>
+                <Text style={[rmStyles.stateBtnText, state === s && { color: s === 'UTILITY_ON' ? T.success : T.danger }]}>
+                  {s === 'UTILITY_ON' ? AR.cameOn : AR.wentOff}
+                </Text>
+              </TouchableOpacity>
+            ))}
           </View>
 
           <Text style={rmStyles.sectionLabel}>{AR.whenHappened}</Text>
@@ -103,13 +98,13 @@ function ReportModal({ visible, onClose, onSubmit, submitting }: {
 
           <TouchableOpacity
             style={[rmStyles.submitBtn, submitting && { opacity: 0.6 }]}
-            onPress={() => onSubmit(time)}
+            onPress={() => onSubmit(state, time)}
             disabled={submitting}
             activeOpacity={0.85}
           >
             {submitting
               ? <ActivityIndicator color="#fff" size="small" />
-              : <Text style={rmStyles.submitText}>⚡ {AR.shareWithFollowers}</Text>
+              : <Text style={rmStyles.submitText}>{AR.shareWithFollowers}</Text>
             }
           </TouchableOpacity>
           <TouchableOpacity style={rmStyles.cancelBtn} onPress={onClose}>
@@ -128,15 +123,12 @@ const rmStyles = StyleSheet.create({
   title: { color: T.textPrimary, fontSize: 20, fontWeight: '800', marginBottom: 6, textAlign: 'right' },
   sub: { color: T.textMuted, fontSize: 13, lineHeight: 19, marginBottom: 20, textAlign: 'right' },
   sectionLabel: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 1, marginBottom: 10, textAlign: 'right' },
-  // V2.1: replaced `stateRow` / `stateBtn*` styles with a single onOnlyBanner.
-  onOnlyBanner: {
-    flexDirection: 'row-reverse', alignItems: 'center', gap: 12,
-    backgroundColor: '#052e16', borderRadius: 14, padding: 14, marginBottom: 20,
-    borderWidth: 1.5, borderColor: T.success + '55',
-  },
-  onOnlyEmoji: { fontSize: 28 },
-  onOnlyTitle: { color: T.success, fontSize: 14, fontWeight: '800', marginBottom: 4, textAlign: 'right' },
-  onOnlySub: { color: T.success + 'cc', fontSize: 11, lineHeight: 16, textAlign: 'right' },
+  stateRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
+  stateBtn: { flex: 1, backgroundColor: T.elevated, borderRadius: 14, padding: 16, alignItems: 'center', gap: 6, borderWidth: 1, borderColor: T.border },
+  stateBtnOnActive: { borderColor: T.success, backgroundColor: '#052e16' },
+  stateBtnOffActive: { borderColor: T.danger, backgroundColor: '#2d0a0a' },
+  stateEmoji: { fontSize: 26 },
+  stateBtnText: { color: T.textMuted, fontSize: 14, fontWeight: '700', textAlign: 'center' },
   timeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 24 },
   timeBtn: { backgroundColor: T.elevated, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1, borderColor: T.border },
   timeBtnActive: { borderColor: T.accent, backgroundColor: '#001a2e' },
@@ -148,49 +140,16 @@ const rmStyles = StyleSheet.create({
 });
 
 // ── Notification Card ─────────────────────────────────────────────────────────
-// TMMS V2.1: only ON reports exist — every OFF branch has been removed.
-// Added: Reporter Offset State badge so the Approver can see EXACTLY what
-// they will clone by pressing YES (PDF §"APPROVER LOGIC").
 function NotifCard({ notif, onRespond, onReporterPress }: {
   notif: any;
   onRespond: (notif: any, response: 'yes' | 'no' | 'ignore') => void;
   onReporterPress?: (reporterId: string) => void;
 }) {
   const isExpired = new Date(notif.expires_at) < new Date();
-  // V2.1: hardcoded ON — no OFF branch.
-  const stateLabel = AR.electricityCameOn;
-  const stateEmoji = '⚡';
+  const stateLabel = notif.reported_state === 'UTILITY_ON' ? AR.electricityCameOn : AR.electricityWentOff;
+  const stateEmoji = notif.reported_state === 'UTILITY_ON' ? '⚡' : '🔴';
   const expiresMin = Math.max(0, Math.round((new Date(notif.expires_at).getTime() - Date.now()) / 60000));
   const timeLabel = TIME_LABELS_AR[notif.time_option] ?? '';
-
-  // V2.1: decode the reporter's offset snapshot for the "you will clone" badge.
-  const reporterState: string = notif.reporter_offset_state ?? null;
-  const reporterValue: number | 'PENDING' | null = notif.reporter_offset_value ?? null;
-  const offsetBadge = (() => {
-    if (!reporterState) return null;
-    const stateLabelAr: Record<string, string> = {
-      POSITIVE: 'إيجابي',
-      NEGATIVE: 'سلبي',
-      NEUTRAL: 'محايد',
-      PENDING_NEGATIVE: 'سلبي معلَّق',
-    };
-    const stateColor: Record<string, string> = {
-      POSITIVE: T.success,
-      NEGATIVE: T.warning,
-      NEUTRAL: T.textMuted,
-      PENDING_NEGATIVE: T.warning,
-    };
-    const valueLabel = reporterValue === 'PENDING' || reporterState === 'PENDING_NEGATIVE'
-      ? 'بانتظار Growatt'
-      : reporterValue !== null
-        ? `${reporterValue > 0 ? '+' : ''}${reporterValue}د`
-        : '?';
-    return {
-      label: stateLabelAr[reporterState] ?? reporterState,
-      value: valueLabel,
-      color: stateColor[reporterState] ?? T.textMuted,
-    };
-  })();
 
   if (notif.response) {
     const colors = { yes: T.success, no: T.danger, ignore: T.textMuted };
@@ -228,28 +187,6 @@ function NotifCard({ notif, onRespond, onReporterPress }: {
         </Text>
       </View>
       <Text style={ncStyles.timeLabel}>{timeLabel}</Text>
-
-      {/* V2.1: "Approving will clone" banner.
-          PDF §"APPROVER LOGIC": Approver clones Reporter's OffsetState,
-          OffsetValue, and TimelineAlignment. The badge surfaces this so
-          the user makes an informed decision. */}
-      {offsetBadge && (
-        <View style={[ncStyles.cloneBanner, { borderColor: offsetBadge.color + '44' }]}>
-          <Text style={ncStyles.cloneBannerTitle}>عند الموافقة ستُنسخ حالة المُبلِّغ:</Text>
-          <View style={ncStyles.cloneBadgeRow}>
-            <View style={[ncStyles.cloneChip, { borderColor: offsetBadge.color + '66', backgroundColor: offsetBadge.color + '15' }]}>
-              <Text style={[ncStyles.cloneChipText, { color: offsetBadge.color }]}>{offsetBadge.label}</Text>
-            </View>
-            <Text style={[ncStyles.cloneValue, { color: offsetBadge.color }]}>{offsetBadge.value}</Text>
-          </View>
-          {reporterState === 'PENDING_NEGATIVE' && (
-            <Text style={ncStyles.clonePendingNote}>
-              ⏳ الفارق سيُحسب تلقائياً عند تحوّل Growatt القادم — لك وللمُبلِّغ معاً.
-            </Text>
-          )}
-        </View>
-      )}
-
       <Text style={ncStyles.question}>{AR.isThisCorrect}</Text>
       <View style={ncStyles.btnRow}>
         <TouchableOpacity style={[ncStyles.btn, ncStyles.ignBtn]} onPress={() => onRespond(notif, 'ignore')} activeOpacity={0.85}>
@@ -282,17 +219,6 @@ const ncStyles = StyleSheet.create({
   ignBtn: { backgroundColor: T.elevated, borderColor: T.border, flex: 0.6 },
   ignBtnText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
   responseLabel: { fontSize: 13, fontWeight: '700', marginTop: 6, textAlign: 'right' },
-  // V2.1: "Approving will clone" banner styles
-  cloneBanner: {
-    backgroundColor: '#0a1929', borderRadius: 12, padding: 12, marginBottom: 12,
-    borderWidth: 1,
-  },
-  cloneBannerTitle: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 0.5, marginBottom: 8, textAlign: 'right' },
-  cloneBadgeRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
-  cloneChip: { borderRadius: 8, paddingHorizontal: 10, paddingVertical: 4, borderWidth: 1 },
-  cloneChipText: { fontSize: 12, fontWeight: '800' },
-  cloneValue: { fontSize: 16, fontWeight: '900', letterSpacing: 0.5 },
-  clonePendingNote: { color: T.warning, fontSize: 10, marginTop: 8, textAlign: 'right', lineHeight: 15 },
 });
 
 // ── Leaderboard ───────────────────────────────────────────────────────────────
@@ -682,15 +608,12 @@ const frStyles = StyleSheet.create({
 });
 
 // ── History Card ──────────────────────────────────────────────────────────────
-// TMMS V2.1: only ON entries appear (OFF filtered out at the data layer).
-// Added: Offset State badge + Generated ON metadata for each entry.
 function HistoryCard({ entry, onReporterPress }: {
   entry: any;
   onReporterPress?: (reporterId: string) => void;
 }) {
-  // V2.1: always ON — no OFF branch.
-  const isOn = true;
-  const color = T.success;
+  const isOn = entry.reported_state === 'UTILITY_ON';
+  const color = isOn ? T.success : T.danger;
   const effectiveTime = new Date(entry.effective_transition_at).toLocaleString('ar-SA', {
     timeZone: 'Asia/Aden', month: 'short', day: 'numeric',
     hour: '2-digit', minute: '2-digit',
@@ -699,38 +622,12 @@ function HistoryCard({ entry, onReporterPress }: {
     timeZone: 'Asia/Aden', timeStyle: 'short',
   });
 
-  // V2.1: decode the entry's cloned offset state for the badge.
-  const offsetState: string | null = entry.offset_state ?? null;
-  const offsetValue: number | 'PENDING' | null = entry.offset_value ?? null;
-  const stateLabelAr: Record<string, string> = {
-    POSITIVE: 'إيجابي',
-    NEGATIVE: 'سلبي',
-    NEUTRAL: 'محايد',
-    PENDING_NEGATIVE: 'سلبي معلَّق',
-  };
-  const stateColor: Record<string, string> = {
-    POSITIVE: T.success,
-    NEGATIVE: T.warning,
-    NEUTRAL: T.textMuted,
-    PENDING_NEGATIVE: T.warning,
-  };
-  const badgeColor = offsetState ? (stateColor[offsetState] ?? T.textMuted) : T.textMuted;
-  const badgeLabel = offsetState ? (stateLabelAr[offsetState] ?? offsetState) : null;
-  const valueLabel = offsetValue === 'PENDING' || offsetState === 'PENDING_NEGATIVE'
-    ? 'بانتظار Growatt'
-    : (typeof offsetValue === 'number' ? `${offsetValue > 0 ? '+' : ''}${offsetValue}د` : null);
-
-  // V2.1: Generated ON metadata (if present)
-  const genOnStart = entry.generated_on_start_iso;
-  const genOnDuration = entry.generated_on_duration_min;
-  const genOnRefKind = entry.generated_on_reference_kind;
-
   return (
     <View style={hcStyles.card}>
       <View style={hcStyles.content}>
         <View style={hcStyles.headerRow}>
           <Text style={hcStyles.source}>{entry.source === 'community_resync' ? '👥 مجتمعي' : entry.source}</Text>
-          <Text style={[hcStyles.state, { color }]}>⚡ {AR.gridOn}</Text>
+          <Text style={[hcStyles.state, { color }]}>{isOn ? '⚡ ' + AR.gridOn : '🔴 ' + AR.gridOff}</Text>
         </View>
         <Text style={hcStyles.time}>الوقت الفعلي: {effectiveTime} (اليمن)</Text>
         <Text style={hcStyles.reporter}>
@@ -747,31 +644,6 @@ function HistoryCard({ entry, onReporterPress }: {
           )}
           {'  '}· أُكّد في {confirmedTime}
         </Text>
-
-        {/* V2.1: Offset State badge */}
-        {badgeLabel && (
-          <View style={hcStyles.offsetRow}>
-            <View style={[hcStyles.offsetChip, { borderColor: badgeColor + '55', backgroundColor: badgeColor + '12' }]}>
-              <Text style={[hcStyles.offsetChipLabel, { color: badgeColor }]}>{badgeLabel}</Text>
-            </View>
-            {valueLabel && (
-              <Text style={[hcStyles.offsetValue, { color: badgeColor }]}>{valueLabel}</Text>
-            )}
-            {offsetState === 'PENDING_NEGATIVE' && (
-              <Text style={hcStyles.pendingNote}>⏳ سيُحسب تلقائياً</Text>
-            )}
-          </View>
-        )}
-
-        {/* V2.1: Generated ON metadata */}
-        {genOnStart && genOnDuration && (
-          <View style={hcStyles.genOnRow}>
-            <Text style={hcStyles.genOnText}>
-              ⚡ حالة تشغيل مُولّدة · {genOnDuration >= 60 ? `${Math.floor(genOnDuration / 60)}س ${genOnDuration % 60}د` : `${genOnDuration}د`}
-              {genOnRefKind === 'active' ? ' · متابعة دورة مرجعية نشطة' : ''}
-            </Text>
-          </View>
-        )}
       </View>
       <View style={[hcStyles.bar, { backgroundColor: color }]} />
     </View>
@@ -787,15 +659,6 @@ const hcStyles = StyleSheet.create({
   source: { color: T.textMuted, fontSize: 11 },
   time: { color: T.textSecondary, fontSize: 12, marginBottom: 3, textAlign: 'right' },
   reporter: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
-  // V2.1: offset state badge row
-  offsetRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginTop: 8 },
-  offsetChip: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
-  offsetChipLabel: { fontSize: 10, fontWeight: '700' },
-  offsetValue: { fontSize: 13, fontWeight: '800' },
-  pendingNote: { color: T.warning, fontSize: 10, fontWeight: '600' },
-  // V2.1: Generated ON metadata
-  genOnRow: { marginTop: 6, backgroundColor: '#052e16', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.success + '33' },
-  genOnText: { color: T.success, fontSize: 10, fontWeight: '600', textAlign: 'right' },
 });
 
 // ── Main Screen ───────────────────────────────────────────────────────────────
@@ -820,7 +683,13 @@ export default function CommunityScreen() {
   const { applyResync, resyncPoint } = useResync();
   const { offset } = useUserOffset();
   const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode, null);
+  const { anchor } = useStateAnchor();
+  const { userPrediction } = useUserPredictions(
+    offset?.offset_minutes ?? 0,
+    resyncPoint,
+    transitionMode,
+    anchor?.startIso ?? null,
+  );
   const { captureSnapshot } = useStatusSnapshot();
 
   useEffect(() => { registerPushToken(); }, []);
@@ -893,11 +762,7 @@ export default function CommunityScreen() {
     }
   }, [getStatusWith, following, pending, cancelOrUnfollow, respondToRequest, sendRequest]);
 
-  // TMMS V2.1: handleReport signature changed — `state` param removed.
-  // Always submits a UTILITY_ON report. The engine computes the OffsetState
-  // (Positive/Negative/Neutral/PendingNegative) at submission time based on
-  // the OFF Progress rule; the user never chooses a state.
-  const handleReport = useCallback(async (time: TimeOption) => {
+  const handleReport = useCallback(async (state: ReportedState, time: TimeOption) => {
     // Capture snapshot BEFORE report is saved so "العودة إلى الحالة الأصلية" can
     // fully restore the pre-report state (offset + resync + state start).
     await captureSnapshot(
@@ -908,40 +773,21 @@ export default function CommunityScreen() {
       'user_report',
     );
 
-    // V2.1: hardcoded UTILITY_ON — no OFF reporting path.
-    const { selfResync, error } = await submitReport('UTILITY_ON' as any, time);
+    const { selfResync, error } = await submitReport(state, time);
     setReportModalVisible(false);
     if (error) {
       Alert.alert(AR.error, error);
     } else {
       if (selfResync) await applyResync(selfResync);
-      // V2.1: updated copy to mention Generated ON creation.
-      Alert.alert(
-        AR.reportShared,
-        'تم إنشاء "حالة تشغيل مُولّدة" في خطّك الزمني وتحديث الجداول لديك ولدى من يتابعك. لا حاجة للإبلاغ عن الانطفاء — سيتولّاه النظام تلقائياً.',
-      );
+      Alert.alert(AR.reportShared, AR.reportSharedBody);
     }
   }, [submitReport, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
 
-  // TMMS V2.1: handleRespond — the YES branch no longer recalculates anything.
-  // useResyncNotifications.respond() clones the reporter's OffsetState /
-  // OffsetValue / TimelineAlignment internally and returns them in yesResult.
-  // Here we just apply the resync point and surface the cloned state to the UI.
   const handleRespond = useCallback(async (notif: any, response: 'yes' | 'no' | 'ignore') => {
     const { yesResult, error } = await respond(notif, response);
     if (error) {
       Alert.alert(AR.error, error);
     } else if (response === 'yes' && yesResult) {
-      // TMMS V2 §GAP-3: capture snapshot BEFORE applying the community resync so
-      // "العودة إلى الحالة الأصلية" can fully restore the pre-confirmation state
-      // even when the Home tab is not currently mounted (snapshotCbRef would be null).
-      await captureSnapshot(
-        userPrediction?.currentState ?? 'OFF',
-        userPrediction?.currentStateStartIso ?? null,
-        offset?.offset_minutes ?? 0,
-        resyncPoint ?? null,
-        'community_confirm',
-      );
       // Fetch reporter reliability to surface in community sync meta
       let reporterReliability: number | null = null;
       if (notif.reporter_id) {
@@ -954,43 +800,16 @@ export default function CommunityScreen() {
           if (data) reporterReliability = Math.round(data.reliability_score ?? 50);
         } catch (_) {}
       }
-      // V2.1: syncedState is ALWAYS 'ON' (no OFF reporting). The cloned
-      // OffsetState / OffsetValue / TimelineAlignment travel inside
-      // yesResult — applyResync will pass them through to the engine.
       await applyResync({
-        syncedState: 'ON', // V2.1: hardcoded
+        syncedState: yesResult.reportedState === 'UTILITY_ON' ? 'ON' : 'OFF',
         syncedAtIso: yesResult.effectiveTransitionAt,
         appliedAtIso: new Date().toISOString(),
         reporterName: yesResult.reporterName ?? notif.reporter_username ?? null,
         reporterReliability,
-        // V2.1 additions (cloned from reporter):
-        offsetState: yesResult.offsetState,
-        offsetValue: yesResult.offsetValue,
-        timelineAlignment: yesResult.timelineAlignment,
-        generatedOnStartIso: yesResult.generatedOnStartIso,
-        generatedOnDurationMin: yesResult.generatedOnDurationMin,
-        generatedOnReferenceIso: yesResult.generatedOnReferenceIso,
-        generatedOnReferenceKind: yesResult.generatedOnReferenceKind,
-      } as any);
-
-      // V2.1: confirmation-only copy. Per the spec, confirmation never
-      // modifies timeline calculations — it only validates the report and
-      // bumps confidence. The user message reflects that.
-      const stateLabelAr: Record<string, string> = {
-        POSITIVE: 'إيجابي',
-        NEGATIVE: 'سلبي',
-        NEUTRAL: 'محايد',
-        PENDING_NEGATIVE: 'سلبي معلَّق',
-      };
-      const valueLabel = yesResult.offsetValue === 'PENDING' || yesResult.offsetState === 'PENDING_NEGATIVE'
-        ? 'بانتظار تحوّل Growatt القادم'
-        : `${(yesResult.offsetValue as number) > 0 ? '+' : ''}${yesResult.offsetValue}د`;
-      Alert.alert(
-        AR.scheduleUpdated,
-        `تمت مزامنة خطّك الزمني مع بلاغ المُبلِّغ وفق قواعد TMMS V2.1. الفارق المنسوخ: ${stateLabelAr[yesResult.offsetState]} · ${valueLabel}. لا يؤثر تأكيدك على وقت البلاغ الأصلي — يُؤثّر فقط على موثوقية المُبلِّغ.`,
-      );
+      });
+      Alert.alert(AR.scheduleUpdated, AR.scheduleUpdatedBody);
     }
-  }, [respond, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
+  }, [respond, applyResync]);
 
   const myBadge = myScore ? getReliabilityBadge(myScore.reliability_score) : null;
   const { profile } = useAuth();
