@@ -1,46 +1,24 @@
 /**
- * useUtilityReports — TMMS V2.1 (Final Corrected Logic)
+ * useUtilityReports
  *
  * Handles submitting utility transition reports.
  *
- * ───────────────────────────────────────────────────────────────────────────
- * TMMS V2.1 FINAL CHANGES
- * ───────────────────────────────────────────────────────────────────────────
+ * After a successful submit:
+ * 1. The report is stored in utility_reports.
+ * 2. The distribute-resync edge function is called to notify followers.
+ * 3. A self-resync result is returned so the caller can immediately
+ *    update the ResyncContext for the reporter themselves.
  *
- *  1. ON-ONLY REPORTING
- *     The `reportedState` parameter is kept for backwards compatibility but
- *     V2.1 always submits 'UTILITY_ON'. The community.tsx UI already enforces
- *     this — the OFF button was removed.
- *
- *  2. PERIOD 1 / PERIOD 2 OFFSET CALCULATION AT SUBMISSION TIME
- *     When a reporter submits a report, the hook:
- *       a. Fetches the current Growatt schedule (from usePredictions/predictions table)
- *       b. Determines which Growatt state the submission falls in (ON or OFF)
- *       c. If OFF: calculates OFF Progress and determines Period 1 (<50%) or Period 2 (>50%)
- *       d. Computes the offset:
- *            Period 1: offset = T − prevOnStart → POSITIVE
- *            Period 2: offset = T − nextOnStart → NEGATIVE
- *            During ON: offset = T − currentOnStart
- *       e. Computes Generated ON duration from the reference ON
- *       f. Stores all V2.1 fields on the utility_reports row
- *       g. Returns them in the selfResync ResyncPoint
- *
- *  3. OFFSET IS FINAL
- *     The offset is computed ONCE at report time and is FINAL.
- *     No recomputation, no flipping, no pending state.
- *
- * Original (V2) responsibilities preserved unchanged:
- *   - Cooldown timer (30 min between reports)
- *   - distribute-resync edge function invocation
- *   - resync_history persistence
- *   - Reporter name/reliability fetch
+ * Self-resync logic:
+ *   syncedAtIso = now - selectedOffsetMinutes
+ *   syncedState = reportedState === 'UTILITY_ON' ? 'ON' : 'OFF'
  */
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { ResyncPoint, OffsetState, OffsetValue } from '../contexts/ResyncContext';
+import { ResyncPoint } from '../contexts/ResyncContext';
 
 export type TimeOption = 'now' | '5min' | '10min' | '15min' | '20min';
 export type ReportedState = 'UTILITY_ON' | 'UTILITY_OFF';
@@ -66,264 +44,6 @@ const TIME_OFFSETS_MIN: Record<TimeOption, number> = {
 
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 const LAST_REPORT_KEY = 'utility_report_last_submitted_at';
-
-// ── V2.1: Schedule slot interface ──────────────────────────────────────────
-interface ScheduleSlot {
-  state: 'ON' | 'OFF';
-  start: string;  // ISO timestamp or 'HH:MM'
-  end: string;
-  durationMin: number;
-}
-
-// ── V2.1: Time helpers ─────────────────────────────────────────────────────
-function timeToMin(hhmm: string): number {
-  if (typeof hhmm !== 'string') return hhmm;
-  // Handle both 'HH:MM' and ISO timestamps
-  if (hhmm.includes('T')) {
-    const d = new Date(hhmm);
-    return d.getHours() * 60 + d.getMinutes();
-  }
-  const [h, m] = hhmm.split(':').map(Number);
-  return h * 60 + m;
-}
-
-function minToTime(min: number): string {
-  min = ((min % 1440) + 1440) % 1440;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
-
-// ── V2.1: Find the current Growatt OFF slot ────────────────────────────────
-function findCurrentOffSlot(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
-  for (const slot of schedule) {
-    if (slot.state !== 'OFF') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    if (start < end) {
-      if (t >= start && t < end) return slot;
-    } else {
-      // wraps midnight
-      if (t >= start || t < end) return slot;
-    }
-  }
-  return null;
-}
-
-// ── V2.1: Find the current Growatt ON slot ─────────────────────────────────
-function findCurrentOnSlot(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
-  for (const slot of schedule) {
-    if (slot.state !== 'ON') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    if (start < end) {
-      if (t >= start && t < end) return slot;
-    } else {
-      if (t >= start || t < end) return slot;
-    }
-  }
-  return null;
-}
-
-// ── V2.1: Find the previous Growatt ON (most recently ended) ───────────────
-function findPreviousGrowattOn(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
-  let prev: ScheduleSlot | null = null;
-  let prevEndMin = -1;
-  for (const slot of schedule) {
-    if (slot.state !== 'ON') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    let hasEnded: boolean;
-    let endedAt: number;
-    if (end > start) {
-      hasEnded = end <= t;
-      endedAt = end;
-    } else {
-      // Wraps midnight
-      const isActive = t >= start || t < end;
-      hasEnded = !isActive;
-      endedAt = end;
-    }
-    if (hasEnded && endedAt > prevEndMin) {
-      prev = slot;
-      prevEndMin = endedAt;
-    }
-  }
-  return prev;
-}
-
-// ── V2.1: Find the next Growatt ON (upcoming) ──────────────────────────────
-function findNextGrowattOn(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
-  let next: ScheduleSlot | null = null;
-  let nextStartMin = Infinity;
-
-  // First pass: look for ON slots that start after t
-  for (const slot of schedule) {
-    if (slot.state !== 'ON') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    let startsAfter: boolean;
-    if (end > start) {
-      startsAfter = start > t;
-    } else {
-      const isActive = t >= start || t < end;
-      startsAfter = !isActive;
-    }
-    if (startsAfter && start < nextStartMin) {
-      next = slot;
-      nextStartMin = start;
-    }
-  }
-
-  // If no ON found after t, wrap around (tomorrow's earliest ON)
-  if (!next) {
-    for (const slot of schedule) {
-      if (slot.state !== 'ON') continue;
-      const start = timeToMin(slot.start);
-      if (start < nextStartMin) {
-        next = slot;
-        nextStartMin = start;
-      }
-    }
-  }
-
-  return next;
-}
-
-// ── V2.1: Calculate OFF Progress ───────────────────────────────────────────
-// Formula: OFF Progress = (Elapsed OFF Time ÷ Expected OFF Duration) × 100
-function calculateOffProgress(offSlot: ScheduleSlot, t: number) {
-  const start = timeToMin(offSlot.start);
-  const end = timeToMin(offSlot.end);
-  const expectedDuration = end > start ? end - start : (1440 - start) + end;
-  let elapsed: number;
-  if (end > start) {
-    elapsed = t >= start && t < end ? t - start : 0;
-  } else {
-    if (t >= start) elapsed = t - start;
-    else if (t < end) elapsed = (1440 - start) + t;
-    else elapsed = 0;
-  }
-  return {
-    elapsed,
-    expectedDuration,
-    progress: expectedDuration > 0 ? (elapsed / expectedDuration) * 100 : 0,
-    isLessThan50: (elapsed / expectedDuration) * 100 < 50,
-    isGreaterThan50: (elapsed / expectedDuration) * 100 >= 50,
-  };
-}
-
-// ── V2.1: Calculate Reporter Offset (Period 1 / Period 2) ──────────────────
-// This is the CORE V2.1 function. It determines which Period the report falls
-// in and computes the offset state, value, and Generated ON metadata.
-//
-// Period 1 (<50% of OFF consumed) → POSITIVE
-//   offset = T − prevOnStart
-//   Generated ON duration = prev ON duration
-//   Generated ON replaces the prev ON
-//
-// Period 2 (>50% of OFF consumed) → NEGATIVE
-//   offset = T − nextOnStart
-//   Generated ON duration = next ON duration
-//   Generated ON replaces the next ON
-//
-// During ON → offset = T − currentOnStart
-//   Generated ON replaces the current ON
-//
-// The offset is FINAL at report time — never changes.
-interface ReporterOffsetResult {
-  offsetState: OffsetState;
-  offsetValue: OffsetValue;
-  timelineAlignment: string;
-  referenceKind: 'previous_on' | 'next_on' | 'current_on';
-  referenceSlot: ScheduleSlot | null;
-  generatedOnDurationMin: number;
-  generatedOnReferenceKind: 'completed';
-  period: string;
-  ruleReason: string;
-}
-
-function calculateReporterOffset(
-  schedule: ScheduleSlot[],
-  transitionTimeMin: number,
-): ReporterOffsetResult | { error: string } {
-  // Find what Growatt state the submission falls in
-  const offSlot = findCurrentOffSlot(schedule, transitionTimeMin);
-  const onSlot = findCurrentOnSlot(schedule, transitionTimeMin);
-
-  // Case A: Report during Growatt ON
-  if (onSlot && !offSlot) {
-    const onStart = timeToMin(onSlot.start);
-    const offsetMin = transitionTimeMin - onStart;
-    let offsetState: OffsetState;
-    if (offsetMin > 0) offsetState = 'POSITIVE';
-    else if (offsetMin < 0) offsetState = 'NEGATIVE';
-    else offsetState = 'NEUTRAL';
-
-    return {
-      offsetState,
-      offsetValue: offsetMin,
-      timelineAlignment: minToTime(onStart),
-      referenceKind: 'current_on',
-      referenceSlot: onSlot,
-      generatedOnDurationMin: onSlot.durationMin,
-      generatedOnReferenceKind: 'completed',
-      period: 'During Growatt ON',
-      ruleReason: `Report during Growatt ON. Offset = T − currentOnStart = ${minToTime(transitionTimeMin)} − ${onSlot.start} = ${offsetMin > 0 ? '+' : ''}${offsetMin} min → ${offsetState}. Generated ON replaces the current ON. Duration = ${onSlot.durationMin} min.`,
-    };
-  }
-
-  // Cases B & C: Report during Growatt OFF
-  if (!offSlot) {
-    return { error: 'No active Growatt state (ON or OFF) found at submission time.' };
-  }
-
-  const offProg = calculateOffProgress(offSlot, transitionTimeMin);
-
-  if (offProg.isLessThan50) {
-    // Period 1 → POSITIVE
-    const prevOn = findPreviousGrowattOn(schedule, transitionTimeMin);
-    if (!prevOn) {
-      return { error: 'No previous Growatt ON found for Period 1 reference.' };
-    }
-    const prevOnStart = timeToMin(prevOn.start);
-    const offsetMin = transitionTimeMin - prevOnStart;
-
-    return {
-      offsetState: 'POSITIVE',
-      offsetValue: offsetMin,
-      timelineAlignment: minToTime(prevOnStart),
-      referenceKind: 'previous_on',
-      referenceSlot: prevOn,
-      generatedOnDurationMin: prevOn.durationMin,
-      generatedOnReferenceKind: 'completed',
-      period: 'Period 1 (<50%)',
-      ruleReason: `Period 1 (<50% of OFF consumed). Offset = T − prevOnStart = ${minToTime(transitionTimeMin)} − ${prevOn.start} = +${offsetMin} min → POSITIVE. Generated ON replaces the prev ON (${prevOn.start}→${prevOn.end}). Duration = ${prevOn.durationMin} min. Verification Window: true.`,
-    };
-  } else {
-    // Period 2 → NEGATIVE
-    const nextOn = findNextGrowattOn(schedule, transitionTimeMin);
-    if (!nextOn) {
-      return { error: 'No next Growatt ON found for Period 2 reference.' };
-    }
-    const nextOnStart = timeToMin(nextOn.start);
-    // Handle midnight wrapping
-    const effectiveNextOnStart = nextOnStart < transitionTimeMin ? nextOnStart + 1440 : nextOnStart;
-    const offsetMin = transitionTimeMin - effectiveNextOnStart;
-
-    return {
-      offsetState: 'NEGATIVE',
-      offsetValue: offsetMin,
-      timelineAlignment: minToTime(transitionTimeMin),
-      referenceKind: 'next_on',
-      referenceSlot: nextOn,
-      generatedOnDurationMin: nextOn.durationMin,
-      generatedOnReferenceKind: 'completed',
-      period: 'Period 2 (>50%)',
-      ruleReason: `Period 2 (>50% of OFF consumed). Offset = T − nextOnStart = ${minToTime(transitionTimeMin)} − ${nextOn.start} = ${offsetMin} min → NEGATIVE. Generated ON replaces the next ON (${nextOn.start}→${nextOn.end}). Duration = ${nextOn.durationMin} min. UNCERTAIN_ZONE: true.`,
-    };
-  }
-}
 
 export function useUtilityReports() {
   const { user } = useAuth();
@@ -389,15 +109,9 @@ export function useUtilityReports() {
   /**
    * Submit a utility transition report.
    *
-   * V2.1 FINAL:
-   *   - Always submits 'UTILITY_ON' (OFF reporting removed)
-   *   - Computes Period 1/Period 2 offset at submission time
-   *   - Stores V2.1 fields on the utility_reports row
-   *   - Returns all V2.1 fields in the selfResync ResyncPoint
-   *
    * Returns:
    *   reportId   — database ID of the inserted report
-   *   selfResync — ResyncPoint with V2.1 fields the reporter should apply
+   *   selfResync — ResyncPoint the reporter should apply to their own schedule
    *   error      — error message string, or null on success
    */
   const submitReport = useCallback(async (
@@ -424,219 +138,87 @@ export function useUtilityReports() {
     const offsetMin = TIME_OFFSETS_MIN[timeOption];
     const nowMs = Date.now();
 
-    // estimated_transition_at = the absolute timestamp when electricity came on
+    // estimated_transition_at is the absolute timestamp when the event
+    // actually occurred (now minus the selected time offset)
     const estimatedTransitionAt = new Date(nowMs - offsetMin * 60 * 1000).toISOString();
 
-    // ── V2.1: Fetch the current Growatt schedule to compute Period 1/Period 2 ──
-    // The schedule comes from the predictions table (same source useUserPredictions uses)
-    let schedule: ScheduleSlot[] = [];
-    try {
-      const { data: predData } = await supabase
-        .from('predictions')
-        .select('day_schedule, schedule')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (predData) {
-        // Try day_schedule first, then schedule
-        const rawSchedule = predData.day_schedule || predData.schedule;
-        if (Array.isArray(rawSchedule)) {
-          schedule = rawSchedule.map((s: any) => ({
-            state: s.state,
-            start: s.start || s.startFormatted || s.start_time || '',
-            end: s.end || s.endFormatted || s.end_time || '',
-            durationMin: s.durationMin || s.duration_min || 0,
-          }));
-        }
-      }
-    } catch (e) {
-      console.warn('[useUtilityReports] Failed to fetch schedule for offset calculation:', e);
-    }
-
-    // ── V2.1: Calculate the Period 1/Period 2 offset ──────────────────────────
-    // The transition time in minutes since midnight
-    const transitionDate = new Date(estimatedTransitionAt);
-    const transitionTimeMin = transitionDate.getHours() * 60 + transitionDate.getMinutes();
-
-    let v21Offset: ReporterOffsetResult | { error: string } | null = null;
-    if (schedule.length > 0) {
-      v21Offset = calculateReporterOffset(schedule, transitionTimeMin);
-      if ('error' in v21Offset) {
-        console.warn('[useUtilityReports] Offset calculation error:', v21Offset.error);
-        v21Offset = null;
-      }
-    }
-
-    // V2.1: Extract offset fields (or use defaults if schedule wasn't available)
-    const offsetState: OffsetState = v21Offset && !('error' in v21Offset) ? v21Offset.offsetState : 'NEUTRAL';
-    const offsetValue: OffsetValue = v21Offset && !('error' in v21Offset) ? v21Offset.offsetValue : 0;
-    const timelineAlignment: string = v21Offset && !('error' in v21Offset)
-      ? v21Offset.timelineAlignment
-      : estimatedTransitionAt;
-    const generatedOnDurationMin: number | null = v21Offset && !('error' in v21Offset)
-      ? v21Offset.generatedOnDurationMin
-      : null;
-    const generatedOnReferenceIso: string | null = v21Offset && !('error' in v21Offset) && v21Offset.referenceSlot
-      ? v21Offset.referenceSlot.start
-      : null;
-
-    // ── Insert the report with V2.1 fields ────────────────────────────────────
     const { data, error } = await supabase
       .from('utility_reports')
       .insert({
         reporter_id: user.id,
-        reported_state: reportedState, // V2.1: always 'UTILITY_ON' from the UI
+        reported_state: reportedState,
         time_option: timeOption,
         estimated_transition_at: estimatedTransitionAt,
         is_active: true,
-        // V2.1 fields:
-        reporter_offset_state: offsetState,
-        reporter_offset_value: offsetValue,
-        reporter_timeline_alignment: timelineAlignment,
-        generated_on_start_iso: estimatedTransitionAt,
-        generated_on_duration_min: generatedOnDurationMin,
-        generated_on_reference_iso: generatedOnReferenceIso,
-        generated_on_reference_kind: 'completed',
       })
       .select('id')
       .single();
 
     if (error) {
       setSubmitting(false);
-      // V2.1: If the error is about missing columns, retry without V2.1 fields
-      // (backwards compat with databases that haven't been migrated yet)
-      if (error.message.includes('reporter_offset_state') || error.message.includes('generated_on')) {
-        console.warn('[useUtilityReports] V2.1 columns not found — retrying without them. Please run the DB migration.');
-        const { data: retryData, error: retryError } = await supabase
-          .from('utility_reports')
-          .insert({
-            reporter_id: user.id,
-            reported_state: reportedState,
-            time_option: timeOption,
-            estimated_transition_at: estimatedTransitionAt,
-            is_active: true,
-          })
-          .select('id')
-          .single();
-
-        if (retryError) {
-          setSubmitting(false);
-          return { reportId: null, selfResync: null, error: retryError.message };
-        }
-        // Continue with the retry data
-        const retryReportId = retryData?.id ?? null;
-        return finishSubmission(retryReportId, estimatedTransitionAt, nowMs, offsetState, offsetValue, timelineAlignment, generatedOnDurationMin, generatedOnReferenceIso, reportedState);
-      }
       return { reportId: null, selfResync: null, error: error.message };
     }
 
     const reportId = data?.id ?? null;
-    return finishSubmission(reportId, estimatedTransitionAt, nowMs, offsetState, offsetValue, timelineAlignment, generatedOnDurationMin, generatedOnReferenceIso, reportedState);
 
-    // ── Helper: finish the submission (shared by main and retry paths) ────────
-    async function finishSubmission(
-      reportId: number | null,
-      estimatedTransitionAt: string,
-      nowMs: number,
-      offsetState: OffsetState,
-      offsetValue: OffsetValue,
-      timelineAlignment: string,
-      generatedOnDurationMin: number | null,
-      generatedOnReferenceIso: string | null,
-      reportedState: ReportedState,
-    ): Promise<{ reportId: number | null; selfResync: ResyncPoint | null; error: string | null }> {
-      // Save submission time & start cooldown
-      try { await AsyncStorage.setItem(LAST_REPORT_KEY, String(nowMs)); } catch (_) {}
-      setCooldownRemainingMs(COOLDOWN_MS);
+    // Save submission time & start cooldown
+    try { await AsyncStorage.setItem(LAST_REPORT_KEY, String(nowMs)); } catch (_) {}
+    setCooldownRemainingMs(COOLDOWN_MS);
 
-      // Fetch reporter name and reliability
-      let selfReporterName: string | null = null;
-      let selfReporterReliability: number | null = null;
-      try {
-        const [{ data: profData }, { data: relData }] = await Promise.all([
-          supabase.from('user_profiles').select('username').eq('id', user!.id).maybeSingle(),
-          supabase.from('user_reliability').select('reliability_score').eq('user_id', user!.id).maybeSingle(),
-        ]);
-        selfReporterName = profData?.username ?? null;
-        selfReporterReliability = relData ? Math.round(relData.reliability_score ?? 50) : null;
-      } catch (_) {}
+    // Build the self-resync point:
+    //   syncedState = ON if UTILITY_ON reported, OFF otherwise
+    //   syncedAtIso = estimated_transition_at (when the event actually happened)
+    //   reporterName / reporterReliability — fetch from user_profiles & user_reliability
+    let selfReporterName: string | null = null;
+    let selfReporterReliability: number | null = null;
+    try {
+      const [{ data: profData }, { data: relData }] = await Promise.all([
+        supabase.from('user_profiles').select('username').eq('id', user.id).maybeSingle(),
+        supabase.from('user_reliability').select('reliability_score').eq('user_id', user.id).maybeSingle(),
+      ]);
+      selfReporterName = profData?.username ?? null;
+      selfReporterReliability = relData ? Math.round(relData.reliability_score ?? 50) : null;
+    } catch (_) {}
 
-      // V2.1: Build the self-resync point with all V2.1 fields
-      const selfResync: ResyncPoint = {
-        syncedState: reportedState === 'UTILITY_ON' ? 'ON' : 'OFF',
-        syncedAtIso: estimatedTransitionAt,
-        appliedAtIso: new Date(nowMs).toISOString(),
-        reporterName: selfReporterName ?? 'أنت',
-        reporterReliability: selfReporterReliability,
-        // V2.1 additions:
-        offsetState,
-        offsetValue,
-        timelineAlignment,
-        generatedOnStartIso: estimatedTransitionAt,
-        generatedOnDurationMin,
-        generatedOnReferenceIso,
-        generatedOnReferenceKind: 'completed',
-        confirmationTime: estimatedTransitionAt, // for reporters, same as syncedAtIso
-      };
+    const selfResync: ResyncPoint = {
+      syncedState: reportedState === 'UTILITY_ON' ? 'ON' : 'OFF',
+      syncedAtIso: estimatedTransitionAt,
+      appliedAtIso: new Date(nowMs).toISOString(),
+      reporterName: selfReporterName ?? 'أنت',
+      reporterReliability: selfReporterReliability,
+    };
 
-      // Persist to resync_history with V2.1 fields
-      supabase.from('resync_history').insert({
-        user_id: user!.id,
-        report_id: reportId,
-        reporter_id: user!.id,
-        reporter_username: null,
-        reported_state: reportedState,
-        effective_transition_at: estimatedTransitionAt,
-        confirmed_at: new Date(nowMs).toISOString(),
-        source: 'self_report',
-        // V2.1 fields:
-        offset_state: offsetState,
-        offset_value: offsetValue,
-        timeline_alignment: timelineAlignment,
-        generated_on_start_iso: estimatedTransitionAt,
-        generated_on_duration_min: generatedOnDurationMin,
-        generated_on_reference_iso: generatedOnReferenceIso,
-        generated_on_reference_kind: 'completed',
-      }).then(({ error: histErr }) => {
-        if (histErr) {
-          console.warn('[useUtilityReports] history insert error:', histErr.message);
-          // V2.1: Retry without V2.1 columns if they don't exist yet
-          if (histErr.message.includes('offset_state') || histErr.message.includes('generated_on')) {
-            supabase.from('resync_history').insert({
-              user_id: user!.id,
-              report_id: reportId,
-              reporter_id: user!.id,
-              reporter_username: null,
-              reported_state: reportedState,
-              effective_transition_at: estimatedTransitionAt,
-              confirmed_at: new Date(nowMs).toISOString(),
-              source: 'self_report',
-            }).then(({ error: retryHistErr }) => {
-              if (retryHistErr) console.warn('[useUtilityReports] history retry error:', retryHistErr.message);
-            });
-          }
-        }
-      });
+    // Also persist to resync_history for the reporter themselves
+    supabase.from('resync_history').insert({
+      user_id: user.id,
+      report_id: reportId,
+      reporter_id: user.id,
+      reporter_username: null, // will be resolved by display layer
+      reported_state: reportedState,
+      effective_transition_at: estimatedTransitionAt,
+      confirmed_at: new Date(nowMs).toISOString(),
+      source: 'self_report',
+    }).then(({ error: histErr }) => {
+      if (histErr) console.warn('[useUtilityReports] history insert error:', histErr.message);
+    });
 
-      // Distribute push notifications to followers (non-blocking)
-      supabase.functions.invoke('distribute-resync', {
-        body: {
-          reportId,
-          reporterId: user!.id,
-          reportedState,
-          estimatedTransitionAt,
-          timeOption,
-        },
-      }).catch(e => {
-        console.warn('[useUtilityReports] distribute-resync invoke failed (non-fatal):', e);
-      });
+    // Distribute push notifications to followers (non-blocking)
+    supabase.functions.invoke('distribute-resync', {
+      body: {
+        reportId,
+        reporterId: user.id,
+        reportedState,
+        estimatedTransitionAt,
+        timeOption,
+      },
+    }).catch(e => {
+      console.warn('[useUtilityReports] distribute-resync invoke failed (non-fatal):', e);
+    });
 
-      await fetchMyReports();
-      setSubmitting(false);
+    await fetchMyReports();
+    setSubmitting(false);
 
-      return { reportId, selfResync, error: null };
-    }
+    return { reportId, selfResync, error: null };
   }, [user, fetchMyReports, cooldownRemainingMs]);
 
   const cooldownLabel = cooldownRemainingMs > 0
