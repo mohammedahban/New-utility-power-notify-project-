@@ -936,3 +936,54 @@ export function computeAccuracyLogEvent(
 // The admin dashboard may import these types directly from the engine.
 export type { ScheduleStateMode as ATCMode };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SAFE DEFAULT EXPORT — prevents white-page crash if the admin dashboard
+// imports a function that doesn't exist on the engine object.
+// ═══════════════════════════════════════════════════════════════════════════
+// The admin dashboard's TMMSDebugSimulator does `import * as engine from
+// './tmmsEngine'` then calls `engine.someFunction()`. If any function is
+// missing, it crashes with "TypeError: undefined is not a function" and the
+// entire admin Stack goes white. This default export object includes every
+// function plus safe no-op fallbacks for any that might still be missing.
+// ═══════════════════════════════════════════════════════════════════════════
+const _engine = {
+  // Core function
+  applyOffsetToPrediction,
+
+  // Admin dashboard functions
+  extendScheduleTo48h,
+  applyOffsetToSlots,
+  computeCommunityOffset,
+  computeCommunityTransition,
+  computeATCState: computeATCStateExport,
+  computeATCStateExport,
+  deriveCurrentStateATC,
+  deriveNextTransition: deriveNextTransitionExport,
+  deriveNextTransitionExport,
+  computeReconciledCycleStart,
+  computeAccuracyLogEvent,
+
+  // Safe fallbacks for any other functions the admin dashboard might import.
+  // These return sensible defaults so the dashboard renders without crashing.
+  buildScheduleFromPrediction: (prediction: any): ShiftedScheduleSlot[] => {
+    const raw = prediction?.daySchedule || prediction?.schedule || prediction?.slots || [];
+    return raw.map((s: RawSlot, i: number) => normalizeSlot(s, i));
+  },
+  computeResyncedSlots: (
+    schedule: ShiftedScheduleSlot[],
+    resyncPoint: ResyncPoint | null,
+    offsetMin: number,
+  ): ShiftedScheduleSlot[] => {
+    return applyOffsetToAllSlots(schedule, offsetMin, resyncPoint);
+  },
+  computeOffsetSign: (offsetMin: number): 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' => {
+    if (offsetMin > 0) return 'POSITIVE';
+    if (offsetMin < 0) return 'NEGATIVE';
+    return 'NEUTRAL';
+  },
+  formatTime: fmtYemenTime,
+  formatDuration: fmtDurationLabel,
+  arabicDurationRange,
+};
+
+export default _engine;
