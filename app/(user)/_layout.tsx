@@ -1,30 +1,3 @@
-/**
- * _layout.tsx — User Tab Layout (TMMS V2.1 Wired)
- *
- * V2.1 CHANGES (logic only — no UI changes):
- *   1. Removed the old `calibrate()` call from handleReport.
- *      V2.1's useUtilityReports.ts already computes the Period 1/Period 2
- *      offset at submission time and writes it to user_offsets. Calling the
- *      old calibrate() on top would overwrite the V2.1 offset with the V2
- *      Growatt-event-matching offset — a conflict. The calibrate() function
- *      in useUserOffset.ts is kept for MANUAL DSD calibration from the
- *      settings screen only.
- *
- *   2. The GlobalReportModal still shows ON/OFF buttons (no UI change per
- *      user's request). However, useUtilityReports.ts internally always
- *      computes the V2.1 Period 1/Period 2 offset regardless of which
- *      state is passed. The V2.1 rule is: only ON reports create Generated
- *      ON states. If the user selects OFF, the report is still submitted
- *      but the V2.1 offset calculation in useUtilityReports treats it as
- *      a UTILITY_ON report (since V2.1 is ON-only).
- *
- * Original responsibilities preserved:
- *   - Global FAB for quick reporting
- *   - Tab bar with 4 tabs (Home, Schedule, Community, Settings)
- *   - Reporter profile route (hidden)
- *   - Cooldown timer display
- */
-
 import React, { useState, useCallback } from 'react';
 import { Tabs } from 'expo-router';
 import {
@@ -114,10 +87,10 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
             ))}
           </View>
 
-          {/* V2.1: Updated hint to mention Period 1/Period 2 offset calculation */}
+          {/* Offset calibration hint */}
           <View style={grmStyles.calibHint}>
             <Text style={grmStyles.calibHintText}>
-              💡 سيتم حساب فارقك الزمني تلقائياً (Period 1 / Period 2) عند الإبلاغ عن تشغيل الكهرباء
+              💡 سيُحدَّث فارقك الزمني تلقائياً بناءً على هذا البلاغ
             </Text>
           </View>
 
@@ -180,36 +153,37 @@ export default function UserLayout() {
   const { pendingCount } = useResyncNotifications();
   const { submitting, submitReport, isCoolingDown, cooldownLabel } = useUtilityReports();
   const { applyResync } = useResync();
-  // V2.1: useUserOffset is still used for reading the current offset (for display),
-  // but the calibrate() function is NOT called on report submission anymore.
-  // V2.1's useUtilityReports.ts computes the Period 1/Period 2 offset internally.
-  const { offset } = useUserOffset();
+  const { calibrate } = useUserOffset();
   const [reportModalVisible, setReportModalVisible] = useState(false);
 
-  // V2.1: handleReport — no longer calls calibrate().
-  // The V2.1 Period 1/Period 2 offset is computed inside useUtilityReports.ts
-  // at submission time and stored on the utility_reports row + user_offsets.
-  // The old calibrate() function (which matched against power_events) is kept
-  // in useUserOffset.ts for MANUAL DSD calibration from the settings screen only.
   const handleReport = useCallback(async (state: ReportedState, time: TimeOption) => {
-    // V2.1: useUtilityReports.submitReport() computes the Period 1/Period 2
-    // offset internally and returns it in selfResync.offsetState / offsetValue.
     const { selfResync, error } = await submitReport(state, time);
     setReportModalVisible(false);
     if (error) {
       Alert.alert(AR.error, error);
       return;
     }
-    // Apply the community resync (which now carries V2.1 offset fields)
+    // Auto-apply community resync (existing behaviour)
     if (selfResync) await applyResync(selfResync);
 
-    // V2.1: No calibrate() call — the offset was already computed by
-    // useUtilityReports.ts using Period 1/Period 2 rules.
-    // The old calibrate() from useUserOffset.ts is only for manual DSD
-    // calibration from the settings screen.
+    // Auto-calibrate offset from this report in the background.
+    // We derive the event time by subtracting minutesAgo from now.
+    const opt = TIME_OPTS.find(o => o.key === time);
+    const minutesAgo = opt?.minutesAgo ?? 0;
+    const eventMs = Date.now() - minutesAgo * 60_000;
+    const eventDate = new Date(eventMs + 3 * 60 * 60 * 1000); // shift to Yemen local
+    const eventType = state === 'UTILITY_ON' ? 'UTILITY_ON' : 'UTILITY_OFF';
+    // Fire calibration silently — we pass Yemen local hour/minute directly
+    calibrate(eventType as any, eventDate.getUTCHours(), Math.floor(eventDate.getUTCMinutes() / 5) * 5)
+      .then(({ offsetMinutes, error: calibErr }) => {
+        if (!calibErr) {
+          console.log(`[AutoCalibrate] new offset: ${offsetMinutes} min`);
+        }
+      })
+      .catch(() => {/* silent */});
 
     Alert.alert(AR.reportShared, AR.reportSharedBody);
-  }, [submitReport, applyResync]);
+  }, [submitReport, applyResync, calibrate]);
 
   const fabBottom = insets.bottom + 80;
 
