@@ -303,9 +303,34 @@ function applyOffsetToSlotsInternal(
 }
 
 // ─── ATC STATE MACHINE ───────────────────────────────────────────────────────
+//
+// V2.1 FINAL — Offset Sign Meaning (VERY IMPORTANT):
+//
+//   POSITIVE offset = user turns ON AFTER Growatt
+//     - Growatt turns ON at 10:00, offset +30 → user turns ON at 10:30
+//     - At end of user's predicted OFF → short VERIFICATION WINDOW
+//       (user is confident — Growatt already confirmed)
+//     - If between slots (Growatt ON but user's ON hasn't started) →
+//       POSITIVE_OFFSET_PENDING (holding pre-transition state)
+//
+//   NEGATIVE offset = user turns ON BEFORE Growatt
+//     - Growatt turns ON at 10:00, offset -30 → user turns ON at 9:30
+//     - At end of user's predicted OFF → UNCERTAIN_ZONE
+//       (user is uncertain — doesn't know when Growatt will confirm)
+//     - The ON state uses the predicted ON duration automatically
+//     - Remains in UNCERTAIN_ZONE until Growatt confirms OR community report
+//
+//   NEUTRAL offset = user clones Growatt exactly
+//     - Same start/end times and durations as Growatt
+//     - At end of predicted OFF → short VERIFICATION WINDOW only
+//       (for API/communication delays)
+//
+// AUTO MODE: all of the above apply
+// MANUAL MODE: only community reports and user reports trigger transitions
 
 const PREDICTION_RANGE_MIN = 15;
 const GRACE_MODE_MAX_MIN = 30;
+const VERIFICATION_WINDOW_MIN = 20;
 
 function computeATCMode(
   shiftedSlots: ShiftedScheduleSlot[],
@@ -333,6 +358,8 @@ function computeATCMode(
   }) ?? null;
 
   // ── COMMUNITY_SYNCED ─────────────────────────────────────────────────────
+  // A community resync overrides everything — the user's timeline is
+  // synced to the community report's Generated ON.
   if (resyncPoint) {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
     const durationMin = resyncPoint.generatedOnDurationMin ?? 0;
@@ -357,75 +384,145 @@ function computeATCMode(
     }
   }
 
-  // ── POSITIVE_OFFSET_PENDING ──────────────────────────────────────────────
-  if (offsetMinutes > 0 && !activeSlot) {
-    const nextSlot = shiftedSlots
-      .filter(s => new Date(s.startIso).getTime() > nowMs)
-      .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
+  // ── CASE 1: No active slot — user is between slots ───────────────────────
+  // This happens when the user's shifted schedule has a gap, meaning:
+  //   - POSITIVE offset: Growatt already transitioned, user's next slot
+  //     hasn't started yet → POSITIVE_OFFSET_PENDING
+  //   - NEGATIVE offset: user's predicted OFF ended before Growatt's OFF,
+  //     user is waiting for Growatt to confirm → UNCERTAIN_ZONE
+  if (!activeSlot) {
+    // ── POSITIVE_OFFSET_PENDING ──────────────────────────────────────────
+    // Positive offset = user turns ON AFTER Growatt.
+    // Growatt has already transitioned, but the user's scheduled transition
+    // is still in the future. The user holds their current state until
+    // their scheduled time arrives.
+    if (offsetMinutes > 0) {
+      const nextSlot = shiftedSlots
+        .filter(s => new Date(s.startIso).getTime() > nowMs)
+        .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
 
-    if (nextSlot && nextSlot.state !== growattCurrentState) {
-      return {
-        mode: 'POSITIVE_OFFSET_PENDING',
-        currentState: growattCurrentState === 'ON' ? 'OFF' : 'ON',
-        currentStateStartIso: null,
-        isHoldingState: true,
-        overrunMinutes: 0,
-        communityElevated: false,
-        inValidationWindow: false,
-        validationWindowRemainingMin: 0,
-        scheduledAutoTransitionIso: nextSlot.startIso,
-        statusLine: `تغيير تلقائي مجدول في ${fmtYemenTime(nextSlot.startIso)}`,
-      };
-    }
-  }
-
-  // ── NEGATIVE OFFSET: UNCERTAIN_ZONE ──────────────────────────────────────
-  if (offsetMinutes < 0 && !activeSlot) {
-    const recentlyEnded = shiftedSlots
-      .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
-      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
-
-    if (recentlyEnded) {
-      const slotEndMs = new Date(recentlyEnded.endIso!).getTime();
-      const overrunMin = Math.round((nowMs - slotEndMs) / 60_000);
-      const offsetMs = offsetMinutes * 60_000;
-      const backedStartIso = new Date(slotEndMs + offsetMs).toISOString();
-
-      if (overrunMin <= GRACE_MODE_MAX_MIN) {
+      if (nextSlot && nextSlot.state !== growattCurrentState) {
         return {
-          mode: overrunMin <= 5 ? 'GRACE_MODE' : 'UNCERTAIN_ZONE',
-          currentState: recentlyEnded.state,
-          currentStateStartIso: backedStartIso,
+          mode: 'POSITIVE_OFFSET_PENDING',
+          currentState: growattCurrentState === 'ON' ? 'OFF' : 'ON',
+          currentStateStartIso: null,
           isHoldingState: true,
+          overrunMinutes: 0,
+          communityElevated: false,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: nextSlot.startIso,
+          statusLine: `تغيير تلقائي مجدول في ${fmtYemenTime(nextSlot.startIso)}`,
+        };
+      }
+    }
+
+    // ── NEGATIVE OFFSET: UNCERTAIN_ZONE ──────────────────────────────────
+    // Negative offset = user turns ON BEFORE Growatt.
+    // The user's predicted OFF has ended (shifted earlier by negative offset),
+    // but Growatt hasn't transitioned to ON yet. The user doesn't know
+    // exactly when Growatt will turn ON, so they enter UNCERTAIN_ZONE.
+    // The ON state will use the predicted ON duration automatically.
+    // Remains in UNCERTAIN_ZONE until:
+    //   - Growatt finally transitions to ON, OR
+    //   - A new accepted community ON report arrives
+    if (offsetMinutes < 0) {
+      const recentlyEnded = shiftedSlots
+        .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
+        .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
+
+      if (recentlyEnded) {
+        const slotEndMs = new Date(recentlyEnded.endIso!).getTime();
+        const overrunMin = Math.round((nowMs - slotEndMs) / 60_000);
+        const offsetMs = offsetMinutes * 60_000;
+        const backedStartIso = new Date(slotEndMs + offsetMs).toISOString();
+
+        if (overrunMin <= GRACE_MODE_MAX_MIN) {
+          return {
+            mode: overrunMin <= 5 ? 'GRACE_MODE' : 'UNCERTAIN_ZONE',
+            currentState: recentlyEnded.state,
+            currentStateStartIso: backedStartIso,
+            isHoldingState: true,
+            overrunMinutes: overrunMin,
+            communityElevated: overrunMin >= PREDICTION_RANGE_MIN,
+            inValidationWindow: false,
+            validationWindowRemainingMin: 0,
+            scheduledAutoTransitionIso: null,
+            statusLine: overrunMin <= 5
+              ? `مهلة المزامنة — تجاوزنا الجدول بـ ${overrunMin} دقيقة`
+              : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
+          };
+        }
+        // Overrun > 30 min — escalate to WAITING_FOR_GROWATT
+        return {
+          mode: 'WAITING_FOR_GROWATT',
+          currentState: growattCurrentState,
+          currentStateStartIso: null,
+          isHoldingState: false,
           overrunMinutes: overrunMin,
-          communityElevated: overrunMin >= PREDICTION_RANGE_MIN,
+          communityElevated: true,
           inValidationWindow: false,
           validationWindowRemainingMin: 0,
           scheduledAutoTransitionIso: null,
-          statusLine: overrunMin <= 5
-            ? `مهلة المزامنة — تجاوزنا الجدول بـ ${overrunMin} دقيقة`
-            : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
+          statusLine: `بانتظار تأكيد Growatt — تأخير ${overrunMin} دقيقة`,
         };
       }
-      return {
-        mode: 'WAITING_FOR_GROWATT',
-        currentState: growattCurrentState,
-        currentStateStartIso: null,
-        isHoldingState: false,
-        overrunMinutes: overrunMin,
-        communityElevated: true,
-        inValidationWindow: false,
-        validationWindowRemainingMin: 0,
-        scheduledAutoTransitionIso: null,
-        statusLine: `بانتظار تأكيد Growatt — تأخير ${overrunMin} دقيقة`,
-      };
     }
   }
 
-  // ── PREDICTION_RANGE ─────────────────────────────────────────────────────
+  // ── CASE 2: Active slot exists — check end-of-slot behavior ──────────────
+  // When the user is near the end of their current slot (within the
+  // verification window), the behavior depends on the offset sign:
+  //
+  //   POSITIVE / NEUTRAL offset → VERIFICATION WINDOW (short, confident)
+  //     The user trusts the prediction. Growatt has either already
+  //     transitioned (positive) or will transition at the same time (neutral).
+  //     A short verification window accounts for API/communication delays.
+  //
+  //   NEGATIVE offset → PREDICTION_RANGE (preparing for UNCERTAIN_ZONE)
+  //     The user is about to enter UNCERTAIN_ZONE when the slot ends.
+  //     The prediction range badge warns the user that uncertainty is coming.
   if (activeSlot?.endIso) {
     const endMs = new Date(activeSlot.endIso).getTime();
     const minutesUntilEnd = (endMs - nowMs) / 60_000;
+
+    if (minutesUntilEnd >= 0 && minutesUntilEnd <= VERIFICATION_WINDOW_MIN) {
+      if (offsetMinutes >= 0) {
+        // ── VERIFICATION WINDOW (Positive / Neutral) ─────────────────────
+        // User is confident — Growatt already confirmed (positive) or
+        // will confirm at the same time (neutral). Short window only.
+        return {
+          mode: 'NORMAL', // Still NORMAL mode, but with verification window active
+          currentState: activeSlot.state,
+          currentStateStartIso: activeSlot.startIso,
+          isHoldingState: false,
+          overrunMinutes: 0,
+          communityElevated: false,
+          inValidationWindow: true,
+          validationWindowRemainingMin: Math.round(minutesUntilEnd),
+          scheduledAutoTransitionIso: null,
+          statusLine: `نافذة التحقق — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
+        };
+      } else {
+        // ── PREDICTION_RANGE (Negative — preparing for UNCERTAIN_ZONE) ──
+        // User is about to enter UNCERTAIN_ZONE when this slot ends.
+        // Warn the user that uncertainty is coming.
+        return {
+          mode: 'PREDICTION_RANGE',
+          currentState: activeSlot.state,
+          currentStateStartIso: activeSlot.startIso,
+          isHoldingState: false,
+          overrunMinutes: 0,
+          communityElevated: false,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة (تحذير: قريبة من UNCERTAIN_ZONE)`,
+        };
+      }
+    }
+
+    // ── PREDICTION_RANGE (beyond verification window, within 15 min) ──────
     if (minutesUntilEnd >= 0 && minutesUntilEnd <= PREDICTION_RANGE_MIN) {
       return {
         mode: 'PREDICTION_RANGE',
@@ -434,8 +531,8 @@ function computeATCMode(
         isHoldingState: false,
         overrunMinutes: 0,
         communityElevated: false,
-        inValidationWindow: false,
-        validationWindowRemainingMin: 0,
+        inValidationWindow: offsetMinutes >= 0,
+        validationWindowRemainingMin: offsetMinutes >= 0 ? Math.round(minutesUntilEnd) : 0,
         scheduledAutoTransitionIso: null,
         statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
       };
@@ -443,6 +540,8 @@ function computeATCMode(
   }
 
   // ── NORMAL ───────────────────────────────────────────────────────────────
+  // User is in the middle of a slot, not near the end. Everything is fine.
+  // For neutral offset: this means the user's timeline matches Growatt exactly.
   return {
     mode: 'NORMAL',
     currentState: activeSlot ? activeSlot.state : growattCurrentState,
