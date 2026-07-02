@@ -1,144 +1,126 @@
 /**
- * useUserOffset — TMMS V2.2 Personal Timeline Replacement Model
+ * useUserOffset — manages the user's personal time offset (DSD calibration)
  *
- * Manages the user's personal offset (offset_minutes) in local state and
- * syncs it to Supabase user_offsets.
- *
- * ───────────────────────────────────────────────────────────────────────────
- * TMMS V2.2 NOTES
- * ───────────────────────────────────────────────────────────────────────────
- *
- * V2.2 offset_minutes semantics:
- *   - offset_minutes > 0  → POSITIVE offset (Period 1: during ON or first half of OFF)
- *                           User's Personal Timeline is LATER than Growatt.
- *                           Future ON/OFF shifted forward by offset value.
- *   - offset_minutes < 0  → NEGATIVE offset (Period 2 resolved)
- *                           User's Personal Timeline is EARLIER than Growatt.
- *                           Future ON/OFF shifted backward by offset value.
- *   - offset_minutes === 0 → NEUTRAL (Period 3: exact ON start instant)
- *                            Personal Timeline = exact clone of Growatt.
- *   - PENDING_NEGATIVE state is tracked separately via offset_state
- *     column in user_offsets and via the ResyncPoint.offsetState field.
- *
- * The V2.2 engine (tmmsEngine.ts computeATCMode) treats these offsets as:
- *   POSITIVE → Short Verification Window after Growatt turns ON.
- *              Home Page remains OFF with countdown until scheduled time.
- *   NEGATIVE → UNCERTAIN_ZONE when predicted OFF ends before Growatt ON.
- *              Waiting time is deducted from next ON duration.
- *   NEUTRAL  → No special behavior. Standard verification window applies.
- *
- * Pending DSD flow (unchanged from V2.1):
- *   When a report is submitted, a PendingDSDCandidate is stored in memory.
- *   It is confirmed (offset_minutes updated) on the next Growatt transition,
- *   or cancelled by the user.
- *
- * Original V2 / V2.1 responsibilities preserved:
- *   1. Load offset_minutes from Supabase user_offsets on mount
- *   2. Persist new offsets to Supabase
- *   3. Clear offset (delete row) on demand
- *   4. Manage pending DSD state
+ * Reads from / writes to the `user_offsets` table.
+ * Also manages the pending DSD candidate (a speculative offset awaiting
+ * Growatt confirmation before being committed).
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 
-export interface OffsetRow {
-  id?: number;
-  user_id: string;
+export interface UserOffset {
   offset_minutes: number;
-  created_at?: string;
+  last_event_type: string | null;
+  last_event_at: string | null;
+  updated_at: string;
+  offset_state: string | null;
+  offset_value: string | number | null;
 }
 
 export interface PendingDSDCandidate {
   eventType: 'UTILITY_ON' | 'UTILITY_OFF';
-  tentativeDSD: number;
+  tentativeDSD: number;        // minutes
   createdAtIso: string;
+  reportedAtIso: string;
 }
+
+const PENDING_DSD_KEY = 'pending_dsd_candidate_v2';
 
 export function useUserOffset() {
   const { user } = useAuth();
-  const [offset, setOffset] = useState<OffsetRow | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [offset, setOffset] = useState<UserOffset | null>(null);
+  const [loading, setLoading] = useState(true);
   const [pendingDSD, setPendingDSD] = useState<PendingDSDCandidate | null>(null);
 
-  useEffect(() => {
-    if (!user) { setOffset(null); return; }
-    (async () => {
-      setLoading(true);
-      const { data } = await supabase
+  // Load offset from DB on mount
+  const fetchOffset = useCallback(async () => {
+    if (!user) { setLoading(false); return; }
+    try {
+      const { data, error } = await supabase
         .from('user_offsets')
-        .select('*')
+        .select('offset_minutes, last_event_type, last_event_at, updated_at, offset_state, offset_value')
         .eq('user_id', user.id)
         .maybeSingle();
-      if (data) setOffset(data);
-      setLoading(false);
+
+      if (error) {
+        console.error('[useUserOffset] fetch error:', error.message);
+      } else {
+        setOffset(data ?? { offset_minutes: 0, last_event_type: null, last_event_at: null, updated_at: new Date().toISOString(), offset_state: null, offset_value: null });
+      }
+    } catch (e) {
+      console.error('[useUserOffset] unexpected error:', e);
+    }
+    setLoading(false);
+  }, [user]);
+
+  useEffect(() => { fetchOffset(); }, [fetchOffset]);
+
+  // Load pending DSD from AsyncStorage
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(PENDING_DSD_KEY);
+        if (raw) setPendingDSD(JSON.parse(raw));
+      } catch (_) {}
     })();
+  }, []);
+
+  // Save user offset to DB
+  const saveOffset = useCallback(async (offsetMinutes: number): Promise<boolean> => {
+    if (!user) return false;
+    try {
+      const { error } = await supabase
+        .from('user_offsets')
+        .upsert(
+          {
+            user_id: user.id,
+            offset_minutes: offsetMinutes,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id' },
+        );
+      if (error) {
+        console.error('[useUserOffset] saveOffset error:', error.message);
+        return false;
+      }
+      // Update local state immediately
+      setOffset(prev => prev
+        ? { ...prev, offset_minutes: offsetMinutes, updated_at: new Date().toISOString() }
+        : { offset_minutes: offsetMinutes, last_event_type: null, last_event_at: null, updated_at: new Date().toISOString(), offset_state: null, offset_value: null }
+      );
+      return true;
+    } catch (e) {
+      console.error('[useUserOffset] saveOffset unexpected error:', e);
+      return false;
+    }
   }, [user]);
 
-  /**
-   * V2.2: The offset value is derived from Period 1/2/3 rules at report time.
-   * For Period 1: positive value (T - ReplacedONstart).
-   * For Period 2: stored as PENDING_NEGATIVE state; numeric value resolves
-   *               when Growatt ON begins.
-   * For Period 3: 0 (NEUTRAL).
-   */
-  const updateOffset = useCallback(async (offsetMinutes: number) => {
-    if (!user) return;
-    const upsertData: any = {
-      user_id: user.id,
-      offset_minutes: offsetMinutes,
-      updated_at: new Date().toISOString(),
-    };
-    // V2.2: derive and store offset_state alongside the numeric value
-    const offsetState: string =
-      offsetMinutes > 0 ? 'POSITIVE'
-      : offsetMinutes < 0 ? 'NEGATIVE'
-      : 'NEUTRAL';
-    upsertData.offset_state = offsetState;
-    upsertData.offset_value = offsetMinutes;
+  // Clear pending DSD
+  const clearPendingDSD = useCallback(async () => {
+    setPendingDSD(null);
+    try {
+      await AsyncStorage.removeItem(PENDING_DSD_KEY);
+    } catch (_) {}
+  }, []);
 
-    const { data } = await supabase
-      .from('user_offsets')
-      .upsert(upsertData, { onConflict: 'user_id' })
-      .select()
-      .single();
-    if (data) setOffset(data);
-  }, [user]);
-
-  const clearOffset = useCallback(async () => {
-    if (!user) return;
-    await supabase.from('user_offsets').delete().eq('user_id', user.id);
-    setOffset(null);
-  }, [user]);
-
-  // Pending DSD (unchanged from V2.1)
-  const setPendingDSDCandidate = useCallback((candidate: PendingDSDCandidate) => {
+  // Set pending DSD candidate
+  const setPendingDSDCandidate = useCallback(async (candidate: PendingDSDCandidate) => {
     setPendingDSD(candidate);
+    try {
+      await AsyncStorage.setItem(PENDING_DSD_KEY, JSON.stringify(candidate));
+    } catch (_) {}
   }, []);
-
-  const clearPendingDSD = useCallback(() => {
-    setPendingDSD(null);
-  }, []);
-
-  const confirmPendingDSD = useCallback(async () => {
-    if (!pendingDSD) return;
-    await updateOffset(pendingDSD.tentativeDSD);
-    setPendingDSD(null);
-  }, [pendingDSD, updateOffset]);
-
-  // V2.2: saveOffset is an alias for updateOffset — used by index.tsx
-  const saveOffset = updateOffset;
 
   return {
     offset,
-    updateOffset,
-    saveOffset,
-    clearOffset,
     loading,
     pendingDSD,
-    setPendingDSD: setPendingDSDCandidate,
     clearPendingDSD,
-    confirmPendingDSD,
+    setPendingDSDCandidate,
+    saveOffset,
+    refresh: fetchOffset,
   };
 }
