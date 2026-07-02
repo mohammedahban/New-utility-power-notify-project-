@@ -1,727 +1,431 @@
-import React, { useState, useRef, useEffect } from 'react';
-import {
-  View, Text, ScrollView, StyleSheet, ActivityIndicator, Animated,
-} from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useUserOffset } from '../../hooks/useUserOffset';
-import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
-import { useResyncNotifications } from '../../hooks/useResyncNotifications';
+import React, { useState, useCallback } from 'react';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ScrollView } from 'react-native';
+import { useAuth } from '../../contexts/AuthContext';
+import { useUserPredictions, UserPrediction, ShiftedScheduleSlot } from '../../hooks/useUserPredictions';
 import { useResync } from '../../contexts/ResyncContext';
+import { useUserOffset } from '../../hooks/useUserOffset';
+import { useTransitionMode } from '../../hooks/useTransitionMode';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
-import { supabase } from '../../lib/supabase';
-import { AR } from '../../constants/arabic';
+import { fmtYemenTime, durationLabelFromMin } from '../../app/(admin)/tmmsEngine';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 const T = {
-  bg: '#0a0f1e', surface: '#0f172a', elevated: '#1e293b',
-  border: '#334155', accent: '#38bdf8',
-  textPrimary: '#f1f5f9', textSecondary: '#94a3b8', textMuted: '#64748b',
+  bg: '#060d1a', surface: '#0d1526', elevated: '#162035',
+  border: '#1e2d45', primary: '#3b82f6', accent: '#38bdf8',
+  textPrimary: '#f1f5f9', textSecondary: '#94a3b8', textMuted: '#4a5e7a',
   success: '#22c55e', warning: '#f59e0b', danger: '#ef4444',
 };
 
-function parseFormattedTime(label: string): number | null {
-  try {
-    const now = new Date();
-    const base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const m24 = label.match(/(\d{1,2}):(\d{2})/);
-    if (m24) {
-      base.setHours(parseInt(m24[1], 10), parseInt(m24[2], 10), 0, 0);
-      return base.getTime();
-    }
-    return null;
-  } catch { return null; }
+function formatTimeRangeYemen(start: string, end: string | null): string {
+  if (!end) return fmtYemenTime(start);
+  return `${fmtYemenTime(start)} — ${fmtYemenTime(end)}`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Schedule Block
-// ─────────────────────────────────────────────────────────────────────────────
-function ScheduleBlock({ slot, index, resyncEvents, isActive, atcMode, isHolding, stableStartFormatted, stableEndFormatted, isPendingNegative }: {
+function toYemenIsoHour(iso: string): number {
+  return parseInt(
+    new Date(iso).toLocaleString('en-US', {
+      timeZone: 'Asia/Aden', hour: 'numeric', hour12: false,
+    }),
+    10,
+  );
+}
+
+function formatTotalDuration(totalMin: number): string {
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h === 0) return `${m} دقيقة`;
+  if (m === 0) return `${h} ${h === 1 ? 'ساعة' : 'ساعات'}`;
+  return `${h}س ${m}د`;
+}
+
+/**
+ * ─── Schedule Card ───
+ *
+ * TMMS V2.2 additions:
+ *   - If the slot is a "Generated ON" (the permanent timeline event created
+ *     when an ON report is accepted), renders a "⚡ مُولّدة" badge.
+ *   - If the slot is a future ON whose start time is "Estimated (Pending
+ *     Offset)" because the user's offset is PENDING_NEGATIVE, renders a
+ *     "تقديري (فارق معلّق)" badge.
+ *   - Both badges are already set on the ShiftedScheduleSlot by
+ *     useUserPredictions.ts in V2.2.
+ */
+function ScheduleCard({ slot, index, isCurrent, showShifted }: {
   slot: ShiftedScheduleSlot;
   index: number;
-  resyncEvents: any[];
-  isActive?: boolean;
-  atcMode?: ScheduleStateMode;
-  isHolding?: boolean;
-  stableStartFormatted?: string;
-  stableEndFormatted?: string;
-  // V2.1: passed down so future ON slots can be marked "Estimated (Pending Offset)"
-  // when the user's Offset State is PendingNegative (PDF §"Pending Negative").
-  isPendingNegative?: boolean;
+  isCurrent: boolean;
+  showShifted: boolean;
 }) {
   const isOn = slot.state === 'ON';
-  const color = isOn ? T.success : T.danger;
-  const startTime = stableStartFormatted ?? slot.shiftedStartFormatted ?? slot.startFormatted;
-  const endTime = stableEndFormatted ?? slot.shiftedEndFormatted ?? slot.endFormatted;
-  const zoneAr = (AR as any)[slot.zone] ?? slot.zone;
-
-  // V2.1: read the slot-level V2.1 flags (set by useUserPredictions).
-  // - isGeneratedOn: this slot is a Generated ON event (a permanent timeline
-  //   event created from a community ON report). Renders a green "⚡ مُولّدة" badge.
-  // - isEstimatedPendingOffset: this is a FUTURE ON slot whose precise start
-  //   time is unknown because the user's offset is PendingNegative.
-  //   Renders an amber "تقديري معلَّق" badge.
-  const isGeneratedOn = (slot as any).isGeneratedOn === true;
-  const isEstimatedPendingOffset = (slot as any).isEstimatedPendingOffset === true;
-
-  const slotStartMs = startTime ? parseFormattedTime(startTime) : null;
-  const slotEndMs = endTime ? parseFormattedTime(endTime) : null;
-
-  const resyncMatch = resyncEvents.find(ev => {
-    if (slotStartMs === null) return false;
-    const evMs = new Date(ev.effective_transition_at).getTime();
-    const windowStart = slotStartMs - 15 * 60 * 1000;
-    const windowEnd = slotEndMs ? slotEndMs + 15 * 60 * 1000 : slotStartMs + 60 * 60 * 1000;
-    return evMs >= windowStart && evMs <= windowEnd;
-  });
-
-  return (
-    <View style={[sbStyles.row, index === 0 && sbStyles.firstRow]}>
-      <View style={[sbStyles.block,
-        { borderRightColor: color, borderRightWidth: 3 },
-        resyncMatch ? sbStyles.resyncBlock : undefined,
-        isActive ? [sbStyles.activeBlock, { borderColor: color }] : undefined,
-      ]}>
-        <View style={sbStyles.blockHeader}>
-          {resyncMatch && (
-            <View style={sbStyles.resyncBadge}>
-              <Text style={sbStyles.resyncBadgeText}>👥 مزامنة مجتمعية</Text>
-            </View>
-          )}
-          {isActive && isHolding && atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && (() => {
-            const atcCfg: Record<string, { label: string; bg: string; border: string; color: string }> = {
-              UNCERTAIN_ZONE:        { label: '⚠ بانتظار تأكيد', bg: '#1a0e00', border: '#f59e0b66', color: '#f59e0b' },
-              WAITING_FOR_GROWATT:   { label: '⏳ بانتظار Growatt', bg: '#001020', border: '#38bdf866', color: '#38bdf8' },
-              PREDICTION_RANGE:      { label: '🔮 نطاق التوقع نشط', bg: '#001020', border: '#38bdf844', color: '#38bdf8' },
-              GRACE_MODE:            { label: '⏳ تأخر غير معتاد — مهلة المزامنة', bg: '#1a0e00', border: '#f9731666', color: '#f97316' },
-              POSITIVE_OFFSET_PENDING: { label: '⏰ تغيير تلقائي مجدول', bg: '#001a2e', border: '#38bdf866', color: '#38bdf8' },
-            };
-            const cfg = atcCfg[atcMode];
-            if (!cfg) return null;
-            return (
-              <View style={[sbStyles.atcBadge, { backgroundColor: cfg.bg, borderColor: cfg.border }]}>
-                <Text style={[sbStyles.atcBadgeText, { color: cfg.color }]}>{cfg.label}</Text>
-              </View>
-            );
-          })()}
-          <View style={[sbStyles.zoneBadge, { backgroundColor: isOn ? T.success + '18' : T.danger + '18' }]}>
-            <Text style={[sbStyles.zoneText, { color }]}>{zoneAr}</Text>
-          </View>
-          {slot.isEstimated && (
-            <View style={sbStyles.estBadge}><Text style={sbStyles.estText}>{AR.estBadge}</Text></View>
-          )}
-          {/* V2.1: Generated ON badge — permanently marks slots that were
-              created as a Generated ON event. PDF §"GENERATED ON IS A REAL
-              TIMELINE EVENT": "Never delete Generated ON later. Never replace
-              it. Never hide it." The badge makes this visible in the schedule. */}
-          {isGeneratedOn && (
-            <View style={sbStyles.genOnBadge}>
-              <Text style={sbStyles.genOnBadgeText}>⚡ مُولّدة</Text>
-            </View>
-          )}
-          {/* V2.1: Estimated (Pending Offset) badge — marks future ON slots
-              whose precise start time is unknown because the user's offset
-              is PendingNegative. PDF §"Pending Negative": "Future ON
-              predictions must be displayed as: Estimated (Pending Offset)". */}
-          {isEstimatedPendingOffset && (
-            <View style={sbStyles.pendingOffsetBadge}>
-              <Text style={sbStyles.pendingOffsetBadgeText}>تقديري معلَّق</Text>
-            </View>
-          )}
-          {isActive && (
-            <View style={[sbStyles.nowBadge, { backgroundColor: color + '22', borderColor: color + '88' }]}>
-              <Text style={[sbStyles.nowBadgeText, { color }]}>{AR.nowBadge}</Text>
-            </View>
-          )}
-          <Text style={[sbStyles.state, { color }]}>{isOn ? AR.gridOn : AR.gridOff}</Text>
-        </View>
-
-        {/* V2.1: Generated ON info panel — only for Generated ON slots.
-            Shows that this slot is a permanent timeline event created from
-            a community ON report. Mirrors the HistoryCard's genOnRow. */}
-        {isGeneratedOn && (
-          <View style={sbStyles.genOnInfo}>
-            <Text style={sbStyles.genOnInfoText}>
-              ⚡ حدث تشغيل مُولّدة — دائم في الخطّ الزمني، لا يُحذف ولا يُستبدل.
-            </Text>
-          </View>
-        )}
-
-        <View style={sbStyles.timeRow}>
-          {!endTime && <Text style={sbStyles.ongoing}>{AR.ongoing}</Text>}
-          {endTime && (
-            <>
-              <Text style={sbStyles.endTime}>{endTime}</Text>
-              <Text style={sbStyles.arrow}>←</Text>
-            </>
-          )}
-          <Text style={sbStyles.startTime}>{startTime}</Text>
-        </View>
-
-        {slot.durationLabel && (
-          <Text style={[sbStyles.duration, { color: color + 'cc' }]}>{slot.durationLabel}</Text>
-        )}
-
-        {resyncMatch && (
-          <View style={sbStyles.resyncInfo}>
-            <Text style={sbStyles.resyncInfoText}>
-              👥 تم الضبط عبر بلاغ مجتمعي من{' '}
-              <Text style={{ fontWeight: '700' }}>{resyncMatch.reporter_username ?? 'جار'}</Text>
-              {' '}في{' '}
-              {new Date(resyncMatch.effective_transition_at).toLocaleString('ar-SA', {
-                timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit',
-              })}
-            </Text>
-          </View>
-        )}
-      </View>
-
-      <View style={sbStyles.timeline}>
-        <View style={[sbStyles.line, { backgroundColor: isOn ? T.success + '33' : T.danger + '33' }]} />
-        <View style={[sbStyles.dot, { backgroundColor: color }]} />
-      </View>
-    </View>
+  const bg = isOn ? '#052e16' : '#2d0a0a';
+  const border = isOn ? '#15803d66' : '#7f1d1d66';
+  const durationColor = isOn ? T.success : T.danger;
+  const durationLabel = slot.durationLabel ?? durationLabelFromMin(
+    Math.round((new Date(slot.endIso ?? slot.startIso).getTime() - new Date(slot.startIso).getTime()) / 60000),
   );
-}
 
-const sbStyles = StyleSheet.create({
-  row: { flexDirection: 'row-reverse', gap: 12, marginBottom: 4 },
-  firstRow: {},
-  timeline: { width: 20, alignItems: 'center' },
-  dot: { width: 12, height: 12, borderRadius: 6, marginTop: 14, zIndex: 1 },
-  line: { flex: 1, width: 2, marginTop: 2 },
-  block: { flex: 1, backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 8 },
-  blockHeader: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' },
-  state: { fontSize: 16, fontWeight: '800', flex: 1, textAlign: 'right' },
-  estBadge: { backgroundColor: T.elevated, borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3 },
-  estText: { color: T.textMuted, fontSize: 9, fontStyle: 'italic' },
-  zoneBadge: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 },
-  zoneText: { fontSize: 10, fontWeight: '600' },
-  timeRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 4 },
-  startTime: { color: T.textPrimary, fontSize: 15, fontWeight: '700' },
-  arrow: { color: T.textMuted, fontSize: 13 },
-  endTime: { color: T.textSecondary, fontSize: 15, fontWeight: '600' },
-  ongoing: { color: T.textMuted, fontSize: 13 },
-  duration: { fontSize: 12, fontWeight: '600', textAlign: 'right' },
-  activeBlock: { borderWidth: 1.5, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 6, elevation: 4 },
-  nowBadge: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
-  nowBadgeText: { fontSize: 9, fontWeight: '800', letterSpacing: 1.5 },
-  resyncBlock: { borderColor: '#1e3a5a', backgroundColor: '#0a1929' },
-  resyncBadge: { backgroundColor: '#001a2e', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3, borderWidth: 1, borderColor: '#38bdf844' },
-  resyncBadgeText: { color: '#38bdf8', fontSize: 9, fontWeight: '700' },
-  resyncInfo: { marginTop: 8, backgroundColor: '#001a2e', borderRadius: 8, padding: 8, borderWidth: 1, borderColor: '#38bdf822' },
-  resyncInfoText: { color: '#38bdf8', fontSize: 11, lineHeight: 16, textAlign: 'right' },
-  atcBadge: { borderRadius: 8, paddingHorizontal: 9, paddingVertical: 4, borderWidth: 1, marginTop: 2 },
-  atcBadgeText: { fontSize: 10, fontWeight: '700' },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POWER EVENTS HISTORY — with duration badges
-// Shows past real power transition events from power_events table.
-// The "مدة" badge on each event shows how long the PREVIOUS state lasted
-// (= time from this event back to the one before it).
-// ─────────────────────────────────────────────────────────────────────────────
-interface PowerEvent {
-  id: number;
-  event_type: 'UTILITY_ON' | 'UTILITY_OFF';
-  occurred_at: string;
-  durationLabel?: string;
-}
-
-function usePowerEventsHistory(limit = 20) {
-  const [events, setEvents] = useState<PowerEvent[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    supabase
-      .from('power_events')
-      .select('id, event_type, occurred_at')
-      .order('occurred_at', { ascending: false })
-      .limit(limit + 1)
-      .then(({ data }) => {
-        if (cancelled || !data) return;
-        const withDuration: PowerEvent[] = data.slice(0, limit).map((ev: any, i: number) => {
-          // data is sorted newest-first.
-          // data[i-1] is the event that occurred AFTER ev (more recent),
-          // meaning it marks when THIS state ended — so the duration is:
-          //   data[i-1].occurred_at − ev.occurred_at
-          // This shows "how long did THIS state last" on the badge.
-          const endEv = data[i - 1];
-          let durationLabel: string | undefined;
-          if (endEv) {
-            const endMs  = new Date(endEv.occurred_at).getTime();
-            const startMs = new Date(ev.occurred_at).getTime();
-            const durMin = Math.round(Math.abs(endMs - startMs) / 60_000);
-            const h = Math.floor(durMin / 60);
-            const m = durMin % 60;
-            if (h === 0) durationLabel = `${m} دقيقة`;
-            else if (m === 0) durationLabel = h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h} ساعات`;
-            else durationLabel = `${h}س ${m}د`;
-          }
-          return { ...ev, durationLabel };
-        });
-        setEvents(withDuration);
-        setLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [limit]);
-
-  return { events, loading };
-}
-
-function fmtEventTime(iso: string): string {
-  return new Date(iso).toLocaleString('en-US', {
-    timeZone: 'Asia/Aden',
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  }).replace('AM', ' ص').replace('PM', ' م');
-}
-
-function EventsHistorySection() {
-  const { events, loading } = usePowerEventsHistory(20);
+  // V2.2: Determine which time to display.
+  const displayStart = showShifted
+    ? (slot as any).shiftedStartFormatted ?? fmtYemenTime(slot.startIso)
+    : fmtYemenTime(slot.startIso);
+  const displayEnd = slot.endIso
+    ? (showShifted
+        ? (slot as any).shiftedEndFormatted ?? fmtYemenTime(slot.endIso)
+        : fmtYemenTime(slot.endIso))
+    : null;
 
   return (
-    <View style={ehStyles.container}>
-      <Text style={ehStyles.sectionTitle}>📋 سجل الأحداث الفعلية</Text>
-      <Text style={ehStyles.sectionSub}>الأحداث الحقيقية المسجَّلة من الحساس الرئيسي</Text>
-
-      {loading ? (
-        <ActivityIndicator color={T.accent} size="small" style={{ marginVertical: 16 }} />
-      ) : events.length === 0 ? (
-        <Text style={ehStyles.emptyText}>لا توجد أحداث مسجَّلة بعد</Text>
-      ) : (
-        events.map((ev, i) => {
-          const isOn = ev.event_type === 'UTILITY_ON';
-          const color = isOn ? T.success : T.danger;
-          const icon  = isOn ? '⚡' : '🔴';
-          const label = isOn ? 'اشتغلت الكهرباء' : 'طفت الكهرباء';
-          return (
-            <View key={ev.id} style={[ehStyles.row, i < events.length - 1 && ehStyles.rowBorder]}>
-              {/* Duration badge */}
-              <View style={ehStyles.badgeCol}>
-                {ev.durationLabel ? (
-                  <View style={[ehStyles.durBadge, { borderColor: color + '44', backgroundColor: color + '10' }]}>
-                    <Text style={[ehStyles.durBadgeText, { color }]}>{ev.durationLabel}</Text>
-                    <Text style={ehStyles.durBadgeSub}>مدة</Text>
-                  </View>
-                ) : (
-                  <View style={[ehStyles.durBadge, { borderColor: T.border, backgroundColor: T.elevated }]}>
-                    <Text style={[ehStyles.durBadgeText, { color: T.textMuted }]}>—</Text>
-                  </View>
-                )}
-              </View>
-
-              {/* Event info */}
-              <View style={ehStyles.details}>
-                <Text style={[ehStyles.eventLabel, { color }]}>{icon} {label}</Text>
-                <Text style={ehStyles.eventTime}>{fmtEventTime(ev.occurred_at)}</Text>
-              </View>
-
-              {/* Color stripe */}
-              <View style={[ehStyles.colorBar, { backgroundColor: color }]} />
+    <View style={[scStyles.card, {
+      backgroundColor: bg, borderColor: border,
+      opacity: isCurrent ? 1 : 0.6,
+      transform: [{ scale: isCurrent ? 1 : 0.97 }],
+    }]}>
+      <View style={scStyles.header}>
+        <View style={{ flexDirection: 'row-reverse', alignItems: 'center', gap: 6 }}>
+          <Text style={[scStyles.state, { color: durationColor }]}>
+            {isOn ? '⚡ تشغيل' : '🔴 انطفاء'}
+          </Text>
+          {/* V2.2: Generated ON badge */}
+          {slot.isGeneratedOn && (
+            <View style={[scStyles.badge, { borderColor: T.success + '55', backgroundColor: T.success + '15' }]}>
+              <Text style={[scStyles.badgeText, { color: T.success }]}>⚡ مُولّدة</Text>
             </View>
-          );
-        })
+          )}
+          {/* V2.2: Estimated (Pending Offset) badge */}
+          {slot.isEstimatedPendingOffset && (
+            <View style={[scStyles.badge, { borderColor: T.warning + '55', backgroundColor: T.warning + '15' }]}>
+              <Text style={[scStyles.badgeText, { color: T.warning }]}>⏳ تقديري (فارق معلّق)</Text>
+            </View>
+          )}
+        </View>
+        <Text style={[scStyles.order, { color: T.textMuted }]}>
+          #{index + 1} · {slot.zone === 'DAY' ? '☀️ نهار' : '🌙 ليل'}
+        </Text>
+      </View>
+      <Text style={scStyles.times}>
+        {displayStart} — {displayEnd ?? 'مستمر'}
+      </Text>
+      <Text style={[scStyles.duration, { color: durationColor }]}>
+        المدة: {durationLabel}
+      </Text>
+      {isCurrent && (
+        <View style={scStyles.currentBadge}>
+          <Text style={scStyles.currentBadgeText}>الحالة الحالية</Text>
+        </View>
       )}
     </View>
   );
 }
 
-const ehStyles = StyleSheet.create({
-  container: {
-    backgroundColor: T.surface, borderRadius: 20, padding: 18,
-    marginTop: 8, marginBottom: 16, borderWidth: 1, borderColor: T.border,
-  },
-  sectionTitle: { color: T.textPrimary, fontSize: 14, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  sectionSub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginBottom: 16, letterSpacing: 0.3 },
-  emptyText: { color: T.textMuted, fontSize: 12, textAlign: 'center', paddingVertical: 16 },
-  row: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, paddingVertical: 12 },
-  rowBorder: { borderBottomWidth: 1, borderBottomColor: T.elevated },
-  colorBar: { width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 36, flexShrink: 0 },
-  details: { flex: 1 },
-  eventLabel: { fontSize: 14, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  eventTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
-  badgeCol: { alignItems: 'center', width: 64, flexShrink: 0 },
-  durBadge: { borderRadius: 10, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, alignItems: 'center', minWidth: 58 },
-  durBadgeText: { fontSize: 13, fontWeight: '800', textAlign: 'center' },
-  durBadgeSub: { color: T.textMuted, fontSize: 8, fontWeight: '600', marginTop: 2, letterSpacing: 1 },
+const scStyles = StyleSheet.create({
+  card: { borderRadius: 14, padding: 14, marginBottom: 8, borderWidth: 1 },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  state: { fontSize: 16, fontWeight: '800' },
+  order: { fontSize: 10, fontWeight: '600' },
+  times: { color: T.textPrimary, fontSize: 13, fontWeight: '700', marginBottom: 4, textAlign: 'right' },
+  duration: { fontSize: 11, fontWeight: '600' },
+  badge: { borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1 },
+  badgeText: { fontSize: 9, fontWeight: '700' },
+  currentBadge: { backgroundColor: T.accent + '22', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6, alignSelf: 'flex-start', borderWidth: 1, borderColor: T.accent + '44' },
+  currentBadgeText: { color: T.accent, fontSize: 10, fontWeight: '700' },
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DSD Chip — V2.1 upgraded
-// ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.1: the DSD chip now also surfaces the Offset STATE (Positive /
-// Negative / Neutral / PendingNegative), not just the numeric value. When
-// the state is PendingNegative, the numeric value displays as "معلَّق"
-// (pending) and the pulse animation runs — matching the visual language of
-// the existing pendingDSD indicator.
-function DSDChip({ offsetMinutes, isPending, offsetState }: {
-  offsetMinutes: number;
-  isPending: boolean;
-  offsetState?: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE' | null;
-}) {
-  // V2.1: derive display color from the Offset State when available, falling
-  // back to the legacy sign-based color logic for backwards compatibility.
-  const stateColor = offsetState === 'PENDING_NEGATIVE'
-    ? T.warning
-    : offsetState === 'POSITIVE'
-      ? T.success
-      : offsetState === 'NEGATIVE'
-        ? T.warning
-        : offsetState === 'NEUTRAL'
-          ? T.textMuted
-          : (offsetMinutes < 0 ? '#f97316' : offsetMinutes > 0 ? '#22c55e' : '#94a3b8');
+// ─── Summary ───
+function Summary({ prediction }: { prediction: UserPrediction | null }) {
+  const slots = prediction?.daySchedule ?? [];
+  const totalOnMin = slots
+    .filter(s => s.state === 'ON' && s.endIso)
+    .reduce((sum, s) => sum + (new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60000, 0);
+  const totalOffMin = slots
+    .filter(s => s.state === 'OFF' && s.endIso)
+    .reduce((sum, s) => sum + (new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60000, 0);
+  const totalMin = totalOnMin + totalOffMin;
+  const onPct = totalMin > 0 ? Math.round((totalOnMin / totalMin) * 100) : 0;
+  const cycleCount = slots.filter(s => s.state === 'ON').length;
 
-  // V2.1: when PendingNegative, show "معلَّق" instead of a number.
-  const label = (offsetState === 'PENDING_NEGATIVE' || isPending)
-    ? 'معلَّق'
-    : `${offsetMinutes > 0 ? '+' : ''}${offsetMinutes}د`;
-
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    if (!isPending && offsetState !== 'PENDING_NEGATIVE') { pulseAnim.setValue(1); return; }
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 0.25, duration: 700, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
-      ]),
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [isPending, offsetState]);
-
-  // V2.1: short state label under the value
-  const stateLabel = offsetState === 'POSITIVE'
-    ? 'إيجابي'
-    : offsetState === 'NEGATIVE'
-      ? 'سلبي'
-      : offsetState === 'NEUTRAL'
-        ? 'محايد'
-        : offsetState === 'PENDING_NEGATIVE'
-          ? 'معلَّق'
-          : 'الفارق';
+  // V2.2: show if there's a Generated ON
+  const generatedOnCount = slots.filter(s => s.isGeneratedOn).length;
 
   return (
-    <View style={[dsdStyles.wrap, { borderColor: stateColor + '44', backgroundColor: stateColor + '12' }]}>
-      {(isPending || offsetState === 'PENDING_NEGATIVE') && (
-        <Animated.View style={[dsdStyles.pendingDot, { opacity: pulseAnim, backgroundColor: stateColor }]} />
+    <View style={sumStyles.wrap}>
+      <View style={sumStyles.row}>
+        <View style={sumStyles.cell}>
+          <Text style={[sumStyles.val, { color: T.success }]}>{formatTotalDuration(totalOnMin)}</Text>
+          <Text style={sumStyles.label}>إجمالي التشغيل</Text>
+        </View>
+        <View style={sumStyles.cell}>
+          <Text style={[sumStyles.val, { color: T.danger }]}>{formatTotalDuration(totalOffMin)}</Text>
+          <Text style={sumStyles.label}>إجمالي الانطفاء</Text>
+        </View>
+        <View style={sumStyles.cell}>
+          <Text style={sumStyles.val}>{onPct}%</Text>
+          <Text style={sumStyles.label}>نسبة التشغيل</Text>
+        </View>
+        <View style={sumStyles.cell}>
+          <Text style={sumStyles.val}>{cycleCount}</Text>
+          <Text style={sumStyles.label}>عدد الدورات</Text>
+        </View>
+      </View>
+      {/* V2.2: Generated ON summary */}
+      {generatedOnCount > 0 && (
+        <View style={sumStyles.genOnRow}>
+          <View style={[sumStyles.genOnBadge, { borderColor: T.success + '44', backgroundColor: T.success + '10' }]}>
+            <Text style={[sumStyles.genOnText, { color: T.success }]}>
+              ⚡ حالات مُولّدة: {generatedOnCount} — هذه أحداث دائمة في خطّك الزمني
+            </Text>
+          </View>
+        </View>
       )}
-      <Text style={[dsdStyles.value, { color: stateColor }]}>{label}</Text>
-      <Text style={dsdStyles.label}>{stateLabel}</Text>
     </View>
   );
 }
 
-const dsdStyles = StyleSheet.create({
-  wrap: { flex: 1, alignItems: 'center', borderRadius: 10, paddingVertical: 8, paddingHorizontal: 4, borderWidth: 1, gap: 2 },
-  value: { fontSize: 15, fontWeight: '800' },
-  label: { color: '#64748b', fontSize: 8, fontWeight: '700', letterSpacing: 1, marginTop: 2 },
-  pendingDot: { width: 6, height: 6, borderRadius: 3, position: 'absolute', top: 5, left: 6 },
+const sumStyles = StyleSheet.create({
+  wrap: { backgroundColor: T.surface, borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: T.border },
+  row: { flexDirection: 'row-reverse', justifyContent: 'space-around' },
+  cell: { alignItems: 'center', flex: 1 },
+  val: { color: T.textPrimary, fontSize: 16, fontWeight: '800', marginBottom: 2 },
+  label: { color: T.textMuted, fontSize: 9, fontWeight: '600' },
+  genOnRow: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: T.border },
+  genOnBadge: { borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6, borderWidth: 1 },
+  genOnText: { fontSize: 10, fontWeight: '700', textAlign: 'right' },
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN SCREEN
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Main Screen ───
 export default function ScheduleScreen() {
-  const insets = useSafeAreaInsets();
-  const { offset, pendingDSD } = useUserOffset();
-  const { resyncPoint } = useResync();
+  const { offset } = useUserOffset();
   const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode, anchor?.startIso ?? null);
-  const { history: resyncHistory } = useResyncNotifications();
+  const { resyncPoint } = useResync();
   const { anchor } = useStateAnchor();
+  const { userPrediction } = useUserPredictions(
+    offset?.offset_minutes ?? 0,
+    resyncPoint,
+    transitionMode,
+    anchor?.startIso ?? null,
+  );
+  const { user } = useAuth();
 
-  const stableStartMapRef   = useRef<Record<string, string>>({});
-  const stableEndMapRef     = useRef<Record<string, string>>({});
-  const lastOffsetRef       = useRef<number | null>(null);
-  const lastResyncRef       = useRef<string | null>(null);
+  const [view, setView] = useState<'timeline' | 'analysis'>('timeline');
+  const [showShifted, setShowShifted] = useState(true);
 
-  const currentOffset   = offset?.offset_minutes ?? 0;
-  const offsetMs = currentOffset * 60_000;
-  const atcMode = userPrediction?.atc?.mode;
-  const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
-
-  // For POSITIVE_OFFSET_PENDING: use currentStateStartIso as the actual start
-  // For others: use anchor + offset or resync
-  const mathematicalActiveStartIso = (() => {
-    if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
-      return userPrediction.resyncedAtIso;
-    }
-    if (isPositiveOffsetPending) {
-      return userPrediction?.currentStateStartIso ?? null;
-    }
-    if (anchor && userPrediction && anchor.state === userPrediction.currentState) {
-      return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
-    }
-    return userPrediction?.currentStateStartIso ?? null;
-  })();
-
-  const currentResyncIso = resyncPoint?.syncedAtIso ?? null;
-
-  if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
-    stableStartMapRef.current = {};
-    stableEndMapRef.current   = {};
-  }
-  lastOffsetRef.current = currentOffset;
-
-  const resyncChanged = lastResyncRef.current !== currentResyncIso;
-  if (resyncChanged) {
-    stableStartMapRef.current = {};
-    stableEndMapRef.current   = {};
-    lastResyncRef.current     = currentResyncIso;
-  }
-
-  const allSlots = userPrediction?.daySchedule ?? [];
+  const slots = (userPrediction?.daySchedule ?? []) as ShiftedScheduleSlot[];
   const nowMs = Date.now();
 
-  // For POSITIVE_OFFSET_PENDING: the synthetic slot (at index 0) is the active slot
-  const activeIdx = (() => {
-    if (isPositiveOffsetPending && allSlots.length > 0) return 0;
-    return allSlots.findIndex(s => {
-      const start = new Date(s.startIso).getTime();
-      const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
-      return nowMs >= start && nowMs < end;
-    });
+  const nowIdx = slots.findIndex(s => {
+    const start = new Date(s.startIso).getTime();
+    const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    return nowMs >= start && nowMs < end;
+  });
+
+  const cycleInfo = (() => {
+    if (nowIdx < 0) return null;
+    const totalCycles = slots.filter(s => s.state === 'ON').length;
+    const completedCycles = slots.filter((s, i) => s.state === 'ON' && i < nowIdx).length;
+    return `${totalCycles} دورة · مكتمل ${completedCycles} · الحالية ${nowIdx + 1}`;
   })();
 
-  const startIdx = activeIdx >= 0 ? activeIdx
-    : allSlots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
-  const slots = startIdx > 0 ? allSlots.slice(startIdx) : allSlots;
+  // V2.2: Offset State display
+  const offsetStateLabel = userPrediction?.offsetState ?? null;
+  const offsetValueLabel = userPrediction?.offsetValue ?? null;
 
-  if (loading) {
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: T.bg }} edges={['top']}>
+      <View style={styles.container}>
+        {/* Header */}
+        <View style={styles.header}>
+          <Text style={styles.headerTitle}>📅 جدول الكهرباء</Text>
+          {cycleInfo && <Text style={styles.cycleInfo}>{cycleInfo}</Text>}
+          {/* V2.2: Offset state indicator */}
+          {offsetStateLabel && (
+            <View style={styles.offsetRow}>
+              <View style={[styles.offsetChip, {
+                borderColor: offsetStateLabel === 'POSITIVE' ? T.success + '44'
+                  : offsetStateLabel === 'NEGATIVE' ? T.warning + '44'
+                  : offsetStateLabel === 'PENDING_NEGATIVE' ? T.warning + '44'
+                  : T.textMuted + '44',
+                backgroundColor: offsetStateLabel === 'POSITIVE' ? T.success + '10'
+                  : offsetStateLabel === 'NEGATIVE' ? T.warning + '10'
+                  : offsetStateLabel === 'PENDING_NEGATIVE' ? T.warning + '10'
+                  : T.textMuted + '10',
+              }]}>
+                <Text style={[styles.offsetChipText, {
+                  color: offsetStateLabel === 'POSITIVE' ? T.success
+                    : offsetStateLabel === 'NEGATIVE' ? T.warning
+                    : offsetStateLabel === 'PENDING_NEGATIVE' ? T.warning
+                    : T.textMuted,
+                }]}>
+                  {offsetStateLabel === 'POSITIVE' ? 'فارق إيجابي'
+                    : offsetStateLabel === 'NEGATIVE' ? 'فارق سلبي'
+                    : offsetStateLabel === 'PENDING_NEGATIVE' ? 'فارق معلَّق'
+                    : offsetStateLabel === 'NEUTRAL' ? 'فارق محايد'
+                    : offsetStateLabel}
+                  {offsetValueLabel !== null && offsetValueLabel !== undefined
+                    ? (offsetValueLabel === 'PENDING' || offsetStateLabel === 'PENDING_NEGATIVE'
+                        ? ' · بانتظار Growatt'
+                        : ` · ${(offsetValueLabel as number) > 0 ? '+' : ''}${offsetValueLabel}د`)
+                    : ''}
+                </Text>
+              </View>
+            </View>
+          )}
+        </View>
+
+        {/* Controls */}
+        <View style={styles.controls}>
+          <View style={styles.viewToggle}>
+            <TouchableOpacity style={[styles.viewBtn, view === 'analysis' && styles.viewBtnActive]} onPress={() => setView('analysis')} activeOpacity={0.8}>
+              <Text style={[styles.viewBtnText, view === 'analysis' && styles.viewBtnTextActive]}>📊 تحليل</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.viewBtn, view === 'timeline' && styles.viewBtnActive]} onPress={() => setView('timeline')} activeOpacity={0.8}>
+              <Text style={[styles.viewBtnText, view === 'timeline' && styles.viewBtnTextActive]}>⏰ الجدول</Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity
+            style={[styles.shiftToggle, { borderColor: showShifted ? T.accent + '55' : T.border }]}
+            onPress={() => setShowShifted(v => !v)}
+            activeOpacity={0.8}
+          >
+            <Text style={[styles.shiftToggleText, { color: showShifted ? T.accent : T.textMuted }]}>
+              {showShifted ? '⏱ الفارق مفعَّل' : '⏱ الفارق معطّل'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* V2.2: Generated ON explanation */}
+        <View style={styles.infoBox}>
+          <Text style={styles.infoText}>
+            ⚡ = حالة تشغيل مُولّدة (بلاغ حقيقي) · ⏳ = فارق معلّق (تقديري حتى تحوّل Growatt)
+          </Text>
+        </View>
+
+        {view === 'timeline' ? (
+          <FlatList
+            data={slots}
+            keyExtractor={(_, i) => `slot-${i}`}
+            contentContainerStyle={styles.list}
+            ListHeaderComponent={<Summary prediction={userPrediction} />}
+            renderItem={({ item, index }) => (
+              <ScheduleCard
+                slot={item}
+                index={index}
+                isCurrent={index === nowIdx}
+                showShifted={showShifted}
+              />
+            )}
+            ListEmptyComponent={
+              <View style={styles.emptyBox}>
+                <Text style={{ fontSize: 48, marginBottom: 14 }}>📅</Text>
+                <Text style={styles.emptyTitle}>لا يوجد جدول متاح</Text>
+                <Text style={styles.emptySub}>يستمر التطبيق في تحليل أنماط الكهرباء.</Text>
+              </View>
+            }
+          />
+        ) : (
+          <AnalysisView prediction={userPrediction} />
+        )}
+      </View>
+    </SafeAreaView>
+  );
+}
+
+// ─── Analysis View ───
+function AnalysisView({ prediction }: { prediction: UserPrediction | null }) {
+  const apppe = prediction?.apppe;
+  if (!apppe) {
     return (
-      <View style={{ flex: 1, backgroundColor: T.bg, alignItems: 'center', justifyContent: 'center' }}>
-        <ActivityIndicator size="large" color={T.accent} />
-        <Text style={{ color: T.textMuted, marginTop: 12, fontSize: 14 }}>{AR.loading}</Text>
+      <View style={styles.emptyBox}>
+        <Text style={{ fontSize: 48, marginBottom: 14 }}>📊</Text>
+        <Text style={styles.emptyTitle}>لا توجد بيانات تحليلية</Text>
+        <Text style={styles.emptySub}>يستمر التطبيق في جمع البيانات.</Text>
       </View>
     );
   }
 
-  const modeLabel = userPrediction?.learningMode === 'learned' ? AR.learned
-    : userPrediction?.learningMode === 'hybrid' ? AR.hybrid : AR.estimated;
+  const { dayPattern, nightPattern } = prediction;
+  const q = apppe.predictionQuality;
+
+  const QualityRow = ({ label, value, color }: { label: string; value: number; color: string }) => (
+    <View style={aStyles.qualityRow}>
+      <Text style={[aStyles.qualityVal, { color }]}>{Math.round(value * 100)}%</Text>
+      <View style={[aStyles.qualityBar, { backgroundColor: T.elevated }]}>
+        <View style={[aStyles.qualityFill, { width: `${Math.round(value * 100)}%`, backgroundColor: color }]} />
+      </View>
+      <Text style={aStyles.qualityLabel}>{label}</Text>
+    </View>
+  );
 
   return (
-    <ScrollView
-      style={styles.root}
-      contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 32 }]}
-      showsVerticalScrollIndicator={false}
-    >
-      {/* Info bar */}
-      <View style={styles.infoBar}>
-        <View style={styles.infoItem}>
-          <Text style={styles.infoValue}>{modeLabel}</Text>
-          <Text style={styles.infoLabel}>النوع</Text>
-        </View>
-        <View style={styles.infoDivider} />
-        <View style={styles.infoItem}>
-          <Text style={styles.infoValue}>{userPrediction?.confidence ?? 0}%</Text>
-          <Text style={styles.infoLabel}>الثقة</Text>
-        </View>
-        <View style={styles.infoDivider} />
-        <View style={styles.infoItem}>
-          <Text style={[styles.infoValue, {
-            color: (userPrediction?.stabilityScore ?? 0) >= 75 ? T.success
-              : (userPrediction?.stabilityScore ?? 0) >= 45 ? T.warning : T.danger
-          }]}>
-            {userPrediction?.stabilityScore ?? 0}%
-          </Text>
-          <Text style={styles.infoLabel}>الاستقرار</Text>
-        </View>
-        <View style={styles.infoDivider} />
-        <DSDChip
-          offsetMinutes={offset?.offset_minutes ?? 0}
-          isPending={!!pendingDSD}
-          offsetState={(userPrediction as any)?.offsetState ?? null}
-        />
-      </View>
-
-      {/* Legend */}
-      <View style={styles.legend}>
-        {resyncHistory.length > 0 && (
-          <View style={styles.legendItem}>
-            <Text style={styles.legendText}>مجتمعي</Text>
-            <View style={[styles.legendBadge, { borderColor: '#38bdf844', backgroundColor: '#001a2e' }]}>
-              <Text style={[styles.legendBadgeText, { color: '#38bdf8' }]}>👥</Text>
-            </View>
-          </View>
-        )}
-        {/* V2.1: Generated ON legend entry */}
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>مُولّدة</Text>
-          <View style={[styles.legendBadge, { borderColor: T.success + '55', backgroundColor: '#052e16' }]}>
-            <Text style={[styles.legendBadgeText, { color: T.success, fontStyle: 'normal', fontWeight: '700' }]}>⚡</Text>
-          </View>
-        </View>
-        {/* V2.1: Estimated (Pending Offset) legend entry */}
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>تقديري معلَّق</Text>
-          <View style={[styles.legendBadge, { borderColor: T.warning + '55', backgroundColor: '#1a0e00' }]}>
-            <Text style={[styles.legendBadgeText, { color: T.warning, fontStyle: 'normal', fontWeight: '700' }]}>⏳</Text>
-          </View>
-        </View>
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>توقع</Text>
-          <View style={[styles.legendBadge]}><Text style={styles.legendBadgeText}>{AR.estBadge}</Text></View>
-        </View>
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>{AR.gridOff}</Text>
-          <View style={[styles.legendDot, { backgroundColor: T.danger }]} />
-        </View>
-        <View style={styles.legendItem}>
-          <Text style={styles.legendText}>{AR.gridOn}</Text>
-          <View style={[styles.legendDot, { backgroundColor: T.success }]} />
+    <ScrollView contentContainerStyle={styles.list}>
+      <Summary prediction={prediction} />
+      <View style={aStyles.section}>
+        <Text style={aStyles.sectionTitle}>🎯 جودة التوقع</Text>
+        <Text style={aStyles.sectionSub}>APPPE v4 — {apppe.historySource}</Text>
+        <QualityRow label="كمية البيانات" value={q.dataQuantityFactor} color={T.accent} />
+        <QualityRow label="استقرار الأنماط" value={q.stabilityFactor} color={T.success} />
+        <QualityRow label="استقرار الانحراف" value={q.driftStabilityFactor} color={T.warning} />
+        <QualityRow label="استقرار الانحياز" value={q.biasStabilityFactor} color={T.primary} />
+        <QualityRow label="التقلب" value={q.volatilityFactor} color={T.danger} />
+        <QualityRow label="أزمة" value={q.crisisFactor} color={T.danger} />
+        <View style={aStyles.totalRow}>
+          <Text style={aStyles.totalVal}>{prediction.confidence}%</Text>
+          <Text style={aStyles.totalLabel}>الثقة الإجمالية</Text>
         </View>
       </View>
-
-      {/* Upcoming schedule */}
-      {slots.length === 0 ? (
-        <View style={styles.emptyBox}>
-          <Text style={{ fontSize: 48, marginBottom: 16 }}>📅</Text>
-          <Text style={styles.emptyTitle}>{AR.noScheduleYet}</Text>
-          <Text style={styles.emptySub}>{AR.noScheduleSub}</Text>
-        </View>
-      ) : (
-        <View style={styles.timeline}>
-          <Text style={styles.sectionLabel}>{AR.scheduleTitle}</Text>
-          {slots.map((slot, i) => {
-            const slotStartMs = new Date(slot.startIso).getTime();
-            const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
-            // For POSITIVE_OFFSET_PENDING: first slot is always active
-            const isActive = isPositiveOffsetPending ? i === 0 : (nowMs >= slotStartMs && nowMs < slotEndMs);
-            const slotKey = `${slot.state}|${Math.round(slotStartMs / 60_000)}`;
-
-            // Active start: use mathematicalActiveStartIso for the active slot
-            let activeStartFormatted: string | undefined;
-            if (isActive && mathematicalActiveStartIso) {
-              activeStartFormatted = new Date(mathematicalActiveStartIso).toLocaleString('en-US', {
-                timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
-              }).replace('AM', ' ص').replace('PM', ' م');
-            }
-
-            const currentFormatted = activeStartFormatted ?? slot.shiftedStartFormatted ?? slot.startFormatted;
-            if (!stableStartMapRef.current[slotKey] && currentFormatted) {
-              stableStartMapRef.current[slotKey] = currentFormatted;
-            }
-            // For active POSITIVE_OFFSET_PENDING slot always show fresh anchor time
-            const stableStart = (isActive && isPositiveOffsetPending && activeStartFormatted)
-              ? activeStartFormatted
-              : (stableStartMapRef.current[slotKey] ?? currentFormatted);
-
-            const currentEndFormatted = slot.shiftedEndFormatted ?? slot.endFormatted;
-            if (!stableEndMapRef.current[slotKey] && currentEndFormatted) {
-              stableEndMapRef.current[slotKey] = currentEndFormatted;
-            }
-            const stableEnd = stableEndMapRef.current[slotKey] ?? currentEndFormatted;
-
-            return (
-              <ScheduleBlock
-                key={i} slot={slot} index={i}
-                resyncEvents={resyncHistory}
-                isActive={isActive}
-                atcMode={atcMode}
-                isHolding={userPrediction?.isHoldingState}
-                stableStartFormatted={stableStart}
-                stableEndFormatted={stableEnd}
-                isPendingNegative={(userPrediction as any)?.isPendingNegative ?? false}
-              />
-            );
-          })}
-          <View style={styles.endDot} />
-        </View>
-      )}
-
-      {/* Cycle stats */}
-      {slots.length >= 2 && (() => {
-        const completedSlots = slots.filter(s => s.endIso);
-        const onSlots = completedSlots.filter(s => s.state === 'ON');
-        const offSlots = completedSlots.filter(s => s.state === 'OFF');
-        if (onSlots.length === 0 && offSlots.length === 0) return null;
-        const avgMin = (arr: ShiftedScheduleSlot[]) =>
-          Math.round(arr.reduce((sum, s) => {
-            const ms = new Date(s.endIso!).getTime() - new Date(s.startIso).getTime();
-            return sum + ms / 60_000;
-          }, 0) / arr.length);
-        const fmtMin = (m: number) => {
-          const h = Math.floor(m / 60);
-          const mins = Math.round(m % 60);
-          if (h === 0) return `${mins}د`;
-          if (mins === 0) return h === 1 ? 'ساعة' : `${h}س`;
-          return `${h}س ${mins}د`;
-        };
-        const onAvg = onSlots.length > 0 ? fmtMin(avgMin(onSlots)) : null;
-        const offAvg = offSlots.length > 0 ? fmtMin(avgMin(offSlots)) : null;
-        return (
-          <View style={styles.statsRow}>
-            <Text style={styles.statLabel}>{AR.perCycle}</Text>
-            {offAvg && (
-              <View style={styles.statItem}>
-                <Text style={styles.statText}>~{offAvg} <Text style={{ color: T.danger, fontWeight: '700' }}>طافي</Text></Text>
-                <View style={[styles.statDot, { backgroundColor: T.danger }]} />
-              </View>
-            )}
-            {onAvg && offAvg && <Text style={styles.statSlash}>/</Text>}
-            {onAvg && (
-              <View style={styles.statItem}>
-                <Text style={styles.statText}>~{onAvg} <Text style={{ color: T.success, fontWeight: '700' }}>شغّال</Text></Text>
-                <View style={[styles.statDot, { backgroundColor: T.success }]} />
-              </View>
-            )}
+      <View style={aStyles.section}>
+        <Text style={aStyles.sectionTitle}>⚙️ تكوين المحرك</Text>
+        <View style={aStyles.row2}>
+          <View style={aStyles.cell2}>
+            <Text style={aStyles.cell2Val}>{apppe.driftSampleCount}</Text>
+            <Text style={aStyles.cell2Label}>عينات الانحراف</Text>
           </View>
-        );
-      })()}
-
-      {/* ── Power Events History ── */}
-      <EventsHistorySection />
-
-      {userPrediction?.computedAt && (
-        <Text style={styles.computedAt}>
-          {AR.computedAt}{' '}
-          {new Date(userPrediction.computedAt).toLocaleString('ar-SA', {
-            timeZone: 'Asia/Aden', dateStyle: 'medium', timeStyle: 'short',
-          })} (اليمن)
-        </Text>
-      )}
+          <View style={aStyles.cell2}>
+            <Text style={aStyles.cell2Val}>{apppe.biasSampleCount}</Text>
+            <Text style={aStyles.cell2Label}>عينات الانحياز</Text>
+          </View>
+        </View>
+      </View>
     </ScrollView>
   );
 }
 
+const aStyles = StyleSheet.create({
+  section: { backgroundColor: T.surface, borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: T.border },
+  sectionTitle: { color: T.textPrimary, fontSize: 16, fontWeight: '800', marginBottom: 6, textAlign: 'right' },
+  sectionSub: { color: T.textMuted, fontSize: 11, marginBottom: 14, textAlign: 'right' },
+  qualityRow: { flexDirection: 'row-reverse', alignItems: 'center', marginBottom: 10, gap: 10 },
+  qualityLabel: { color: T.textSecondary, fontSize: 12, width: 80, textAlign: 'right' },
+  qualityBar: { flex: 1, height: 6, borderRadius: 3, overflow: 'hidden' },
+  qualityFill: { height: 6, borderRadius: 3 },
+  qualityVal: { fontSize: 12, fontWeight: '700', width: 40, textAlign: 'right' },
+  totalRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderTopColor: T.border },
+  totalLabel: { color: T.textPrimary, fontSize: 14, fontWeight: '800' },
+  totalVal: { color: T.accent, fontSize: 18, fontWeight: '900' },
+  row2: { flexDirection: 'row-reverse', gap: 10 },
+  cell2: { flex: 1, backgroundColor: T.elevated, borderRadius: 10, padding: 12, alignItems: 'center' },
+  cell2Val: { color: T.textPrimary, fontSize: 16, fontWeight: '800' },
+  cell2Label: { color: T.textMuted, fontSize: 10, marginTop: 4 },
+});
+
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: T.bg },
-  content: { paddingHorizontal: 16, paddingTop: 12 },
-  infoBar: {
-    flexDirection: 'row-reverse', backgroundColor: T.surface, borderRadius: 14,
-    paddingVertical: 14, paddingHorizontal: 8, marginBottom: 14,
-    borderWidth: 1, borderColor: T.border, alignItems: 'center', justifyContent: 'space-evenly',
-  },
-  infoItem: { alignItems: 'center', flex: 1 },
-  infoLabel: { color: T.textMuted, fontSize: 8, fontWeight: '700', letterSpacing: 1, marginTop: 4 },
-  infoValue: { color: T.textPrimary, fontSize: 15, fontWeight: '800' },
-  infoDivider: { width: 1, height: 28, backgroundColor: T.border },
-  legend: { flexDirection: 'row-reverse', gap: 12, marginBottom: 16, flexWrap: 'wrap' },
-  legendItem: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6 },
-  legendDot: { width: 8, height: 8, borderRadius: 4 },
-  legendText: { color: T.textMuted, fontSize: 11 },
-  legendBadge: { backgroundColor: T.elevated, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2, borderWidth: 1, borderColor: 'transparent' },
-  legendBadgeText: { color: T.textMuted, fontSize: 9, fontStyle: 'italic' },
-  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 12, textTransform: 'uppercase', textAlign: 'center' },
-  timeline: { marginBottom: 8 },
-  endDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: T.border, marginRight: 4, marginTop: 4, alignSelf: 'flex-end' },
+  container: { flex: 1, paddingHorizontal: 16 },
+  header: { paddingVertical: 12 },
+  headerTitle: { color: T.textPrimary, fontSize: 18, fontWeight: '800', textAlign: 'right' },
+  cycleInfo: { color: T.textMuted, fontSize: 11, textAlign: 'right', marginTop: 4 },
+  offsetRow: { flexDirection: 'row-reverse', marginTop: 6 },
+  offsetChip: { borderRadius: 6, paddingHorizontal: 10, paddingVertical: 4, borderWidth: 1 },
+  offsetChipText: { fontSize: 10, fontWeight: '700' },
+  controls: { flexDirection: 'row-reverse', alignItems: 'center', marginBottom: 12, gap: 10 },
+  viewToggle: { flexDirection: 'row-reverse', backgroundColor: T.surface, borderRadius: 10, padding: 3, borderWidth: 1, borderColor: T.border },
+  viewBtn: { paddingHorizontal: 14, paddingVertical: 7, borderRadius: 8 },
+  viewBtnActive: { backgroundColor: T.primary + '33' },
+  viewBtnText: { color: T.textMuted, fontSize: 12, fontWeight: '600' },
+  viewBtnTextActive: { color: T.accent, fontWeight: '700' },
+  shiftToggle: { flex: 1, borderRadius: 10, paddingVertical: 7, borderWidth: 1, alignItems: 'center' },
+  shiftToggleText: { fontSize: 11, fontWeight: '700' },
+  infoBox: { backgroundColor: T.surface, borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.border },
+  infoText: { color: T.textMuted, fontSize: 10, textAlign: 'right' },
+  list: { paddingBottom: 32 },
   emptyBox: { alignItems: 'center', paddingVertical: 48, paddingHorizontal: 24 },
-  emptyTitle: { color: T.textSecondary, fontSize: 20, fontWeight: '700', marginBottom: 12 },
+  emptyTitle: { color: T.textSecondary, fontSize: 18, fontWeight: '700', marginBottom: 10, textAlign: 'center' },
   emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 22 },
-  computedAt: { color: T.textMuted, fontSize: 10, textAlign: 'center', marginTop: 8 },
-  statsRow: {
-    flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 8,
-    backgroundColor: T.surface, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 16,
-    marginTop: 8, marginBottom: 4, borderWidth: 1, borderColor: T.border,
-  },
-  statItem: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5 },
-  statDot: { width: 7, height: 7, borderRadius: 4 },
-  statText: { color: T.textSecondary, fontSize: 13 },
-  statSlash: { color: T.border, fontSize: 14, fontWeight: '300' },
-  statLabel: { color: T.textMuted, fontSize: 11, marginRight: 2 },
 });
