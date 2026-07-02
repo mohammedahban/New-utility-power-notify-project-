@@ -996,9 +996,6 @@ export default function CommunityScreen() {
   const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? null;
 
   const isParticipationRestricted = myScore
-
-
-  const isParticipationRestricted = myScore
     ? myScore.total_responses >= 10 &&
       myScore.ignored_notifications / myScore.total_responses > 0.7
     : false;
