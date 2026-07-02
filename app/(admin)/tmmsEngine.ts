@@ -1,72 +1,22 @@
 /**
- * tmmsEngine.ts — TMMS V2.2 Personal Timeline Replacement Model
+ * tmmsEngine.ts — TMMS V2.1 Final Engine
  *
  * Dependency-free TypeScript — shared between the production hook
  * (hooks/useUserPredictions.ts) and admin tooling.
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * TMMS V2.2 RULES (Period 1 / Period 2 / Period 3)
+ * TMMS V2.1 FINAL RULES (Period 1 / Period 2)
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Period 1 = starts immediately after Growatt ON begins, continues through
- *            the entire Growatt ON duration PLUS the first half of the
- *            following Growatt OFF duration.
- *   - Generated ON replaces the Growatt ON that belongs to this period
- *   - Generated ON receives the FULL duration of the replaced ON
- *   - Creates POSITIVE offset (offset = GeneratedONstart - ReplacedONstart)
- *   - Following OFF receives the full duration of the original following OFF
- *   - Short Verification Window after Growatt turns ON (countdown until
- *     personal scheduled ON time)
+ * Period 1 = first half of OFF (<50% consumed) → POSITIVE offset
+ *   - Offset is ADDED (push) to start/end of EACH state (ON and OFF)
+ *   - Verification Window: true
  *
- * Period 2 = second half of Growatt OFF (>50% consumed) through immediately
- *            before the next Growatt ON starts.
- *   - Generated ON replaces the NEXT upcoming Growatt ON
- *   - Generated ON receives the full duration of the next ON
- *   - Creates PENDING_NEGATIVE (initially — exact numeric value unknown
- *     because the referenced Growatt ON hasn't started yet)
- *   - Automatically resolves to NEGATIVE when Growatt ON begins:
- *     offsetValue = GeneratedONstart - ActualGrowattONstart
- *   - Following OFF receives the full duration of the OFF that followed
- *     the replaced next ON
- *   - UNCERTAIN_ZONE when predicted OFF finishes before Growatt turns ON:
- *     waiting time is deducted from the next ON duration
+ * Period 2 = second half of OFF (>50% consumed) → NEGATIVE offset
+ *   - Offset is DECLINED (pull) from start/end of EACH state (ON and OFF)
+ *   - UNCERTAIN_ZONE: true
  *
- * Period 3 = exact instant the Growatt ON state begins.
- *   - Offset = 0, NEUTRAL
- *   - Personal Timeline = exact clone of Growatt Timeline
- *   - No shifting, no Pending state, no UNCERTAIN_ZONE
- *
- * PERSONAL TIMELINE REPLACEMENT MODEL:
- *   Specific Growatt ON states are REPLACED by Generated ON states.
- *   The Personal Timeline is a "customized copy" built from the Growatt
- *   template. After replacement, the user's timeline is independent while
- *   still borrowing Growatt durations.
- *
- * GENERATED ON:
- *   - Permanent timeline event — never temporary, never deleted
- *   - Immediately becomes the current user state
- *   - When user reports ON: ends current OFF, creates Generated ON,
- *     chooses its duration (from replaced ON), calculates offset,
- *     rebuilds remaining timeline and future schedules
- *
- * UNCERTAIN_ZONE (Negative Offset):
- *   - When predicted OFF duration finishes before Growatt turns ON:
- *     OFF → UNCERTAIN_ZONE
- *   - Home Page shows: "Electricity OFF — Waiting for Growatt ON..."
- *     with elapsed waiting time counter
- *   - When Growatt turns ON:
- *     1. Measure actual waiting time inside UNCERTAIN_ZONE
- *     2. Deduct waiting time from next ON duration
- *     3. User immediately enters new ON state
- *
- * ON DURATION RECONCILIATION:
- *   Displayed Personal ON Duration = Expected ON Duration - UNCERTAIN_ZONE waiting time
- *   This preserves correct cycle timing without introducing timeline gaps.
- *
- * COMMUNITY APPROVAL:
- *   - Approver clones Reporter's synchronization state exactly:
- *     Offset State, Offset Value (or Pending Negative if unresolved),
- *     Timeline Alignment, Personal Timeline structure
+ * The offset is FINAL at report time. No recomputation.
  *
  * FILE LOCATION: app/(admin)/tmmsEngine.ts
  */
@@ -194,39 +144,18 @@ export interface Prediction {
 
 /** Community resync point (from ResyncContext) */
 export interface ResyncPoint {
-  /** The utility state that was confirmed as active */
   syncedState: 'ON' | 'OFF';
-  /**
-   * The ISO timestamp at which this state effectively became active.
-   * For reporter: transition time (now - selectedTimeOffsetMinutes)
-   * For recipient: same as reporter (Confirmation Timestamp Rule)
-   */
   syncedAtIso: string;
-  /** When the resync was applied locally */
   appliedAtIso: string;
-  /** Reporter display name */
   reporterName?: string | null;
-  /** Reporter reliability score (0–100) */
   reporterReliability?: number | null;
-
-  // ── V2.2 additions ────────────────────────────────────────────────────────
-  /** V2.2: Offset state (POSITIVE for Period 1, PENDING_NEGATIVE for Period 2,
-   *  NEUTRAL for Period 3, NEGATIVE after Pending Negative resolves) */
-  offsetState?: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE';
-  /** V2.2: Offset value in signed minutes, or 'PENDING' when waiting for
-   *  Growatt ON to resolve Period 2 */
-  offsetValue?: number | 'PENDING';
-  /** V2.2: Timeline alignment anchor (ISO timestamp of the reference ON start) */
+  offsetState?: string;
+  offsetValue?: number | string;
   timelineAlignment?: string;
-  /** V2.2: Generated ON start time (ISO) */
   generatedOnStartIso?: string;
-  /** V2.2: Generated ON duration in minutes */
   generatedOnDurationMin?: number | null;
-  /** V2.2: Reference ON start time (ISO) — the Growatt ON that was replaced */
   generatedOnReferenceIso?: string | null;
-  /** V2.2: Reference kind */
-  generatedOnReferenceKind?: 'completed' | 'active' | null;
-  /** V2.2: For approvers — the time they confirmed */
+  generatedOnReferenceKind?: string | null;
   confirmationTime?: string;
 }
 
@@ -242,9 +171,6 @@ export interface ShiftedScheduleSlot extends ScheduleSlot {
   shiftedStartFormatted: string;
   shiftedEndFormatted: string | null;
   isResynced?: boolean;
-  // V2.2: slot-level flags for Generated ON and Estimated Pending Offset
-  isGeneratedOn?: boolean;
-  isEstimatedPendingOffset?: boolean;
 }
 
 export interface ATCInfo {
@@ -256,13 +182,6 @@ export interface ATCInfo {
   inValidationWindow: boolean;
   validationWindowRemainingMin: number;
   scheduledAutoTransitionIso: string | null;
-  // V2.2: UNCERTAIN_ZONE tracking fields
-  /** Elapsed waiting time inside UNCERTAIN_ZONE (minutes) */
-  uncertainZoneElapsedMin?: number;
-  /** Whether the current state is inside UNCERTAIN_ZONE */
-  isInUncertainZone?: boolean;
-  /** The deducted duration from the next ON due to UNCERTAIN_ZONE waiting */
-  onDurationDeductionMin?: number;
 }
 
 export interface AccuracyLogEvent {
@@ -287,28 +206,14 @@ export interface UserPrediction extends Prediction {
   isHoldingState: boolean;
   crisisMode: boolean | null;
   crisisReason: string | null;
-  // V2.2 fields
-  offsetState?: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE';
-  offsetValue?: number | 'PENDING';
+  // V2.1 fields
+  offsetState?: string;
+  offsetValue?: number | string;
   timelineAlignment?: string;
-  generatedOnInfo?: GeneratedOnInfo | null;
+  generatedOnInfo?: any;
   isPendingNegative?: boolean;
   isGeneratedOnCurrent?: boolean;
   pendingNegativeResolutionIso?: string | null;
-}
-
-/** V2.2: Generated ON metadata */
-export interface GeneratedOnInfo {
-  /** ISO when the Generated ON began */
-  startIso: string;
-  /** Duration in minutes, copied from the replaced ON */
-  durationMin: number;
-  /** ISO of the reference ON used to compute duration */
-  referenceIso: string;
-  /** Whether the reference was 'completed' or 'active' */
-  referenceKind: 'completed' | 'active';
-  /** When referenceKind='active', inherits reference ON's lifecycle */
-  inheritsReferenceLifecycle: boolean;
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -347,22 +252,12 @@ export function getZoneFromIso(iso: string): string {
   return hour >= 6 && hour < 20 ? 'DAY' : 'NIGHT';
 }
 
-// ─── PERSONAL TIMELINE REPLACEMENT: OFFSET APPLICATION ──────────────────────
+// ─── OFFSET APPLICATION ──────────────────────────────────────────────────────
 
 /**
- * V2.2: Apply offset to ALL slots in the schedule.
- *
- * Positive Offset → pushes every future ON and OFF later by offset value.
- * Negative Offset → pulls every future ON and OFF earlier by offset value.
- * Neutral Offset → no shifting (clone of Growatt).
- * Pending Negative → behaves as future Negative Offset (pull earlier).
- *
- * The Generated ON slot itself is NOT shifted — it sits at its natural
- * position. Only the Growatt-derived slots are shifted.
- *
- * Per the Personal Timeline Replacement Model: specific Growatt ON states
- * are replaced by Generated ON states. The offset shifts all remaining
- * timeline slots while preserving their durations.
+ * Apply offset to ALL slots in the schedule.
+ * V2.1: Positive → push forward, Negative → pull backward.
+ * Both start AND end times are shifted. Generated ON is NOT shifted.
  */
 function applyOffsetToSlotsInternal(
   schedule: ScheduleSlot[],
@@ -370,7 +265,7 @@ function applyOffsetToSlotsInternal(
   resyncPoint: ResyncPoint | null,
 ): ShiftedScheduleSlot[] {
   return schedule.map(slot => {
-    // V2.2: Don't shift the Generated ON slot — it sits at its natural position
+    // V2.1: Don't shift the Generated ON slot
     const isGeneratedOn = resyncPoint &&
       resyncPoint.syncedState === 'ON' &&
       slot.startIso === resyncPoint.syncedAtIso;
@@ -381,7 +276,6 @@ function applyOffsetToSlotsInternal(
         shiftedStartFormatted: slot.startFormatted,
         shiftedEndFormatted: slot.endFormatted,
         isResynced: true,
-        isGeneratedOn: true,
       };
     }
 
@@ -410,30 +304,26 @@ function applyOffsetToSlotsInternal(
 
 // ─── ATC STATE MACHINE ───────────────────────────────────────────────────────
 //
-// V2.2 — Offset State meanings:
+// V2.1 FINAL — Offset Sign Meaning (VERY IMPORTANT):
 //
-//   POSITIVE offset = user's Personal Timeline occurs later than Growatt
-//     - Created when Generated ON is inside Period 1
-//     - Pushes every future ON and OFF later
-//     - Short Verification Window after Growatt turns ON:
-//       Home Page remains OFF during countdown, auto-switches at zero
+//   POSITIVE offset = user turns ON AFTER Growatt
+//     - Growatt turns ON at 10:00, offset +30 → user turns ON at 10:30
+//     - At end of user's predicted OFF → short VERIFICATION WINDOW
+//       (user is confident — Growatt already confirmed)
+//     - If between slots (Growatt ON but user's ON hasn't started) →
+//       POSITIVE_OFFSET_PENDING (holding pre-transition state)
 //
-//   PENDING_NEGATIVE = user is known to be Negative category but exact value
-//     is unknown (referenced Growatt ON hasn't started yet)
-//     - Created when Generated ON is inside Period 2
-//     - Behaves as future Negative Offset (pulls future ON/OFF earlier)
-//     - Auto-resolves to NEGATIVE when Growatt ON begins
+//   NEGATIVE offset = user turns ON BEFORE Growatt
+//     - Growatt turns ON at 10:00, offset -30 → user turns ON at 9:30
+//     - At end of user's predicted OFF → UNCERTAIN_ZONE
+//       (user is uncertain — doesn't know when Growatt will confirm)
+//     - The ON state uses the predicted ON duration automatically
+//     - Remains in UNCERTAIN_ZONE until Growatt confirms OR community report
 //
-//   NEGATIVE offset = user's Personal Timeline occurs earlier than Growatt
-//     - Created after Pending Negative resolves
-//     - Pulls every future ON and OFF earlier
-//     - UNCERTAIN_ZONE when predicted OFF finishes before Growatt turns ON:
-//       waiting time is deducted from next ON duration
-//
-//   NEUTRAL offset = user perfectly synchronized with Growatt
-//     - Created at exact Growatt ON start instant (Period 3)
-//     - Offset = 0, Personal Timeline clones Growatt completely
-//     - No shifting, no Pending state, no UNCERTAIN_ZONE
+//   NEUTRAL offset = user clones Growatt exactly
+//     - Same start/end times and durations as Growatt
+//     - At end of predicted OFF → short VERIFICATION WINDOW only
+//       (for API/communication delays)
 //
 // AUTO MODE: all of the above apply
 // MANUAL MODE: only community reports and user reports trigger transitions
@@ -442,17 +332,6 @@ const PREDICTION_RANGE_MIN = 15;
 const GRACE_MODE_MAX_MIN = 30;
 const VERIFICATION_WINDOW_MIN = 20;
 
-/**
- * V2.2: Compute the ATC mode based on current timeline state.
- *
- * Key V2.2 behaviors:
- * - POSITIVE_OFFSET_PENDING: Growatt turned ON but user's scheduled ON is
- *   still in the future. Home Page shows OFF with countdown.
- * - UNCERTAIN_ZONE (Negative): user's predicted OFF ended before Growatt ON.
- *   Track elapsed waiting time, deduct from next ON duration.
- * - PENDING_NEGATIVE: waiting for Growatt ON to resolve the numeric offset.
- *   Future ON predictions shown as "Estimated (Pending Offset)".
- */
 function computeATCMode(
   shiftedSlots: ShiftedScheduleSlot[],
   growattCurrentState: 'ON' | 'OFF',
@@ -471,17 +350,7 @@ function computeATCMode(
   validationWindowRemainingMin: number;
   scheduledAutoTransitionIso: string | null;
   statusLine: string;
-  // V2.2 UNCERTAIN_ZONE tracking
-  uncertainZoneElapsedMin: number;
-  isInUncertainZone: boolean;
-  onDurationDeductionMin: number;
 } {
-  // Determine effective offset (numeric). PENDING_NEGATIVE behaves as
-  // negative for timeline positioning purposes.
-  const effectiveOffsetMin = typeof resyncPoint?.offsetValue === 'number'
-    ? resyncPoint.offsetValue
-    : offsetMinutes;
-
   const activeSlot = shiftedSlots.find(s => {
     const start = new Date(s.startIso).getTime();
     const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
@@ -489,6 +358,8 @@ function computeATCMode(
   }) ?? null;
 
   // ── COMMUNITY_SYNCED ─────────────────────────────────────────────────────
+  // A community resync overrides everything — the user's timeline is
+  // synced to the community report's Generated ON.
   if (resyncPoint) {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
     const durationMin = resyncPoint.generatedOnDurationMin ?? 0;
@@ -509,21 +380,23 @@ function computeATCMode(
         validationWindowRemainingMin,
         scheduledAutoTransitionIso: durationMin > 0 ? new Date(cycleEndMs).toISOString() : null,
         statusLine: 'الحالة مُزامَنة مجتمعياً',
-        uncertainZoneElapsedMin: 0,
-        isInUncertainZone: false,
-        onDurationDeductionMin: 0,
       };
     }
   }
 
   // ── CASE 1: No active slot — user is between slots ───────────────────────
+  // This happens when the user's shifted schedule has a gap, meaning:
+  //   - POSITIVE offset: Growatt already transitioned, user's next slot
+  //     hasn't started yet → POSITIVE_OFFSET_PENDING
+  //   - NEGATIVE offset: user's predicted OFF ended before Growatt's OFF,
+  //     user is waiting for Growatt to confirm → UNCERTAIN_ZONE
   if (!activeSlot) {
     // ── POSITIVE_OFFSET_PENDING ──────────────────────────────────────────
-    // V2.2: Positive offset = user's timeline is later than Growatt.
-    // Growatt has already transitioned, but user's scheduled transition
-    // is still in the future. Short Verification Window behavior:
-    // Home Page shows OFF with countdown until scheduled time.
-    if (effectiveOffsetMin > 0) {
+    // Positive offset = user turns ON AFTER Growatt.
+    // Growatt has already transitioned, but the user's scheduled transition
+    // is still in the future. The user holds their current state until
+    // their scheduled time arrives.
+    if (offsetMinutes > 0) {
       const nextSlot = shiftedSlots
         .filter(s => new Date(s.startIso).getTime() > nowMs)
         .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
@@ -539,20 +412,21 @@ function computeATCMode(
           inValidationWindow: false,
           validationWindowRemainingMin: 0,
           scheduledAutoTransitionIso: nextSlot.startIso,
-          statusLine: `تغيير تلقائي مجدول في ${fmtYemenTime(nextSlot.startIso)} — الفارق الإيجابي +${effectiveOffsetMin}د`,
-          uncertainZoneElapsedMin: 0,
-          isInUncertainZone: false,
-          onDurationDeductionMin: 0,
+          statusLine: `تغيير تلقائي مجدول في ${fmtYemenTime(nextSlot.startIso)}`,
         };
       }
     }
 
     // ── NEGATIVE OFFSET: UNCERTAIN_ZONE ──────────────────────────────────
-    // V2.2: Negative offset = user's timeline is ahead of Growatt.
+    // Negative offset = user turns ON BEFORE Growatt.
     // The user's predicted OFF has ended (shifted earlier by negative offset),
-    // but Growatt hasn't transitioned to ON yet. Enter UNCERTAIN_ZONE.
-    // When Growatt finally turns ON, waiting time is deducted from next ON.
-    if (effectiveOffsetMin < 0 || resyncPoint?.offsetState === 'PENDING_NEGATIVE') {
+    // but Growatt hasn't transitioned to ON yet. The user doesn't know
+    // exactly when Growatt will turn ON, so they enter UNCERTAIN_ZONE.
+    // The ON state will use the predicted ON duration automatically.
+    // Remains in UNCERTAIN_ZONE until:
+    //   - Growatt finally transitions to ON, OR
+    //   - A new accepted community ON report arrives
+    if (offsetMinutes < 0) {
       const recentlyEnded = shiftedSlots
         .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
         .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
@@ -560,11 +434,8 @@ function computeATCMode(
       if (recentlyEnded) {
         const slotEndMs = new Date(recentlyEnded.endIso!).getTime();
         const overrunMin = Math.round((nowMs - slotEndMs) / 60_000);
-        const offsetMs = effectiveOffsetMin * 60_000;
+        const offsetMs = offsetMinutes * 60_000;
         const backedStartIso = new Date(slotEndMs + offsetMs).toISOString();
-
-        // V2.2: Track UNCERTAIN_ZONE elapsed time for ON duration deduction
-        const uncertainZoneElapsedMin = Math.max(0, overrunMin);
 
         if (overrunMin <= GRACE_MODE_MAX_MIN) {
           return {
@@ -579,10 +450,7 @@ function computeATCMode(
             scheduledAutoTransitionIso: null,
             statusLine: overrunMin <= 5
               ? `مهلة المزامنة — تجاوزنا الجدول بـ ${overrunMin} دقيقة`
-              : `منطقة غير مؤكدة — بانتظار Growatt (${overrunMin} دقيقة انتظار)`,
-            uncertainZoneElapsedMin,
-            isInUncertainZone: overrunMin > 5,
-            onDurationDeductionMin: 0, // Will be set when Growatt turns ON
+              : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
           };
         }
         // Overrun > 30 min — escalate to WAITING_FOR_GROWATT
@@ -597,26 +465,34 @@ function computeATCMode(
           validationWindowRemainingMin: 0,
           scheduledAutoTransitionIso: null,
           statusLine: `بانتظار تأكيد Growatt — تأخير ${overrunMin} دقيقة`,
-          uncertainZoneElapsedMin,
-          isInUncertainZone: true,
-          onDurationDeductionMin: 0,
         };
       }
     }
   }
 
   // ── CASE 2: Active slot exists — check end-of-slot behavior ──────────────
+  // When the user is near the end of their current slot (within the
+  // verification window), the behavior depends on the offset sign:
+  //
+  //   POSITIVE / NEUTRAL offset → VERIFICATION WINDOW (short, confident)
+  //     The user trusts the prediction. Growatt has either already
+  //     transitioned (positive) or will transition at the same time (neutral).
+  //     A short verification window accounts for API/communication delays.
+  //
+  //   NEGATIVE offset → PREDICTION_RANGE (preparing for UNCERTAIN_ZONE)
+  //     The user is about to enter UNCERTAIN_ZONE when the slot ends.
+  //     The prediction range badge warns the user that uncertainty is coming.
   if (activeSlot?.endIso) {
     const endMs = new Date(activeSlot.endIso).getTime();
     const minutesUntilEnd = (endMs - nowMs) / 60_000;
 
     if (minutesUntilEnd >= 0 && minutesUntilEnd <= VERIFICATION_WINDOW_MIN) {
-      if (effectiveOffsetMin >= 0) {
+      if (offsetMinutes >= 0) {
         // ── VERIFICATION WINDOW (Positive / Neutral) ─────────────────────
-        // V2.2: Short verification window. User is confident — Growatt already
-        // confirmed (positive) or will confirm at same time (neutral).
+        // User is confident — Growatt already confirmed (positive) or
+        // will confirm at the same time (neutral). Short window only.
         return {
-          mode: 'NORMAL',
+          mode: 'NORMAL', // Still NORMAL mode, but with verification window active
           currentState: activeSlot.state,
           currentStateStartIso: activeSlot.startIso,
           isHoldingState: false,
@@ -626,13 +502,11 @@ function computeATCMode(
           validationWindowRemainingMin: Math.round(minutesUntilEnd),
           scheduledAutoTransitionIso: null,
           statusLine: `نافذة التحقق — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
-          uncertainZoneElapsedMin: 0,
-          isInUncertainZone: false,
-          onDurationDeductionMin: 0,
         };
       } else {
-        // ── PREDICTION_RANGE (Negative — approaching UNCERTAIN_ZONE) ──
-        // V2.2: User is about to enter UNCERTAIN_ZONE when this slot ends.
+        // ── PREDICTION_RANGE (Negative — preparing for UNCERTAIN_ZONE) ──
+        // User is about to enter UNCERTAIN_ZONE when this slot ends.
+        // Warn the user that uncertainty is coming.
         return {
           mode: 'PREDICTION_RANGE',
           currentState: activeSlot.state,
@@ -643,10 +517,7 @@ function computeATCMode(
           inValidationWindow: false,
           validationWindowRemainingMin: 0,
           scheduledAutoTransitionIso: null,
-          statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة (ستدخل منطقة غير مؤكدة)`,
-          uncertainZoneElapsedMin: 0,
-          isInUncertainZone: false,
-          onDurationDeductionMin: 0,
+          statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة (تحذير: قريبة من UNCERTAIN_ZONE)`,
         };
       }
     }
@@ -660,18 +531,17 @@ function computeATCMode(
         isHoldingState: false,
         overrunMinutes: 0,
         communityElevated: false,
-        inValidationWindow: effectiveOffsetMin >= 0,
-        validationWindowRemainingMin: effectiveOffsetMin >= 0 ? Math.round(minutesUntilEnd) : 0,
+        inValidationWindow: offsetMinutes >= 0,
+        validationWindowRemainingMin: offsetMinutes >= 0 ? Math.round(minutesUntilEnd) : 0,
         scheduledAutoTransitionIso: null,
         statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
-        uncertainZoneElapsedMin: 0,
-        isInUncertainZone: false,
-        onDurationDeductionMin: 0,
       };
     }
   }
 
   // ── NORMAL ───────────────────────────────────────────────────────────────
+  // User is in the middle of a slot, not near the end. Everything is fine.
+  // For neutral offset: this means the user's timeline matches Growatt exactly.
   return {
     mode: 'NORMAL',
     currentState: activeSlot ? activeSlot.state : growattCurrentState,
@@ -683,56 +553,7 @@ function computeATCMode(
     validationWindowRemainingMin: 0,
     scheduledAutoTransitionIso: null,
     statusLine: '',
-    uncertainZoneElapsedMin: 0,
-    isInUncertainZone: false,
-    onDurationDeductionMin: 0,
   };
-}
-
-// ─── V2.2: UNCERTAIN ZONE → ON DURATION RECONCILIATION ─────────────────────
-
-/**
- * V2.2: When a Negative Offset user exits UNCERTAIN_ZONE because Growatt
- * turned ON, deduct the UNCERTAIN_ZONE waiting time from the next ON duration.
- *
- * Formula: Reconciled ON Duration = Expected ON Duration - UNCERTAIN_ZONE Waiting Time
- *
- * This preserves correct cycle timing and keeps the Personal Timeline
- * synchronized without introducing timeline gaps.
- */
-function reconcileOnDurationAfterUncertainZone(
-  schedule: ShiftedScheduleSlot[],
-  uncertainZoneElapsedMin: number,
-  nowMs: number,
-): ShiftedScheduleSlot[] {
-  if (uncertainZoneElapsedMin <= 0) return schedule;
-
-  // Find the next ON slot after now and adjust its duration
-  return schedule.map(slot => {
-    if (slot.state !== 'ON') return slot;
-    const slotStartMs = new Date(slot.startIso).getTime();
-    if (slotStartMs < nowMs) return slot; // Already started — don't adjust past slots
-
-    // This is the next ON slot — deduct waiting time from its duration
-    const originalEndMs = slot.endIso ? new Date(slot.endIso).getTime() : null;
-    if (!originalEndMs) return slot;
-
-    const originalDurationMs = originalEndMs - slotStartMs;
-    const deductedDurationMs = Math.max(
-      5 * 60_000, // Minimum 5 minutes ON
-      originalDurationMs - uncertainZoneElapsedMin * 60_000,
-    );
-    const newEndMs = slotStartMs + deductedDurationMs;
-    const newEndIso = new Date(newEndMs).toISOString();
-
-    return {
-      ...slot,
-      endIso: newEndIso,
-      endFormatted: fmtYemenTime(newEndIso),
-      shiftedEndFormatted: fmtYemenTime(newEndIso),
-      durationLabel: durationLabelFromMin(Math.round(deductedDurationMs / 60_000)),
-    };
-  });
 }
 
 // ─── MAIN ENGINE FUNCTION ───────────────────────────────────────────────────
@@ -757,37 +578,9 @@ export function applyOffsetToPrediction(
   const offsetMs = effectiveOffset * 60_000;
 
   // ── 1. Build shifted schedule ──────────────────────────────────────────────
-  let shiftedSlots = applyOffsetToSlotsInternal(rawSlots, offsetMs, resyncPoint);
+  const shiftedSlots = applyOffsetToSlotsInternal(rawSlots, offsetMs, resyncPoint);
 
-  // ── 2. V2.2: UNCERTAIN_ZONE ON duration reconciliation ─────────────────────
-  // If the user was in UNCERTAIN_ZONE and Growatt just turned ON, deduct
-  // the waiting time from the next ON duration.
-  const offsetState = resyncPoint?.offsetState;
-  const offsetValue = resyncPoint?.offsetValue;
-  const isPendingNegative = offsetState === 'PENDING_NEGATIVE';
-
-  // Track UNCERTAIN_ZONE elapsed time for the UI
-  let uncertainZoneElapsedMin = 0;
-  if (offsetState === 'NEGATIVE' && prediction.currentState === 'OFF') {
-    // Check if we're in the gap between predicted OFF end and Growatt ON
-    const lastOffSlot = shiftedSlots
-      .filter(s => s.state === 'OFF' && s.endIso && new Date(s.endIso).getTime() <= nowMs)
-      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
-    if (lastOffSlot?.endIso) {
-      uncertainZoneElapsedMin = Math.max(0, Math.round((nowMs - new Date(lastOffSlot.endIso).getTime()) / 60_000));
-    }
-  }
-
-  // Apply ON duration reconciliation if we have UNCERTAIN_ZONE time to deduct
-  if (uncertainZoneElapsedMin > 0) {
-    shiftedSlots = reconcileOnDurationAfterUncertainZone(
-      shiftedSlots,
-      uncertainZoneElapsedMin,
-      nowMs,
-    );
-  }
-
-  // ── 3. Run ATC state machine ───────────────────────────────────────────────
+  // ── 2. Run ATC state machine ───────────────────────────────────────────────
   const atcResult = computeATCMode(
     shiftedSlots,
     prediction.currentState,
@@ -797,7 +590,7 @@ export function applyOffsetToPrediction(
     nowMs,
   );
 
-  // ── 4. Inject synthetic slot for POSITIVE_OFFSET_PENDING ───────────────────
+  // ── 3. Inject synthetic slot for POSITIVE_OFFSET_PENDING ───────────────────
   let finalSlots: ShiftedScheduleSlot[] = [...shiftedSlots];
   if (atcResult.mode === 'POSITIVE_OFFSET_PENDING' && atcResult.scheduledAutoTransitionIso) {
     const heldState: 'ON' | 'OFF' = atcResult.currentState;
@@ -819,7 +612,7 @@ export function applyOffsetToPrediction(
     }, ...shiftedSlots];
   }
 
-  // ── 5. Inject synthetic slot for COMMUNITY_SYNCED ──────────────────────────
+  // ── 4. Inject synthetic slot for COMMUNITY_SYNCED ──────────────────────────
   if (atcResult.mode === 'COMMUNITY_SYNCED' && resyncPoint) {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
     const durationMin = resyncPoint.generatedOnDurationMin ?? 60;
@@ -843,7 +636,7 @@ export function applyOffsetToPrediction(
     }
   }
 
-  // ── 6. Compute community offset (Rule Q2-A) ───────────────────────────────
+  // ── 5. Compute community offset (Rule Q2-A) ───────────────────────────────
   if (resyncPoint && frozenCommunityOffset === null && onOffsetCalculated) {
     const syncMs = new Date(resyncPoint.syncedAtIso).getTime();
     const referenceSlot = rawSlots.find(s => {
@@ -865,7 +658,7 @@ export function applyOffsetToPrediction(
     }
   }
 
-  // ── 7. Build next-transition from shifted schedule ─────────────────────────
+  // ── 6. Build next-transition from shifted schedule ─────────────────────────
   const targetState: 'ON' | 'OFF' = atcResult.currentState === 'ON' ? 'OFF' : 'ON';
   const nextSlot = finalSlots.find(s =>
     s.state === targetState && new Date(s.startIso).getTime() > nowMs,
@@ -882,12 +675,6 @@ export function applyOffsetToPrediction(
     const endMs = startMs + rangeWidthMs;
     const endIso = new Date(endMs).toISOString();
 
-    // V2.2: If next ON slot was reconciled (duration deducted after UNCERTAIN_ZONE),
-    // reflect the shorter duration in the transition info
-    const reconciledDurationMin = nextSlot.durationLabel
-      ? parseDurationLabel(nextSlot.durationLabel)
-      : null;
-
     nextTransition = {
       type: targetState === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
       earliestTime: nextSlot.startIso,
@@ -902,7 +689,7 @@ export function applyOffsetToPrediction(
     nextTransition = prediction.nextTransition;
   }
 
-  // ── 8. Determine V2.2 fields ──────────────────────────────────────────────
+  // ── 7. Determine V2.1 fields ──────────────────────────────────────────────
   const isGeneratedOnCurrent = !!resyncPoint &&
     resyncPoint.syncedState === 'ON' &&
     resyncPoint.generatedOnStartIso !== undefined;
@@ -911,17 +698,10 @@ export function applyOffsetToPrediction(
     durationMin: resyncPoint!.generatedOnDurationMin ?? 0,
     referenceIso: resyncPoint!.generatedOnReferenceIso ?? resyncPoint!.syncedAtIso,
     referenceKind: (resyncPoint!.generatedOnReferenceKind ?? 'completed') as 'completed' | 'active',
-    inheritsReferenceLifecycle: (resyncPoint!.generatedOnReferenceKind ?? 'completed') === 'active',
+    inheritsReferenceLifecycle: false,
   } : null;
 
-  // V2.2: Pending Negative resolution forecast — use the next Growatt ON
-  // transition as the expected resolution time
-  const pendingNegativeResolutionIso =
-    isPendingNegative && prediction.nextTransition?.type === 'UTILITY_ON'
-      ? prediction.nextTransition.earliestTime
-      : null;
-
-  // ── 9. Compute duration labels ─────────────────────────────────────────────
+  // ── 8. Compute duration labels ─────────────────────────────────────────────
   const onSlots = finalSlots.filter(s => s.state === 'ON' && s.endIso);
   const offSlots = finalSlots.filter(s => s.state === 'OFF' && s.endIso);
   const avgOn = onSlots.length > 0
@@ -933,7 +713,7 @@ export function applyOffsetToPrediction(
   const expectedOnDurationLabel = avgOn > 0 ? arabicDurationRange(Math.round(avgOn)) : null;
   const expectedOffDurationLabel = avgOff > 0 ? arabicDurationRange(Math.round(avgOff)) : null;
 
-  // ── 10. Assemble UserPrediction ────────────────────────────────────────────
+  // ── 9. Assemble UserPrediction ─────────────────────────────────────────────
   const atcInfo: ATCInfo = {
     mode: atcResult.mode,
     transitionMode,
@@ -943,10 +723,6 @@ export function applyOffsetToPrediction(
     inValidationWindow: atcResult.inValidationWindow,
     validationWindowRemainingMin: atcResult.validationWindowRemainingMin,
     scheduledAutoTransitionIso: atcResult.scheduledAutoTransitionIso,
-    // V2.2 UNCERTAIN_ZONE tracking
-    uncertainZoneElapsedMin: atcResult.uncertainZoneElapsedMin || uncertainZoneElapsedMin,
-    isInUncertainZone: atcResult.isInUncertainZone,
-    onDurationDeductionMin: atcResult.onDurationDeductionMin,
   };
 
   return {
@@ -965,34 +741,15 @@ export function applyOffsetToPrediction(
     crisisReason: prediction.apppe?.crisisReason ?? null,
     expectedOnDurationLabel,
     expectedOffDurationLabel,
-    // V2.2 fields
-    offsetState: resyncPoint?.offsetState ?? deriveOffsetState(effectiveOffset),
-    offsetValue: offsetValue ?? effectiveOffset,
+    // V2.1 fields
+    offsetState: resyncPoint?.offsetState,
+    offsetValue: resyncPoint?.offsetValue,
     timelineAlignment: resyncPoint?.timelineAlignment,
     generatedOnInfo,
-    isPendingNegative,
+    isPendingNegative: false,
     isGeneratedOnCurrent,
-    pendingNegativeResolutionIso,
+    pendingNegativeResolutionIso: null,
   };
-}
-
-// ─── V2.2: Derive Offset State from numeric offset ──────────────────────────
-function deriveOffsetState(
-  offsetMinutes: number,
-): 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' {
-  if (offsetMinutes > 0) return 'POSITIVE';
-  if (offsetMinutes < 0) return 'NEGATIVE';
-  return 'NEUTRAL';
-}
-
-// ─── V2.2: Parse duration label back to minutes ─────────────────────────────
-function parseDurationLabel(label: string): number | null {
-  // Handle formats like "2س 30د", "1ساعة", "45د"
-  const match = label.match(/(?:(\d+)س\s*)?(?:(\d+)د)?/);
-  if (!match) return null;
-  const hours = parseInt(match[1] || '0', 10);
-  const minutes = parseInt(match[2] || '0', 10);
-  return hours * 60 + minutes;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1066,9 +823,6 @@ export function computeATCStateExport(
     inValidationWindow: result.inValidationWindow,
     validationWindowRemainingMin: result.validationWindowRemainingMin,
     scheduledAutoTransitionIso: result.scheduledAutoTransitionIso,
-    uncertainZoneElapsedMin: result.uncertainZoneElapsedMin,
-    isInUncertainZone: result.isInUncertainZone,
-    onDurationDeductionMin: result.onDurationDeductionMin,
   };
 }
 

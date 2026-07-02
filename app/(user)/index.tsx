@@ -44,8 +44,8 @@ function translateCrisisReason(reason: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TRANSITION MODE TOGGLE — TMMS V2.2
-// Placed at the top of the Home screen.
+// TRANSITION MODE TOGGLE — TMMS
+// Placed at the top of the Home screen (spec: §TRANSITION MODES).
 // AUTO:   Growatt + community + user reports all drive transitions.
 // MANUAL: Only community confirmations and user reports drive transitions.
 //         Growatt feeds APPPE learning only.
@@ -147,7 +147,7 @@ function useCountdownSec(targetMinutes: number | null) {
   return { h: Math.floor(total / 3600), m: Math.floor((total % 3600) / 60), s: total % 60, total };
 }
 
-// ── Format time — Western numerals + Arabic AM/PM suffix, always LTR ──
+// ── Format time — Western numerals + Arabic AM/PM suffix, always LTR (spec §20) ──
 function fmtTimeAr(iso: string): string {
   const raw = new Date(iso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
@@ -156,13 +156,18 @@ function fmtTimeAr(iso: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.2: GENERATED ON BANNER
-// When the user's current state is a Generated ON, the Home Screen surfaces
-// this prominently. The banner shows: start time, duration, reference ON kind,
-// and lifecycle inheritance status.
-// ─────────────────────────────────────────────────────────────────────────────
+// TMMS V2.1: GENERATED ON BANNER
+// PDF §"GENERATED ON IS A REAL TIMELINE EVENT": when the user's current
+// state is a Generated ON (created from their own ON report or cloned from
+// a reporter they approved), the Home Screen must surface this prominently.
+// The banner shows: start time, duration, reference ON kind, and lifecycle
+// inheritance status (if the reference ON is still active, the Generated ON
+// inherits its full lifecycle — verification window, UNCERTAIN_ZONE,
+// duration reconciliation).
+// ───────────────────────────────────────────────────────────────────────
 function GeneratedOnBanner({ prediction }: { prediction: UserPrediction | null }) {
   const genOn = prediction?.generatedOnInfo;
+  // V2.1: only render when current state IS the Generated ON.
   if (!genOn || !prediction?.isGeneratedOnCurrent) return null;
 
   const isOn = prediction.currentState === 'ON';
@@ -216,11 +221,13 @@ const goStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.2: PENDING NEGATIVE BANNER
-// When the user's offset is PENDING_NEGATIVE (Period 2 report), the Home
-// Screen surfaces this. Future ON predictions are marked "Estimated
-// (Pending Offset)". The offset auto-resolves when Growatt turns ON.
-// ─────────────────────────────────────────────────────────────────────────────
+// TMMS V2.1: PENDING NEGATIVE BANNER
+// PDF §Rule 2: when OFF Progress >50% at report time, the Offset State is
+// PendingNegative and the Offset Value is "Waiting for next Growatt ON".
+// The Home Screen must surface this so the user understands WHY future ON
+// predictions are marked "Estimated (Pending Offset)" and WHEN the
+// resolution will happen (when Growatt finally transitions to ON).
+// ───────────────────────────────────────────────────────────────────────
 function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | null }) {
   const isPending = prediction?.isPendingNegative ?? false;
   const resolutionIso = prediction?.pendingNegativeResolutionIso ?? null;
@@ -253,8 +260,8 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
       <View style={{ flex: 1 }}>
         <Text style={pn2Styles.title}>فارق معلَّق (Pending Negative)</Text>
         <Text style={pn2Styles.body}>
-          بلاغك أو بلاغ المُبلِّغ وصل في النصف الثاني من فترة الانطفاء المتوقّعة
-          (Period 2). الفارق الزمني سيُحسب تلقائياً بمجرد أن يتحوّل Growatt إلى تشغيل.
+          بلاغك أو بلاغ المُبلِّغ وصل في النصف الثاني من فترة الانطفاء المتوقّعة.
+          الفارق الزمني سيُحسب تلقائياً بمجرد أن يتحوّل Growatt إلى تشغيل.
         </Text>
         <View style={pn2Styles.countdownRow}>
           <Text style={pn2Styles.countdownLabel}>توقّع الحل:</Text>
@@ -284,10 +291,12 @@ const pn2Styles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TMMS V2.2: OFFSET STATE CHIP
-// Renders a small chip showing the current OffsetState and OffsetValue.
-// Used in the PersonalStatusCard for at-a-glance TMMS visibility.
-// ─────────────────────────────────────────────────────────────────────────────
+// TMMS V2.1: OFFSET STATE CHIP
+// Renders a small chip showing the current OffsetState (Positive / Negative /
+// Neutral / PendingNegative) alongside the numeric OffsetValue. Used in the
+// PersonalStatusCard to give the user at-a-glance visibility into which TMMS
+// rules their timeline is currently following.
+// ───────────────────────────────────────────────────────────────────────
 function OffsetStateChip({ prediction }: { prediction: UserPrediction | null }) {
   const state = prediction?.offsetState;
   const value = prediction?.offsetValue;
@@ -331,7 +340,7 @@ const osStyles = StyleSheet.create({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shows when Growatt has already transitioned but user's scheduled time is future.
-// V2.2 Short Verification Window: Home Page shows OFF with countdown.
+// Spec §POSITIVE OFFSET BEHAVIOR: "سيتم تغيير حالتك تلقائياً في الساعة [HH:MM]"
 // ─────────────────────────────────────────────────────────────────────────────
 function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPrediction | null }) {
   const [tick, setTick] = useState(0);
@@ -354,6 +363,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
     ? `${String(hLeft).padStart(2,'0')}:${String(mLeft).padStart(2,'0')}:${String(sLeft).padStart(2,'0')}`
     : 'الآن';
 
+  // Progress bar: from Growatt transition time to scheduledIso
   const growattTransitionMs = scheduledMs - (prediction?.offsetMinutes ?? 0) * 60_000;
   const totalDurationMs = scheduledMs - growattTransitionMs;
   const elapsedMs = Math.max(0, nowMs - growattTransitionMs);
@@ -373,7 +383,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
         <Text style={{ fontSize: 22 }}>⏰</Text>
       </View>
       <View style={{ flex: 1 }}>
-        <Text style={popStyles.title}>نافذة التحقق القصيرة (Short Verification)</Text>
+        <Text style={popStyles.title}>تغيير تلقائي مجدول</Text>
         <Text style={popStyles.body}>
           سيتم تغيير حالتك إلى{' '}
           <Text style={{ fontWeight: '800', color: isOn ? T.danger : T.success }}>
@@ -382,10 +392,12 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
           {' '}تلقائياً في الساعة{' '}
           <Text style={{ fontWeight: '800', color: T.accent }}>{scheduledTimeLabel}</Text>
         </Text>
+        {/* Countdown */}
         <View style={popStyles.countdownRow}>
           <Text style={popStyles.countdownLabel}>الوقت المتبقي:</Text>
           <Text style={popStyles.countdownValue}>{countdownLabel}</Text>
         </View>
+        {/* Progress bar */}
         <View style={popStyles.progressTrack}>
           <View style={[popStyles.progressFill, { width: `${Math.round(progressPct * 100)}%` }]} />
         </View>
@@ -394,7 +406,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
           <Text style={popStyles.progressPct}>{Math.round(progressPct * 100)}%</Text>
           <Text style={popStyles.progressLabelLeft}>وقتك المجدول</Text>
         </View>
-        <Text style={popStyles.sub}>الفارق الإيجابي: {prediction?.offsetMinutes ?? 0} دقيقة</Text>
+        <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {prediction?.offsetMinutes ?? 0} دقيقة</Text>
       </View>
     </View>
   );
@@ -419,73 +431,6 @@ const popStyles = StyleSheet.create({
   progressLabelRight: { color: T.textMuted, fontSize: 9 },
   progressLabelLeft: { color: T.accent + 'aa', fontSize: 9 },
   progressPct: { color: T.accent, fontSize: 10, fontWeight: '700' },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// V2.2: UNCERTAIN_ZONE BANNER
-// Shows when Negative Offset user is waiting in UNCERTAIN_ZONE.
-// Displays elapsed waiting time and ON duration deduction info.
-// ─────────────────────────────────────────────────────────────────────────────
-function UncertainZoneBanner({ prediction }: { prediction: UserPrediction | null }) {
-  const atcMode = prediction?.atc?.mode;
-  const isUncertain = atcMode === 'UNCERTAIN_ZONE' || prediction?.atc?.isInUncertainZone;
-  const elapsedMin = prediction?.atc?.uncertainZoneElapsedMin ?? 0;
-  const deductionMin = prediction?.atc?.onDurationDeductionMin ?? 0;
-
-  if (!isUncertain && elapsedMin <= 0) return null;
-
-  const [tick, setTick] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  const displayElapsedMin = elapsedMin + tick / 60;
-  const h = Math.floor(displayElapsedMin / 60);
-  const m = Math.floor(displayElapsedMin % 60);
-  const elapsedLabel = h > 0 ? `${h}س ${m}د` : `${m} دقيقة`;
-
-  return (
-    <View style={uzStyles.banner}>
-      <View style={uzStyles.iconWrap}>
-        <Text style={{ fontSize: 22 }}>⚠️</Text>
-      </View>
-      <View style={{ flex: 1 }}>
-        <Text style={uzStyles.title}>منطقة غير مؤكدة (UNCERTAIN_ZONE)</Text>
-        <Text style={uzStyles.body}>
-          الكهرباء طافية — بانتظار تحوّل Growatt إلى تشغيل...
-        </Text>
-        <View style={uzStyles.elapsedRow}>
-          <Text style={uzStyles.elapsedLabel}>وقت الانتظار المنقضي:</Text>
-          <Text style={uzStyles.elapsedValue}>{elapsedLabel}</Text>
-        </View>
-        {deductionMin > 0 && (
-          <Text style={uzStyles.deduction}>
-            ⏱ عند التشغيل القادم: سيتم خصم {deductionMin}د من مدة التشغيل
-          </Text>
-        )}
-        <Text style={uzStyles.note}>
-          ⚠ هذا الوقت سيُخصم تلقائياً من مدة التشغيل القادمة لحفظ توقيت الدورة.
-        </Text>
-      </View>
-    </View>
-  );
-}
-
-const uzStyles = StyleSheet.create({
-  banner: {
-    flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12,
-    backgroundColor: '#1a0e00', borderRadius: 16, padding: 14, marginBottom: 12,
-    borderWidth: 1.5, borderColor: T.warning + '66',
-  },
-  iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.warning, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 8 },
-  elapsedRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 6 },
-  elapsedLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
-  elapsedValue: { color: T.warning, fontSize: 16, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
-  deduction: { color: T.accent, fontSize: 11, fontWeight: '700', textAlign: 'right', marginBottom: 4 },
-  note: { color: T.warning + 'aa', fontSize: 10, fontStyle: 'italic', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -577,8 +522,10 @@ const pdcStyles = StyleSheet.create({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1: Personal Utility Status Hero Card
-// V2.2: shows PERSONAL current state, duration, range, why, waiting.
-// V2.2: UNCERTAIN_ZONE shows elapsed waiting + ON duration deduction.
+// Spec §17/§21: shows PERSONAL current state, duration, range, why, waiting.
+// Spec §22: community sync card with reporter name + reliability always shown.
+// Spec §23: typical durations in human-friendly Arabic.
+// TMMS: UNCERTAIN_ZONE shows overrun + accumulation message.
 // ─────────────────────────────────────────────────────────────────────────────
 function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, hasSnapshot, reasoningLine }: {
   prediction: UserPrediction | null;
@@ -592,12 +539,18 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const isOn = prediction?.currentState === 'ON';
   const color = isOn ? T.success : T.danger;
 
+  // TMMS V2.1: surface the Offset State (Positive/Negative/Neutral/PendingNegative)
+  // prominently so the user understands which TMMS rules their timeline is
+  // currently following. The chip renders just below the status text.
+  // V2.1: the chip is unconditional — Rules of Hooks requires it to be called
+  // before any early return, even if atcMode === 'COMMUNITY_SYNCED' renders
+  // a slightly different layout. The chip itself only renders when state is set.
   const offsetStateChip = <OffsetStateChip prediction={prediction} />;
 
-  // Elapsed — driven by persistent anchor
+  // Elapsed — driven by persistent anchor, never resets on prediction refresh
   const elapsed = useElapsedFromIso(anchorStartIso);
 
-  // Community sync elapsed
+  // Community sync elapsed — unconditional (Rules of Hooks)
   const meta = prediction?.communitySyncMeta;
   const syncElapsed = useElapsedFromIso(meta?.syncedAtIso ?? null);
 
@@ -605,6 +558,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const currentSlot = (() => {
     const slots = prediction?.daySchedule ?? [];
     const nowMs = Date.now();
+    // Only POSITIVE_OFFSET_PENDING injects a synthetic current-state slot at
+    // index 0 of daySchedule (engine applyOffsetToPrediction unshift).
+    // COMMUNITY_SYNCED does NOT inject at index 0 — the generated resynced slot
+    // sits at its natural position inside effectiveSlots (after any preCycleSlots)
+    // and is reliably found by the standard findIndex below.  Using slots[0] for
+    // COMMUNITY_SYNCED would return a past preCycleSlot, giving remainMinutes = 0.
     if (atcMode === 'POSITIVE_OFFSET_PENDING' && slots.length > 0) {
       return slots[0];
     }
@@ -633,6 +592,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     if (Platform.OS === 'web') {
       setRevertConfirmVisible(true);
     } else {
+      // Native Alert is handled by Home screen's handleRevert (passed via onRevertToGrowatt)
       onRevertToGrowatt?.();
     }
   }, [onRevertToGrowatt]);
@@ -666,7 +626,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     </View>
   ) : null;
 
-  // ── Typical durations ───────────────────────────────────────────
+  // ── Typical durations (spec §23) ─────────────────────────────────────────
   const DurationsBlock = (prediction?.expectedOnDurationLabel || prediction?.expectedOffDurationLabel) ? (
     <View style={psStyles.durRow}>
       {prediction?.expectedOnDurationLabel ? (
@@ -690,14 +650,14 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     </View>
   ) : null;
 
-  // ── Reasoning ──────────────────────────────────────────────────
+  // ── Reasoning (spec §21) ──────────────────────────────────────────────────
   const ReasoningBlock = reasoningLine ? (
     <View style={psStyles.reasoningBox}>
       <Text style={psStyles.reasoningText}>💡 {reasoningLine}</Text>
     </View>
   ) : null;
 
-  // ── COMMUNITY_SYNCED branch ────────────────────────────────────
+  // ── COMMUNITY_SYNCED branch (spec §22) ────────────────────────────────────
   if (atcMode === 'COMMUNITY_SYNCED') {
     const reporterName = meta?.reporterName ?? 'مجهول';
     const reporterRel = meta?.reporterReliability;
@@ -708,6 +668,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{isOn ? '⚡' : '🔴'}</Animated.Text>
           <Text style={[psStyles.statusText, { color }]}>{isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}</Text>
         </View>
+        {/* V2.1: Offset State chip — shows what was cloned from the reporter */}
         {offsetStateChip}
         <View style={[psStyles.communityBanner, { borderColor: T.accent + '44' }]}>
           <View style={{ flex: 1 }}>
@@ -725,6 +686,9 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
             {meta?.syncedAtIso && (
               <Text style={psStyles.communityBannerTime}>تم تأكيد هذه الحالة منذ: {syncElapsed || 'للتو'}</Text>
             )}
+            {/* V2.1: confirmation-only note. PDF §"COMMUNITY CONFIRMATION":
+                confirmation never modifies timeline calculations — only
+                confidence/trust. The note makes this explicit. */}
             <Text style={psStyles.communityBannerNote}>
               ⚠ تأكيدك لا يغيّر وقت البلاغ الأصلي ولا الفارق — يُؤثّر فقط على موثوقية المُبلِّغ.
             </Text>
@@ -758,14 +722,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     );
   }
 
-  // ── NORMAL / ATC modes ─────────────────────────────────────────
+  // ── NORMAL / ATC modes ────────────────────────────────────────────────────
   const icon = isOn ? '⚡' : '🔴';
   const statusText = isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية';
   const showATCBadge = atcMode !== 'NORMAL';
   const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
   const tMode = prediction?.atc?.transitionMode ?? 'AUTO';
-  const uncertainElapsed = prediction?.atc?.uncertainZoneElapsedMin ?? 0;
-  const onDeduction = prediction?.atc?.onDurationDeductionMin ?? 0;
 
   return (
     <View style={[psStyles.card, { borderColor: color + '30' }]}>
@@ -774,6 +736,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{icon}</Animated.Text>
         <Text style={[psStyles.statusText, { color }]}>{statusText}</Text>
       </View>
+      {/* V2.1: Offset State chip — visible in NORMAL / ATC modes too */}
       {offsetStateChip}
 
       <View style={psStyles.timeRow}>
@@ -791,14 +754,14 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         ) : null}
       </View>
 
-      {/* ATC mode badge with V2.2 TMMS-aware messages */}
+      {/* ATC mode badge with TMMS-aware messages (spec §16/§UNCERTAIN_ZONE) */}
       {showATCBadge && (() => {
         const configs: Record<string, { icon: string; bg: string; border: string; textColor: string; body?: string }> = {
           PREDICTION_RANGE: { icon: '🔮', bg: '#0a1a2e', border: T.accent + '55', textColor: T.accent },
           UNCERTAIN_ZONE: {
             icon: '⚠',  bg: '#1a0e00', border: T.warning + '55', textColor: T.warning,
-            body: uncertainElapsed > 0
-              ? `منطقة غير مؤكدة — وقت الانتظار: ${uncertainElapsed}د · خصم من التشغيل القادم: ${onDeduction}د`
+            body: overrunMin > 0
+              ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — وقت الانتظار سيُجمع إلى المدة الفعلية`
               : undefined,
           },
           WAITING_FOR_GROWATT: {
@@ -849,6 +812,7 @@ const psStyles = StyleSheet.create({
   communityBannerRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 4 },
   communityBannerReporter: { color: T.textSecondary, fontSize: 13, textAlign: 'right' },
   communityBannerTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
+  // V2.1: confirmation-only note inside the community banner
   communityBannerNote: { color: T.warning + 'aa', fontSize: 10, fontStyle: 'italic', marginTop: 6, textAlign: 'right', lineHeight: 15 },
   reliabilityChip: { backgroundColor: T.success + '20', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: T.success + '44' },
   reliabilityChipText: { color: T.success, fontSize: 10, fontWeight: '700' },
@@ -877,14 +841,14 @@ const psStyles = StyleSheet.create({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 2: Upcoming Expected Transition Hero Card
-// V2.2: UNCERTAIN_ZONE shows overrun + ON duration deduction message.
+// Spec §19: range PRIMARY — stacked layout. Spec §20: LTR Western numerals.
+// TMMS: UNCERTAIN_ZONE shows overrun + accumulation message.
 // ─────────────────────────────────────────────────────────────────────────────
 function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
   const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
-  const uncertainElapsed = prediction?.atc?.uncertainZoneElapsedMin ?? 0;
   const midMin = nt ? (nt.minFromNowMin + nt.maxFromNowMin) / 2 : null;
   const { h, m, s, total } = useCountdownSec(midMin);
   const maxSec = midMin ? midMin * 60 : 1;
@@ -897,6 +861,9 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   if (!prediction) return null;
 
+  // CRITICAL: For POSITIVE_OFFSET_PENDING, build an nt from the scheduled transition time
+  // even if prediction.isUnstable=true (which forces nextTransition=null in the hook).
+  // This ensures the hold card always renders instead of the unstable-message card.
   const effectiveNt = (() => {
     if (
       isHolding &&
@@ -921,15 +888,15 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     return nt;
   })();
 
-  // ATC hold card
+  // ATC hold card — MUST be checked before isUnstable to avoid showing wrong message
   if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
     const isCurrentOn = prediction.currentState === 'ON';
     const tMode = prediction.atc.transitionMode ?? 'AUTO';
     const modeConfigs: Record<string, { icon: string; title: string; body: string; borderColor: string; iconColor: string }> = {
       UNCERTAIN_ZONE: {
-        icon: '⚠️', title: 'منطقة غير مؤكدة (UNCERTAIN_ZONE)',
-        body: uncertainElapsed > 0
-          ? `منطقة غير مؤكدة — وقت الانتظار: ${uncertainElapsed} دقيقة · سيتم خصم هذا الوقت من مدة التشغيل القادمة`
+        icon: '⚠️', title: 'استمرار غير معتاد',
+        body: overrunMin > 0
+          ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — هذا الوقت سيُجمع إلى المدة الفعلية للدورة`
           : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد',
         borderColor: T.warning + '44', iconColor: T.warning,
       },
@@ -951,7 +918,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         borderColor: T.warning + '44', iconColor: T.warning,
       },
       POSITIVE_OFFSET_PENDING: {
-        icon: '⏰', title: 'نافذة التحقق القصيرة',
+        icon: '⏰', title: 'تغيير تلقائي مجدول',
         body: prediction?.atc?.statusLine ?? 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد',
         borderColor: T.accent + '44', iconColor: T.accent,
       },
@@ -991,7 +958,21 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     );
   }
 
-  // No prediction available
+  // ── v4.2: COUNTDOWN-CARD / CRISIS COEXISTENCE FIX ──────────────────────────
+  //
+  // BEFORE (v4.1): `if (prediction.isUnstable || !nt) return <UnstableCard/>`
+  //   This entirely replaced the countdown card with a "النمط غير مستقر" message
+  //   whenever crisis mode triggered isUnstable=true — even though we still had
+  //   a perfectly good `nt` (next transition range) to display.
+  //
+  // AFTER (v4.2): Split into two branches:
+  //   • !nt              → still show the "no prediction" card (genuinely nothing to count down to)
+  //   • isUnstable && nt → fall through to the normal countdown card, but render a small
+  //                        "crisis-aware prediction" chip below the title so the user knows
+  //                        the engine is adapting. The countdown STAYS VISIBLE.
+  //
+  // The crisis banner at the top of the home screen still fires separately (line ~1397),
+  // so the user gets BOTH the countdown AND the crisis notice — never one replacing the other.
   if (!nt) {
     return (
       <View style={[utStyles.card, { borderColor: T.warning + '44' }]}>
@@ -1010,243 +991,775 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   const confText = confPct >= 80 ? 'ثقة مرتفعة' : confPct >= 55 ? 'ثقة متوسطة' : 'ثقة منخفضة';
   const confColor = confPct >= 80 ? T.success : confPct >= 55 ? T.warning : T.danger;
 
+  // v4.2: crisis-aware chip — shown inline when isUnstable is true but we still render the countdown.
+  // Replaces the old behavior of hiding the countdown card entirely during crisis.
   const showCrisisAwareChip = prediction.isUnstable;
 
   const slots = prediction.daySchedule ?? [];
   const nextIdx = slots.findIndex(s => {
     const state: 'ON' | 'OFF' = isNextOn ? 'ON' : 'OFF';
-    return s.state === state;
+    return s.state === state && new Date(s.startIso).getTime() > Date.now();
   });
-  const showRangeSecondary = nextIdx >= 0 && slots[nextIdx]?.endIso;
+  const afterNext = nextIdx >= 0 && nextIdx + 1 < slots.length ? slots[nextIdx + 1] : null;
 
   return (
-    <View style={[utStyles.card, { borderColor: color + '44' }]}>
-      <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+    <View style={[utStyles.card, { borderColor: color + '30' }]}>
+      <View style={utStyles.headerRow}>
+        <View style={[utStyles.confBadge, { backgroundColor: confColor + '20', borderColor: confColor + '44' }]}>
+          <Text style={[utStyles.confText, { color: confColor }]}>{confText}</Text>
+        </View>
+        <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+      </View>
 
+      {/* v4.2: Inline crisis-awareness chip — keeps countdown visible during crisis */}
       {showCrisisAwareChip && (
-        <View style={utStyles.crisisChip}>
-          <Text style={utStyles.crisisChipText}>⚠️ تنبؤ مُتكيّف — الأنماط غير مستقرة</Text>
+        <View style={utStyles.crisisAwareChip}>
+          <Text style={utStyles.crisisAwareChipText}>
+            ⚠️ محرك التوقع يتكيّف مع تغيّر النمط — قد تتأثر دقة التوقع
+          </Text>
         </View>
       )}
 
-      {/* Countdown ring */}
-      <View style={utStyles.countdownRing}>
-        <View style={utStyles.countdownInner}>
-          <Text style={[utStyles.countdownState, { color }]}>
-            {isNextOn ? '⚡ تشغيل' : '🔴 انطفاء'}
+      {nt.inRangeWindow && (
+        <View style={[utStyles.rangeWindowBadge, { backgroundColor: color + '15', borderColor: color + '66' }]}>
+          <Text style={[utStyles.rangeWindowText, { color }]}>
+            🟠 {isNextOn ? 'بدأ نطاق التشغيل المتوقع' : 'بدأ نطاق الانطفاء المتوقع'}
           </Text>
-          <Text style={utStyles.countdownTime}>
-            {String(h).padStart(2, '0')}:{String(m).padStart(2, '0')}:{String(s).padStart(2, '0')}
-          </Text>
-          <Text style={utStyles.countdownLabel}>تقريباً</Text>
+          <Text style={[utStyles.rangeWindowSub, { color: color + 'aa' }]}>قد يحدث التغيير في أي لحظة</Text>
         </View>
-        <View style={utStyles.ringTrack}>
-          <Animated.View style={[
-            utStyles.ringFill,
-            {
-              borderColor: color,
-              transform: [{
-                rotate: animProg.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: ['0deg', '360deg'],
-                }),
-              }],
-            },
-          ]} />
-        </View>
-      </View>
+      )}
 
-      {/* Time range */}
-      <View style={utStyles.rangeBox}>
+      {/* PRIMARY: stacked range (spec §19), LTR (spec §20) */}
+      <View style={[utStyles.rangeBox, { borderColor: color + '25' }]}>
         <Text style={[utStyles.rangeBoxLabel, { color }]}>
           {isNextOn ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
         </Text>
         <View style={utStyles.rangeTimeStack} dir="ltr">
           <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeStartIso)}</Text>
-          {nt.rangeStartIso !== nt.rangeEndIso && (
-            <>
-              <Text style={utStyles.rangeSep}>و</Text>
-              <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeEndIso)}</Text>
-            </>
-          )}
+          <Text style={[utStyles.rangeSep, { color: color + '88' }]}>و</Text>
+          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeEndIso)}</Text>
         </View>
-        {showRangeSecondary && (
-          <Text style={utStyles.rangeSecondary}>
-            {isNextOn ? '⚡' : '🔴'} المتوقع {fmtTimeAr(slots[nextIdx].startIso)} → {fmtTimeAr(slots[nextIdx].endIso!)}
-          </Text>
-        )}
       </View>
 
-      {/* Confidence bar */}
-      <View style={utStyles.confBar}>
-        <View style={[utStyles.confFill, { width: `${confPct}%`, backgroundColor: confColor }]} />
-      </View>
-      <Text style={[utStyles.confText, { color: confColor }]}>{confText} · {confPct}%</Text>
+      {/* SECONDARY: countdown (spec §20) */}
+      {!nt.inRangeWindow && (
+        <View style={utStyles.countdownSection}>
+          <Text style={utStyles.countdownLabel}>⏳ يبدأ نطاق التوقع بعد</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginBottom: 10 }}>
+            {h > 0 && (
+              <>
+                <View style={utStyles.cdUnit}>
+                  <Text style={[utStyles.cdVal, { color }]}>{String(h).padStart(2, '0')}</Text>
+                  <Text style={utStyles.cdSub}>س</Text>
+                </View>
+                <Text style={[utStyles.cdColon, { color }]}>:</Text>
+              </>
+            )}
+            <View style={utStyles.cdUnit}>
+              <Text style={[utStyles.cdVal, { color }]}>{String(m).padStart(2, '0')}</Text>
+              <Text style={utStyles.cdSub}>د</Text>
+            </View>
+            <Text style={[utStyles.cdColon, { color }]}>:</Text>
+            <View style={utStyles.cdUnit}>
+              <Text style={[utStyles.cdVal, { color }]}>{String(s).padStart(2, '0')}</Text>
+              <Text style={utStyles.cdSub}>ث</Text>
+            </View>
+          </View>
+          <View style={utStyles.progressTrack}>
+            <Animated.View style={[utStyles.progressFill, {
+              backgroundColor: color,
+              width: animProg.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] }),
+            }]} />
+          </View>
+        </View>
+      )}
+
+      {afterNext && afterNext.endIso && (
+        <View style={utStyles.afterNextBox}>
+          <Text style={utStyles.afterNextLabel}>التغيير المتوقع بعد ذلك</Text>
+          <Text style={[utStyles.afterNextVal, { color: afterNext.state === 'ON' ? T.success : T.danger }]}>
+            {afterNext.state === 'ON' ? '🟢 تشغيل الكهرباء' : '🔴 انقطاع الكهرباء'}
+            {'  '}{fmtTimeAr(afterNext.startIso)} — {fmtTimeAr(afterNext.endIso)}
+          </Text>
+        </View>
+      )}
     </View>
   );
 }
 
 const utStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 22, padding: 20, marginBottom: 14, borderWidth: 1.5 },
-  cardTitle: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5, marginBottom: 16, textAlign: 'right' },
-  countdownRing: { alignItems: 'center', marginBottom: 20 },
-  countdownInner: { alignItems: 'center', zIndex: 1 },
-  countdownState: { fontSize: 18, fontWeight: '800', marginBottom: 6 },
-  countdownTime: { color: T.textPrimary, fontSize: 36, fontWeight: '900', fontVariant: ['tabular-nums'] },
-  countdownLabel: { color: T.textMuted, fontSize: 11, marginTop: 4 },
-  ringTrack: { position: 'absolute', width: 140, height: 140, borderRadius: 70, borderWidth: 4, borderColor: T.elevated, justifyContent: 'center', alignItems: 'center' },
-  ringFill: { position: 'absolute', width: 140, height: 140, borderRadius: 70, borderWidth: 4, borderTopColor: 'transparent', borderRightColor: 'transparent', borderBottomColor: 'transparent' },
-  rangeBox: { backgroundColor: T.elevated, borderRadius: 14, padding: 14, marginBottom: 14 },
-  rangeBoxLabel: { fontSize: 12, fontWeight: '700', textAlign: 'right', marginBottom: 8 },
-  rangeTimeStack: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, justifyContent: 'center' },
-  rangeTime: { fontSize: 20, fontWeight: '800', fontVariant: ['tabular-nums'] },
-  rangeSep: { color: T.textMuted, fontSize: 13 },
-  rangeSecondary: { color: T.textMuted, fontSize: 11, textAlign: 'center', marginTop: 8 },
-  confBar: { height: 6, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden', marginBottom: 6 },
-  confFill: { height: 6, borderRadius: 3 },
-  confText: { fontSize: 11, fontWeight: '700', textAlign: 'right' },
-  crisisChip: { backgroundColor: T.warning + '15', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5, marginBottom: 12, borderWidth: 1, borderColor: T.warning + '33', alignSelf: 'flex-start' },
-  crisisChipText: { color: T.warning, fontSize: 10, fontWeight: '700' },
-  holdBox: { backgroundColor: T.elevated, borderRadius: 14, padding: 16, marginBottom: 14 },
-  holdTitle: { fontSize: 15, fontWeight: '800', textAlign: 'right', marginBottom: 6 },
-  holdBody: { color: T.textSecondary, fontSize: 12, lineHeight: 18, textAlign: 'right' },
-  communityPrioBox: { backgroundColor: T.accent + '10', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.accent + '33' },
-  communityPrioText: { color: T.accent, fontSize: 11, fontWeight: '700', textAlign: 'right' },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  cardTitle: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5 },
+  confBadge: { borderRadius: 20, paddingHorizontal: 12, paddingVertical: 5, borderWidth: 1 },
+  confText: { fontSize: 12, fontWeight: '700' },
+  rangeWindowBadge: { borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1.5, marginBottom: 14, alignItems: 'center' },
+  rangeWindowText: { fontSize: 15, fontWeight: '800', textAlign: 'center', marginBottom: 4 },
+  rangeWindowSub: { fontSize: 11, textAlign: 'center' },
+  rangeBox: { backgroundColor: T.elevated, borderRadius: 18, padding: 20, marginBottom: 16, borderWidth: 1, alignItems: 'center' },
+  rangeBoxLabel: { fontSize: 14, fontWeight: '600', marginBottom: 14, textAlign: 'center' },
+  rangeTimeStack: { alignItems: 'center', gap: 8 },
+  rangeTime: { fontSize: 32, fontWeight: '900', textAlign: 'center', letterSpacing: -0.5, writingDirection: 'ltr' },
+  rangeSep: { fontSize: 14, fontWeight: '600', color: T.textMuted },
+  countdownSection: { alignItems: 'center', marginBottom: 14 },
+  countdownLabel: { color: T.textMuted, fontSize: 11, marginBottom: 10 },
+  cdUnit: { alignItems: 'center', minWidth: 44 },
+  cdVal: { fontSize: 34, fontWeight: '900', letterSpacing: -1 },
+  cdSub: { color: T.textMuted, fontSize: 10, marginTop: -2 },
+  cdColon: { fontSize: 30, fontWeight: '900', marginBottom: 8 },
+  progressTrack: { width: '100%', height: 3, backgroundColor: T.elevated, borderRadius: 2, overflow: 'hidden' },
+  progressFill: { height: 3, borderRadius: 2 },
+  afterNextBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 12 },
+  afterNextLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 6, textAlign: 'right' },
+  afterNextVal: { fontSize: 13, fontWeight: '700', textAlign: 'right' },
+  holdBox: { flexDirection: 'row-reverse', gap: 12, alignItems: 'flex-start', backgroundColor: T.elevated, borderRadius: 14, padding: 14, marginBottom: 12 },
+  holdTitle: { fontSize: 15, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  holdBody: { color: T.textMuted, fontSize: 12, lineHeight: 18, textAlign: 'right' },
+  communityPrioBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.accent + '44' },
+  communityPrioText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
+  // v4.2: inline crisis-awareness chip — soft amber, non-blocking
+  crisisAwareChip: {
+    backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12,
+    borderWidth: 1, borderColor: T.warning + '44',
+  },
+  crisisAwareChipText: {
+    color: T.warning, fontSize: 11, fontWeight: '600', textAlign: 'right', lineHeight: 16,
+  },
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3: Today's Timeline
+// ─────────────────────────────────────────────────────────────────────────────
+function TodayTimeline({ prediction, anchorStartIso }: {
+  prediction: UserPrediction | null;
+  anchorStartIso: string | null;
+}) {
+  const stableStartMapRef   = useRef<Record<string, string>>({});
+  const stableEndMapRef     = useRef<Record<string, string>>({});
+  const lastComputedAtRef   = useRef<string | null>(null);
+  const lastOffsetRef       = useRef<number | null>(null);
+  const lastResyncRef       = useRef<string | null>(null);
+
+  const computedAt       = prediction?.computedAt ?? null;
+  const currentOffset    = prediction?.offsetMinutes ?? 0;
+  const currentResyncIso = prediction?.resyncedAtIso ?? null;
+
+  if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+  }
+  lastOffsetRef.current = currentOffset;
+
+  const resyncChanged = lastResyncRef.current !== currentResyncIso;
+  if (resyncChanged) {
+    stableStartMapRef.current = {};
+    stableEndMapRef.current   = {};
+    lastResyncRef.current     = currentResyncIso;
+  }
+
+  const slots = prediction?.daySchedule ?? [];
+  const nowMs = Date.now();
+  // For POSITIVE_OFFSET_PENDING: the synthetic slot (injected at front) IS the active slot
+  const atcMode = prediction?.atc?.mode;
+  const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+
+  const activeIdx = (() => {
+    // Only POSITIVE_OFFSET_PENDING injects a synthetic current-state slot at
+    // index 0 of daySchedule (engine applyOffsetToPrediction unshift).
+    // COMMUNITY_SYNCED does NOT inject at index 0 — the generated resynced
+    // slot sits at its natural position inside effectiveSlots (preceded by
+    // any preCycleSlots that are already in the past) and is reliably found
+    // by the standard findIndex: its startIso = resync.syncedAtIso (past),
+    // endIso = generatedCycleEndIso (future), so nowMs correctly falls inside.
+    if (isPositiveOffsetPending && slots.length > 0) {
+      return 0;
+    }
+    return slots.findIndex(s => {
+      const start = new Date(s.startIso).getTime();
+      const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+      return nowMs >= start && nowMs < end;
+    });
+  })();
+
+  const startIdx = activeIdx >= 0 ? activeIdx : slots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
+  const displaySlots = startIdx >= 0 ? slots.slice(startIdx, startIdx + 4) : slots.slice(0, 4);
+  if (displaySlots.length === 0) return null;
+
+  return (
+    <View style={tlStyles.card}>
+      <Text style={tlStyles.title}>جدول اليوم</Text>
+      {displaySlots.map((slot, i) => {
+        const isActive = i === 0 && activeIdx >= 0;
+        const isOn = slot.state === 'ON';
+        const color = isOn ? T.success : T.danger;
+        const slotKey = `${slot.state}|${Math.round(new Date(slot.startIso).getTime() / 60_000)}`;
+
+        // For the active POSITIVE_OFFSET_PENDING slot, override start time with
+        // anchorStartIso so the synthetic slot (injected by the engine at index 0)
+        // shows the correct reconciled start moment.
+        // For COMMUNITY_SYNCED, the engine's generated slot already carries the
+        // correct shiftedStartFormatted = fmtYemenTime(resync.syncedAtIso), so no
+        // override is needed — using the slot's own formatted value is accurate.
+        let currentStartF: string;
+        if (isActive && isPositiveOffsetPending && anchorStartIso) {
+          currentStartF = new Date(anchorStartIso).toLocaleString('en-US', {
+            timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+          }).replace('AM', ' ص').replace('PM', ' م');
+        } else {
+          currentStartF = slot.shiftedStartFormatted ?? slot.startFormatted;
+        }
+
+        if (!stableStartMapRef.current[slotKey] && currentStartF) {
+          stableStartMapRef.current[slotKey] = currentStartF;
+        }
+        const startF = isActive && isPositiveOffsetPending && anchorStartIso
+          ? currentStartF  // always use fresh anchor for the synthetic POSITIVE_OFFSET_PENDING slot
+          : (stableStartMapRef.current[slotKey] ?? currentStartF);
+
+        const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
+        if (!stableEndMapRef.current[slotKey] && currentEndF) {
+          stableEndMapRef.current[slotKey] = currentEndF;
+        }
+        const endF = stableEndMapRef.current[slotKey] ?? currentEndF;
+        const isFuture = !isActive && new Date(slot.startIso).getTime() > nowMs;
+        return (
+          <View key={i} style={[tlStyles.row, i < displaySlots.length - 1 && tlStyles.rowBorder]}>
+            <View style={tlStyles.timelineCol}>
+              {i < displaySlots.length - 1 && (
+                <View style={[tlStyles.line, { backgroundColor: color + '40' }]} />
+              )}
+              <View style={[tlStyles.dot, { backgroundColor: color, opacity: isFuture && !isActive ? 0.5 : 1 }]} />
+            </View>
+            <View style={[tlStyles.content, isFuture && !isActive && tlStyles.contentFaded]}>
+              <View style={tlStyles.topRow}>
+                {isActive && (
+                  <View style={[tlStyles.nowChip, { backgroundColor: color + '20', borderColor: color + '66' }]}>
+                    <Text style={[tlStyles.nowChipText, { color }]}>الآن</Text>
+                  </View>
+                )}
+                {slot.isEstimated && !isActive && (
+                  <View style={tlStyles.estChip}><Text style={tlStyles.estChipText}>تقديري</Text></View>
+                )}
+                {slot.isResynced && (
+                  <View style={tlStyles.syncChip}><Text style={tlStyles.syncChipText}>👥</Text></View>
+                )}
+                {/* V2.1: Generated ON badge — marks slots that were created as a
+                    Generated ON event (PDF §"GENERATED ON IS A REAL TIMELINE EVENT"). */}
+                {(slot as any).isGeneratedOn && (
+                  <View style={tlStyles.genOnChip}><Text style={tlStyles.genOnChipText}>⚡ مُولّدة</Text></View>
+                )}
+                {/* V2.1: Estimated (Pending Offset) badge — marks future ON slots
+                    whose precise start time is unknown because the user's offset
+                    is currently PendingNegative (PDF §"Pending Negative"). */}
+                {(slot as any).isEstimatedPendingOffset && (
+                  <View style={tlStyles.pendingChip}><Text style={tlStyles.pendingChipText}>تقديري معلَّق</Text></View>
+                )}
+                <Text style={[tlStyles.stateText, { color }]}>
+                  {isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}
+                </Text>
+              </View>
+                            {/* تم التعديل: قمنا بحقن التوقيت المصحح داخل الـ Ref لمنع زحزحة الوقت للأمام */}
+              <Text style={tlStyles.timeText}>
+                {startF}{endF ? ` → ${endF}` : ' → …'}
+              </Text>
+
+
+              {slot.durationLabel && (
+                <Text style={[tlStyles.durText, { color: color + 'aa' }]}>{slot.durationLabel}</Text>
+              )}
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+const tlStyles = StyleSheet.create({
+  card: { backgroundColor: T.surface, borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
+  title: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5, marginBottom: 16, textAlign: 'right' },
+  row: { flexDirection: 'row-reverse', gap: 14, paddingBottom: 16, marginBottom: 16 },
+  rowBorder: { borderBottomWidth: 1, borderBottomColor: T.elevated },
+  timelineCol: { width: 16, alignItems: 'center', position: 'relative', paddingTop: 3 },
+  dot: { width: 12, height: 12, borderRadius: 6, zIndex: 1 },
+  line: { position: 'absolute', top: 14, bottom: -16, left: '50%', width: 2, marginLeft: -1 },
+  content: { flex: 1 },
+  contentFaded: { opacity: 0.65 },
+  topRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, marginBottom: 5, flexWrap: 'wrap' },
+  stateText: { fontSize: 16, fontWeight: '800', flex: 1, textAlign: 'right' },
+  nowChip: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
+  nowChipText: { fontSize: 9, fontWeight: '800', letterSpacing: 1 },
+  estChip: { backgroundColor: T.elevated, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  estChipText: { color: T.textMuted, fontSize: 9, fontStyle: 'italic' },
+  syncChip: { backgroundColor: '#001a2e', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  syncChipText: { fontSize: 10 },
+  // V2.1: Generated ON badge styles
+  genOnChip: { backgroundColor: '#052e16', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.success + '44' },
+  genOnChipText: { color: T.success, fontSize: 9, fontWeight: '700' },
+  // V2.1: Estimated (Pending Offset) badge styles
+  pendingChip: { backgroundColor: '#1a0e00', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.warning + '44' },
+  pendingChipText: { color: T.warning, fontSize: 9, fontWeight: '700' },
+  timeText: { color: T.textSecondary, fontSize: 13, fontWeight: '600', textAlign: 'right', marginBottom: 2 },
+  durText: { fontSize: 11, fontWeight: '600', textAlign: 'right' },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4: Community Activity
+// ─────────────────────────────────────────────────────────────────────────────
+function CommunityActivity({ pendingAlerts, onViewAll, userId, onReporterPress }: {
+  pendingAlerts: number; onViewAll: () => void; userId?: string;
+  onReporterPress?: (reporterId: string) => void;
+}) {
+  const [recentReports, setRecentReports] = useState<any[]>([]);
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      try {
+        const { data: follows } = await supabase.from('follows').select('target_id').eq('requester_id', userId).eq('status', 'accepted').limit(10);
+        if (!follows || follows.length === 0) return;
+        const targetIds = follows.map((f: any) => f.target_id);
+        const { data: reports } = await supabase.from('utility_reports').select('id, reported_state, created_at, reporter_id, reporter:user_profiles!utility_reports_reporter_id_fkey(username)').in('reporter_id', targetIds).order('created_at', { ascending: false }).limit(4);
+        if (reports) {
+          const reportIds = reports.map((r: any) => r.id);
+          const { data: responses } = await supabase.from('resync_responses').select('report_id, response').in('report_id', reportIds).eq('response', 'yes');
+          const yesCounts: Record<number, number> = {};
+          (responses ?? []).forEach((r: any) => { yesCounts[r.report_id] = (yesCounts[r.report_id] ?? 0) + 1; });
+          setRecentReports(reports.map((r: any) => ({ ...r, yesCount: yesCounts[r.id] ?? 0, username: (r.reporter as any)?.username ?? 'مجهول' })));
+        }
+      } catch (_) {}
+    })();
+  }, [userId]);
+
+  return (
+    <View style={caStyles.card}>
+      <View style={caStyles.header}>
+        <TouchableOpacity onPress={onViewAll} activeOpacity={0.8}>
+          <Text style={caStyles.openBtn}>فتح →</Text>
+        </TouchableOpacity>
+        <Text style={caStyles.title}>🌐 نشاط المجتمع</Text>
+      </View>
+      {pendingAlerts > 0 && (
+        <TouchableOpacity style={caStyles.alertBanner} onPress={onViewAll} activeOpacity={0.85}>
+          <Text style={caStyles.alertArrow}>←</Text>
+          <Text style={caStyles.alertText}>
+            <Text style={{ color: T.accent, fontWeight: '800' }}>{pendingAlerts}</Text>{' '}تنبيه بانتظار ردّك من شخص تتابعه
+          </Text>
+          <View style={caStyles.alertDot} />
+        </TouchableOpacity>
+      )}
+      {recentReports.length > 0 ? recentReports.map((r, i) => {
+        const isOn = r.reported_state === 'UTILITY_ON';
+        const color = isOn ? T.success : T.danger;
+        const minutesAgo = Math.round((Date.now() - new Date(r.created_at).getTime()) / 60000);
+        const timeLabel = minutesAgo < 60 ? `منذ ${minutesAgo} دقيقة` : `منذ ${Math.round(minutesAgo / 60)} ساعة`;
+        return (
+          <View key={r.id} style={caStyles.reportRow}>
+            <View style={caStyles.reportMeta}>
+              {r.yesCount > 0 && <Text style={caStyles.yesCount}>✓ {r.yesCount} موافقة</Text>}
+              <Text style={caStyles.timeAgo}>{timeLabel}</Text>
+            </View>
+            <View style={caStyles.reportLeft}>
+              <Text style={[caStyles.reportState, { color }]}>{isOn ? '⚡ اشتغلت الكهرباء' : '🔴 طفت الكهرباء'}</Text>
+              <TouchableOpacity onPress={() => onReporterPress?.(r.reporter_id)} activeOpacity={0.7} disabled={!onReporterPress}>
+                <Text style={caStyles.reportUser}>أفاد <Text style={{ color: T.accent, fontWeight: '700' }}>{r.username}</Text></Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        );
+      }) : <Text style={caStyles.emptyText}>تابع جيرانك لرؤية بلاغاتهم هنا</Text>}
+    </View>
+  );
+}
+const caStyles = StyleSheet.create({
+  card: { backgroundColor: T.surface, borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  title: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5 },
+  openBtn: { color: T.accent, fontSize: 13, fontWeight: '700' },
+  alertBanner: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: '#001a2e', borderRadius: 12, padding: 12, marginBottom: 12, gap: 8, borderWidth: 1, borderColor: T.accent + '44' },
+  alertDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: T.accent },
+  alertText: { color: T.textSecondary, fontSize: 12, flex: 1, textAlign: 'right' },
+  alertArrow: { color: T.accent, fontWeight: '700' },
+  reportRow: { flexDirection: 'row-reverse', alignItems: 'flex-start', paddingVertical: 10, borderTopWidth: 1, borderTopColor: T.elevated, gap: 10 },
+  reportLeft: { flex: 1 },
+  reportState: { fontSize: 14, fontWeight: '700', textAlign: 'right', marginBottom: 3 },
+  reportUser: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
+  reportMeta: { alignItems: 'flex-end', gap: 3 },
+  timeAgo: { color: T.textMuted, fontSize: 10 },
+  yesCount: { color: T.success, fontSize: 10, fontWeight: '600' },
+  emptyText: { color: T.textMuted, fontSize: 12, textAlign: 'center', paddingVertical: 8 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARTICIPATION NUDGE
+// ─────────────────────────────────────────────────────────────────────────────
+function ParticipationNudge({ userId }: { userId?: string }) {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      try {
+        const cyclesAgo = new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString();
+        const { count } = await supabase.from('utility_reports').select('*', { count: 'exact', head: true }).eq('reporter_id', userId).gte('created_at', cyclesAgo);
+        if ((count ?? 0) === 0) setShow(true);
+      } catch (_) {}
+    })();
+  }, [userId]);
+  if (!show) return null;
+  return (
+    <View style={pnStyles.banner}>
+      <View style={{ flex: 1 }}>
+        <Text style={pnStyles.title}>🤝 شارك المجتمع!</Text>
+        <Text style={pnStyles.body}>
+          لم تُبلّغ عن أي تغيير منذ فترة. عند تغيّر الكهرباء في حيّك — اضغط{' '}
+          <Text style={{ fontWeight: '800', color: T.accent }}>"الإبلاغ عن تغيير"</Text>{' '}لتُحسّن دقة توقعاتك وتساعد جيرانك. 🎯
+        </Text>
+      </View>
+      <TouchableOpacity onPress={() => setShow(false)} style={pnStyles.dismissBtn}>
+        <Text style={pnStyles.dismissText}>✕</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+const pnStyles = StyleSheet.create({
+  banner: { backgroundColor: '#001a2e', borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: T.accent + '44', flexDirection: 'row-reverse', gap: 10 },
+  title: { color: T.accent, fontSize: 13, fontWeight: '800', textAlign: 'right', marginBottom: 6 },
+  body: { color: T.textSecondary, fontSize: 12, lineHeight: 20, textAlign: 'right' },
+  dismissBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  dismissText: { color: T.textMuted, fontSize: 12 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STABILITY BAR
+// ─────────────────────────────────────────────────────────────────────────────
+function StabilityBar({ score, label }: { score: number; label: string }) {
+  const color = score >= 75 ? T.success : score >= 45 ? T.warning : T.danger;
+  const animW = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(animW, { toValue: score, duration: 800, useNativeDriver: false }).start();
+  }, [score]);
+  const arabicLabel = label === 'Stable' ? 'مستقر' : label === 'Slightly Unstable' ? 'غير مستقر نسبياً' : 'غير مستقر';
+  return (
+    <View style={sbStyles.wrap}>
+      <View style={sbStyles.row}>
+        <Text style={[sbStyles.score, { color }]}>{score}%  {arabicLabel}</Text>
+        <Text style={sbStyles.label}>استقرار النمط</Text>
+      </View>
+      <View style={sbStyles.track}>
+        <Animated.View style={[sbStyles.fill, { backgroundColor: color, width: animW.interpolate({ inputRange: [0, 100], outputRange: ['0%', '100%'] }) }]} />
+      </View>
+    </View>
+  );
+}
+const sbStyles = StyleSheet.create({
+  wrap: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: T.border },
+  row: { flexDirection: 'row-reverse', justifyContent: 'space-between', marginBottom: 8 },
+  label: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
+  score: { fontSize: 12, fontWeight: '700' },
+  track: { height: 5, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden' },
+  fill: { height: 5, borderRadius: 3 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STABLE RANGE REF
+// ─────────────────────────────────────────────────────────────────────────────
+function useStableNextTransition(nt: UserPrediction['nextTransition'] | null | undefined) {
+  const ref = useRef<{ key: string; rangeStartIso: string; rangeEndIso: string; rangeLabel: string } | null>(null);
+  if (!nt) { ref.current = null; return nt ?? null; }
+  const roundedStart = Math.round(new Date(nt.rangeStartIso).getTime() / (5 * 60_000));
+  const key = `${nt.type}|${roundedStart}`;
+  if (!ref.current || ref.current.key !== key) {
+    ref.current = { key, rangeStartIso: nt.rangeStartIso, rangeEndIso: nt.rangeEndIso, rangeLabel: nt.rangeLabel };
+  }
+  return { ...nt, rangeStartIso: ref.current.rangeStartIso, rangeEndIso: ref.current.rangeEndIso, rangeLabel: ref.current.rangeLabel };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN HOME SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
-export default function HomeScreen() {
-  const insets = useSafeAreaInsets();
+export default function Home() {
   const router = useRouter();
-  const { user } = useAuth();
-  const [refreshing, setRefreshing] = useState(false);
-  const [hasSnapshot, setHasSnapshot] = useState(false);
-
-  const { offset, pendingDSD, clearPendingDSD } = useUserOffset();
+  const insets = useSafeAreaInsets();
+  const { profile, signOut } = useAuth();
+  const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD, saveOffset } = useUserOffset();
+  const { resyncPoint, clearResync, registerSnapshotCallback } = useResync();
   const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
-  const { resyncPoint, applyResync, clearResync } = useResync();
-  const { captureSnapshot } = useStatusSnapshot();
   const { anchor } = useStateAnchor();
 
-  const { userPrediction, loading } = useUserPredictions(
+  // TMMS V2 Q3-A: persist the community-derived offset to user_offsets the first
+  // time it is computed for a given resync session.  Q2-A already freezes it
+  // in-memory (communityOffsetFrozenRef inside useUserPredictions); this callback
+  // writes it to the DB so the value survives app restarts.  saveOffset() upserts
+  // the same user_offsets row used for manual DSD calibration.
+  const onCommunityOffsetComputed = useCallback((computedOffsetMinutes: number) => {
+    saveOffset(computedOffsetMinutes);
+  }, [saveOffset]);
+
+  const { userPrediction, loading: predLoading } = useUserPredictions(
     offset?.offset_minutes ?? 0,
     resyncPoint,
     transitionMode,
     anchor?.startIso ?? null,
+    onCommunityOffsetComputed,
   );
+  const { pendingCount } = useResyncNotifications();
+  const { score: myScore } = useMyReliability(profile?.id);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const { score: myScore } = useMyReliability(user?.id);
+  // ── Status Snapshot system ────────────────────────────────────────────────
+  // Captures the full state (offset + resync + state start) before any
+  // user report or community sync is applied so "العودة إلى الحالة الأصلية"
+  // can restore it exactly.
+  const { snapshot, hasSnapshot, captureSnapshot, clearSnapshot } = useStatusSnapshot();
 
-  // Check if a snapshot exists (for revert button label)
+  // Register the capture callback with ResyncContext so it fires automatically
+  // before every applyResync() call (covers both reporter and YES-responder paths).
+  // Also used directly by the report-submission flow.
   useEffect(() => {
-    setHasSnapshot(!!userPrediction?.isResynced);
-  }, [userPrediction?.isResynced]);
+    registerSnapshotCallback(async (_point) => {
+      // _point is the incoming new resync — we capture the CURRENT state before it applies
+      await captureSnapshot(
+        userPrediction?.currentState ?? 'OFF',
+        userPrediction?.currentStateStartIso ?? null,
+        offset?.offset_minutes ?? 0,
+        resyncPoint,
+        'community_confirm',
+      );
+    });
+    return () => registerSnapshotCallback(null);
+  }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
 
-  const handleRevertToGrowatt = useCallback(async () => {
-    Alert.alert(
-      'العودة إلى Growatt',
-      'هل أنت متأكد؟ سيتم إلغاء المزامنة المجتمعية الحالية والعودة إلى جدول Growatt.',
-      [
-        { text: 'إلغاء', style: 'cancel' },
-        {
-          text: 'تأكيد',
-          style: 'destructive',
-          onPress: async () => {
-            await clearResync();
-          },
-        },
-      ]
-    );
-  }, [clearResync]);
+  // ── Restore from snapshot ────────────────────────────────────────────────
+  
+  // ── Restore from snapshot (مصحح ومضمون لإعادة الـ offset) ─────────────────
+  const handleRestoreSnapshot = useCallback(async () => {
+    if (!snapshot) return;
+    try {
+      // 1. استعادة الـ Offset مباشرة إلى قاعدة البيانات والحالة المحلية دون شروط مقيدة
+      const targetOffset = snapshot.previousOffsetMinutes;
+      await saveOffset(targetOffset);
+      
+      // 2. مسح المزامنة المجتمعية الحالية للعودة للحالة الأصلية
+      await clearResync();
+      
+      // 3. مسح الـ لقطة (Snapshot) لتحديث واجهة المستخدم وإخفاء الزر
+      await clearSnapshot();
+      
+      // تلميح اختياري للمستخدم للتأكيد
+      if (Platform.OS !== 'web') {
+        Alert.alert('تمت العملية', 'تم استعادة توازن الوقت والفارق بنجاح.');
+      }
+    } catch (error) {
+      console.error('خطأ أثناء محاولة استعادة الحالة الأصلية والـ offset:', error);
+    }
+  }, [snapshot, saveOffset, clearResync, clearSnapshot]);
 
-  const onRefresh = useCallback(async () => {
+  // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
+  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
+  //   e.g. Growatt OFF at 12:00, offset -60 → reconciledStart = 11:00 → "منذ ساعة"
+  //   This MUST win over anchor.startIso which always holds raw Growatt time.
+  // Priority 2: userPrediction.currentStateStartIso — schedule-derived start.
+  // Priority 3: anchor.startIso — Growatt raw time (correct for neutral/positive offset
+  //   users where no reconciliation is needed and schedule start = Growatt start).
+    // تم التعديل: إعطاء الأولوية لـ anchor الثابت لحماية الوقت من التصفير التلقائي
+    // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
+  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
+  // Priority 2: anchor.startIso — Growatt raw time.
+  // Priority 3: userPrediction.currentStateStartIso — schedule-derived start.
+    // ── Mathematical Anchor: Bulletproof start time calculation ──────────
+  const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
+  const anchorStartIso = (() => {
+    if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
+      return userPrediction.resyncedAtIso;
+    }
+    // For POSITIVE_OFFSET_PENDING: anchor.state is the HELD state (before Growatt flipped)
+    // currentState is also the HELD state — but anchor.state may differ if Growatt already flipped.
+    // Use currentStateStartIso directly so it reflects the correct schedule slot start.
+    const atcMode = userPrediction?.atc?.mode;
+    if (atcMode === 'POSITIVE_OFFSET_PENDING') {
+      return userPrediction?.currentStateStartIso ?? null;
+    }
+    if (anchor && userPrediction && anchor.state === userPrediction.currentState) {
+      return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
+    }
+    return userPrediction?.currentStateStartIso ?? null;
+  })();
+
+  const stableNextTransition = useStableNextTransition(userPrediction?.nextTransition);
+  const stablePrediction = userPrediction
+    ? { ...userPrediction, nextTransition: stableNextTransition }
+    : null;
+
+  const onRefresh = useCallback(() => {
     setRefreshing(true);
-    // The 30s tick in useUserPredictions will naturally refresh
-    setTimeout(() => setRefreshing(false), 1000);
+    setTimeout(() => setRefreshing(false), 1200);
   }, []);
 
-  // Crisis banner
-  const crisisActive = userPrediction?.crisisMode ?? false;
-  const crisisReason = userPrediction?.crisisReason ?? '';
+  const loading = offsetLoading || predLoading;
 
-  // Reasoning line (pick the first one)
-  const reasoningLine = userPrediction?.reasoning?.[0] ?? '';
+  // ── Revert handler (used by PersonalStatusCard) ──────────────────────────
+  // If a snapshot exists: show "العودة إلى الحالة الأصلية" flow
+  // Otherwise: plain clearResync (old Growatt-revert behaviour)
+    // ── Revert handler (مصحح) ──────────────────────────────────────────
+  const handleRevert = useCallback(() => {
+    const confirmMsg = hasSnapshot
+      ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك وفارق التوقيت (Offset) السابق تماماً.'
+      : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
+      
+    const doRestore = hasSnapshot ? handleRestoreSnapshot : clearResync;
+    
+    if (Platform.OS === 'web') {
+      doRestore();
+    } else {
+      Alert.alert(
+        hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt',
+        confirmMsg,
+        [
+          { text: 'إلغاء', style: 'cancel' },
+          { text: 'تأكيد العودة والاستعادة', style: 'destructive', onPress: () => doRestore() },
+        ],
+      );
+    }
+  }, [hasSnapshot, handleRestoreSnapshot, clearResync]);
+
+  const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? '';
+
+  if (loading && !userPrediction) {
+    return (
+      <View style={{ flex: 1, backgroundColor: T.bg, alignItems: 'center', justifyContent: 'center' }}>
+        <ActivityIndicator size="large" color={T.accent} />
+        <Text style={{ color: T.textMuted, marginTop: 12, fontSize: 14 }}>جارٍ تحميل توقيتك…</Text>
+      </View>
+    );
+  }
 
   return (
     <ScrollView
-      style={styles.root}
-      contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 32 }]}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={T.accent} />}
+      style={styles.container}
+      contentContainerStyle={[styles.content, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 100 }]}
       showsVerticalScrollIndicator={false}
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={T.accent} />}
     >
-      {/* Crisis banner */}
-      {crisisActive && crisisReason && (
-        <View style={styles.crisisBanner}>
-          <Text style={styles.crisisTitle}>⚠️ أزمة كهرباء مكتشفة</Text>
-          <Text style={styles.crisisBody}>{translateCrisisReason(crisisReason)}</Text>
+      {/* Header */}
+      <View style={styles.header}>
+        <View style={styles.headerBtns}>
+          <TouchableOpacity style={styles.signOutBtn} onPress={() => signOut()} activeOpacity={0.8}>
+            <Text style={styles.signOutIcon}>⏻</Text>
+            <Text style={styles.signOutLabel}>خروج</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.iconBtn} onPress={() => router.push('/(user)/settings')}>
+            <Text style={styles.iconBtnText}>⚙️</Text>
+          </TouchableOpacity>
+          {myScore && (
+            <View style={styles.reliabilityPill}>
+              <Text style={[styles.reliabilityText, { color: getReliabilityBadge(myScore.reliability_score).color }]}>
+                {myScore.reliability_score}%
+              </Text>
+            </View>
+          )}
         </View>
-      )}
+        <View>
+          <Text style={styles.greeting}>أهلاً، {displayName} 👋</Text>
+          <Text style={styles.date}>{new Date().toLocaleDateString('ar-SA', { weekday: 'long', month: 'long', day: 'numeric' })}</Text>
+        </View>
+      </View>
 
-      {/* Transition mode toggle */}
+      {/* v4.2 Crisis banner — softened copy
+          v4.1: implied confidence was unreliable (capped at 30%).
+          v4.2: crisis no longer caps confidence — the engine is adapting,
+                not failing. Wording reflects that. Banner stays amber/yellow
+                (informational) rather than red (alarm). */}
+      {userPrediction?.crisisMode && userPrediction.crisisReason ? (
+        <View style={styles.crisisBanner}>
+          <View style={styles.crisisIconWrap}><Text style={{ fontSize: 20 }}>⚠️</Text></View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.crisisTitle}>محرك التوقع يتكيّف مع نمط متغيّر</Text>
+            <Text style={styles.crisisBody}>{translateCrisisReason(userPrediction.crisisReason)}</Text>
+          </View>
+        </View>
+      ) : null}
+
+      {/* v4.2: Client-rows-filtered info badge
+          Shows how many client-bugged rows the v4.2 server filtered out
+          before computing the drift offset. Non-zero = R1 filter is working.
+          Hidden when there's no apppe block or filter count is 0. */}
+      {(() => {
+        const filtered = (userPrediction as any)?.apppe?.historyDiagnostics?.clientRowsFiltered;
+        if (!filtered || filtered === 0) return null;
+        return (
+          <View style={styles.historyDiagBadge}>
+            <Text style={styles.historyDiagText}>
+              🛡️ تم تجاهل {filtered} صفّاً ملوّثاً من سجلّ الدقّة لمحرك التوقّع
+            </Text>
+          </View>
+        );
+      })()}
+
+      {/* TMMS toggle — at the top of home screen per spec */}
       <TransitionModeToggle mode={transitionMode} onToggle={toggleTransitionMode} />
 
-      {/* Pending DSD chip */}
+      <ParticipationNudge userId={profile?.id} />
       <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
 
-      {/* V2.2: Generated ON banner */}
-      <GeneratedOnBanner prediction={userPrediction} />
+      {/* V2.1: Generated ON banner — shown when the user's current state is a
+          Generated ON event (created from their own ON report or cloned from
+          a reporter they approved). */}
+      <GeneratedOnBanner prediction={stablePrediction} />
 
-      {/* V2.2: Pending Negative banner */}
-      <PendingNegativeBanner prediction={userPrediction} />
+      {/* V2.1: Pending Negative banner — shown when the user's OffsetState is
+          PendingNegative, surfaced BEFORE the PositiveOffsetPendingBanner so
+          the user understands why future ON predictions are estimated. */}
+      <PendingNegativeBanner prediction={stablePrediction} />
 
-      {/* V2.2: UNCERTAIN_ZONE banner */}
-      <UncertainZoneBanner prediction={userPrediction} />
-
-      {/* V2.2: Positive Offset Pending banner */}
-      <PositiveOffsetPendingBanner prediction={userPrediction} />
-
-      {/* V2.2: Validation window toast */}
-      <ValidationWindowToast prediction={userPrediction} />
-
-      {/* Section 1: Personal Status Card */}
+      <PositiveOffsetPendingBanner prediction={stablePrediction} />
+      <ValidationWindowToast prediction={stablePrediction} />
       <PersonalStatusCard
-        prediction={userPrediction}
-        anchorStartIso={anchor?.startIso ?? null}
-        onRevertToGrowatt={handleRevertToGrowatt}
+        prediction={stablePrediction}
+        anchorStartIso={anchorStartIso}
+        onRevertToGrowatt={handleRevert}
         hasSnapshot={hasSnapshot}
-        reasoningLine={reasoningLine}
+        reasoningLine={stablePrediction?.reasoning?.[0] ?? undefined}
       />
+      <UpcomingTransitionCard prediction={stablePrediction} />
 
-      {/* Section 2: Upcoming Transition Card */}
-      <UpcomingTransitionCard prediction={userPrediction} />
+      {stablePrediction && (
+        <StabilityBar score={stablePrediction.stabilityScore} label={stablePrediction.stabilityLabel} />
+      )}
 
-      {/* V2.2 info footer */}
-      <View style={styles.footer}>
-        <Text style={styles.footerText}>
-          TMMS V2.2 — نموذج استبدال الخطّ الزمني الشخصي
-        </Text>
-        <Text style={styles.footerSub}>
-          {userPrediction?.offsetState
-            ? `الفارق الحالي: ${userPrediction.offsetState} · ${typeof userPrediction.offsetValue === 'number' ? (userPrediction.offsetValue > 0 ? '+' : '') + userPrediction.offsetValue + 'د' : 'بانتظار Growatt'}`
-            : 'الفارق: غير محدد'}
-        </Text>
-      </View>
+      <TodayTimeline prediction={stablePrediction} anchorStartIso={anchorStartIso} />
+      <CommunityActivity
+        pendingAlerts={pendingCount}
+        onViewAll={() => router.push('/(user)/community')}
+        userId={profile?.id}
+        onReporterPress={(rid) => router.push(`/(user)/reporter/${rid}` as any)}
+      />
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: T.bg },
-  content: { paddingHorizontal: 16, paddingTop: 12 },
-  crisisBanner: {
-    backgroundColor: '#2a0a0a', borderRadius: 14, padding: 14, marginBottom: 12,
-    borderWidth: 1.5, borderColor: T.danger + '66',
+  container: { flex: 1, backgroundColor: T.bg },
+  content: { paddingHorizontal: 16 },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 },
+  greeting: { color: T.textPrimary, fontSize: 20, fontWeight: '800', textAlign: 'right' },
+  date: { color: T.textMuted, fontSize: 12, marginTop: 2, textAlign: 'right' },
+  headerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  reliabilityPill: { backgroundColor: T.elevated, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.border },
+  reliabilityText: { fontSize: 12, fontWeight: '800' },
+  iconBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: T.surface, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: T.border },
+  iconBtnText: { fontSize: 18 },
+  signOutBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#1a0505', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: '#ef444430' },
+  signOutIcon: { fontSize: 14 },
+  signOutLabel: { color: '#ef4444', fontSize: 12, fontWeight: '700' },
+  crisisBanner: { backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, borderWidth: 1.5, borderColor: '#92400e' },
+  crisisIconWrap: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#451a03', alignItems: 'center', justifyContent: 'center' },
+  crisisTitle: { color: '#f59e0b', fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
+  crisisBody: { color: '#fbbf24', fontSize: 12, lineHeight: 19, textAlign: 'right' },
+  // v4.2: yellow info badge for historyDiagnostics.clientRowsFiltered
+  historyDiagBadge: {
+    backgroundColor: '#0c1a2e', borderRadius: 10, padding: 10, marginBottom: 12,
+    borderWidth: 1, borderColor: T.accent + '55',
   },
-  crisisTitle: { color: T.danger, fontSize: 13, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  crisisBody: { color: T.danger + 'cc', fontSize: 11, lineHeight: 17, textAlign: 'right' },
-  footer: { alignItems: 'center', marginTop: 8, marginBottom: 16 },
-  footerText: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
-  footerSub: { color: T.textMuted + '88', fontSize: 9, marginTop: 2 },
+  historyDiagText: {
+    color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right', lineHeight: 16,
+  },
 });

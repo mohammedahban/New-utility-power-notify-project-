@@ -1,3 +1,4 @@
+// TMMS V2.1 — community screen
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View, Text, FlatList, StyleSheet, TouchableOpacity,
@@ -10,7 +11,9 @@ import * as Location from 'expo-location';
 import { useNearbyUsers } from '../../hooks/useNearbyUsers';
 import { useFollows } from '../../hooks/useFollows';
 import { useUtilityReports, TimeOption } from '../../hooks/useUtilityReports';
-// TMMS V2.2: ReportedState import removed — V2.2 is ON-ONLY reporting.
+// TMMS V2.1: ReportedState import removed — V2.1 is ON-ONLY reporting.
+// The hook still exports it for backwards compatibility, but the V2.1 UI
+// never accepts anything other than 'UTILITY_ON'.
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { supabase } from '../../lib/supabase';
@@ -49,11 +52,14 @@ const TIME_LABELS_AR: Record<string, string> = {
 };
 
 // ── Report Modal ──────────────────────────────────────────────────────────────
-// TMMS V2.2: users NEVER report OFF. The modal is a single-purpose
-// "Report Electricity ON" dialog. The reporter's OffsetState is computed
-// by the engine at submission time per Period 1/2/3 rules.
+// TMMS V2.1 §"WHY ONLY ON REPORTS?": users NEVER report OFF. The state
+// selector row has been removed entirely — the modal is a single-purpose
+// "Report Electricity ON" dialog. The reporter's OffsetState (Positive /
+// Negative / Neutral / PendingNegative) is computed by the engine at
+// submission time, NOT chosen by the user.
 function ReportModal({ visible, onClose, onSubmit, submitting }: {
   visible: boolean; onClose: () => void;
+  // V2.1: signature changed — no `state` param. Always UTILITY_ON.
   onSubmit: (time: TimeOption) => void;
   submitting: boolean;
 }) {
@@ -71,6 +77,7 @@ function ReportModal({ visible, onClose, onSubmit, submitting }: {
             مُولّدة" فوراً وتُحدَّث الجداول لديك ولدى من يتابعك.
           </Text>
 
+          {/* V2.1: ON-only info banner. Replaces the old state selector row. */}
           <View style={rmStyles.onOnlyBanner}>
             <Text style={rmStyles.onOnlyEmoji}>⚡</Text>
             <View style={{ flex: 1 }}>
@@ -122,6 +129,7 @@ const rmStyles = StyleSheet.create({
   title: { color: T.textPrimary, fontSize: 20, fontWeight: '800', marginBottom: 6, textAlign: 'right' },
   sub: { color: T.textMuted, fontSize: 13, lineHeight: 19, marginBottom: 20, textAlign: 'right' },
   sectionLabel: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 1, marginBottom: 10, textAlign: 'right' },
+  // V2.1: replaced `stateRow` / `stateBtn*` styles with a single onOnlyBanner.
   onOnlyBanner: {
     flexDirection: 'row-reverse', alignItems: 'center', gap: 12,
     backgroundColor: '#052e16', borderRadius: 14, padding: 14, marginBottom: 20,
@@ -141,20 +149,22 @@ const rmStyles = StyleSheet.create({
 });
 
 // ── Notification Card ─────────────────────────────────────────────────────────
-// TMMS V2.2: only ON reports exist. Added: Reporter Offset State badge so
-// the Approver can see EXACTLY what they will clone by pressing YES.
+// TMMS V2.1: only ON reports exist — every OFF branch has been removed.
+// Added: Reporter Offset State badge so the Approver can see EXACTLY what
+// they will clone by pressing YES (PDF §"APPROVER LOGIC").
 function NotifCard({ notif, onRespond, onReporterPress }: {
   notif: any;
   onRespond: (notif: any, response: 'yes' | 'no' | 'ignore') => void;
   onReporterPress?: (reporterId: string) => void;
 }) {
   const isExpired = new Date(notif.expires_at) < new Date();
+  // V2.1: hardcoded ON — no OFF branch.
   const stateLabel = AR.electricityCameOn;
   const stateEmoji = '⚡';
   const expiresMin = Math.max(0, Math.round((new Date(notif.expires_at).getTime() - Date.now()) / 60000));
   const timeLabel = TIME_LABELS_AR[notif.time_option] ?? '';
 
-  // V2.2: decode the reporter's offset snapshot for the "you will clone" badge.
+  // V2.1: decode the reporter's offset snapshot for the "you will clone" badge.
   const reporterState: string = notif.reporter_offset_state ?? null;
   const reporterValue: number | 'PENDING' | null = notif.reporter_offset_value ?? null;
   const offsetBadge = (() => {
@@ -220,7 +230,10 @@ function NotifCard({ notif, onRespond, onReporterPress }: {
       </View>
       <Text style={ncStyles.timeLabel}>{timeLabel}</Text>
 
-      {/* V2.2: "Approving will clone" banner */}
+      {/* V2.1: "Approving will clone" banner.
+          PDF §"APPROVER LOGIC": Approver clones Reporter's OffsetState,
+          OffsetValue, and TimelineAlignment. The badge surfaces this so
+          the user makes an informed decision. */}
       {offsetBadge && (
         <View style={[ncStyles.cloneBanner, { borderColor: offsetBadge.color + '44' }]}>
           <Text style={ncStyles.cloneBannerTitle}>عند الموافقة ستُنسخ حالة المُبلِّغ:</Text>
@@ -270,6 +283,7 @@ const ncStyles = StyleSheet.create({
   ignBtn: { backgroundColor: T.elevated, borderColor: T.border, flex: 0.6 },
   ignBtnText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
   responseLabel: { fontSize: 13, fontWeight: '700', marginTop: 6, textAlign: 'right' },
+  // V2.1: "Approving will clone" banner styles
   cloneBanner: {
     backgroundColor: '#0a1929', borderRadius: 12, padding: 12, marginBottom: 12,
     borderWidth: 1,
@@ -669,12 +683,13 @@ const frStyles = StyleSheet.create({
 });
 
 // ── History Card ──────────────────────────────────────────────────────────────
-// TMMS V2.2: only ON entries appear (OFF filtered out at the data layer).
+// TMMS V2.1: only ON entries appear (OFF filtered out at the data layer).
 // Added: Offset State badge + Generated ON metadata for each entry.
 function HistoryCard({ entry, onReporterPress }: {
   entry: any;
   onReporterPress?: (reporterId: string) => void;
 }) {
+  // V2.1: always ON — no OFF branch.
   const isOn = true;
   const color = T.success;
   const effectiveTime = new Date(entry.effective_transition_at).toLocaleString('ar-SA', {
@@ -685,7 +700,7 @@ function HistoryCard({ entry, onReporterPress }: {
     timeZone: 'Asia/Aden', timeStyle: 'short',
   });
 
-  // V2.2: decode the entry's cloned offset state for the badge.
+  // V2.1: decode the entry's cloned offset state for the badge.
   const offsetState: string | null = entry.offset_state ?? null;
   const offsetValue: number | 'PENDING' | null = entry.offset_value ?? null;
   const stateLabelAr: Record<string, string> = {
@@ -706,7 +721,7 @@ function HistoryCard({ entry, onReporterPress }: {
     ? 'بانتظار Growatt'
     : (typeof offsetValue === 'number' ? `${offsetValue > 0 ? '+' : ''}${offsetValue}د` : null);
 
-  // V2.2: Generated ON metadata
+  // V2.1: Generated ON metadata (if present)
   const genOnStart = entry.generated_on_start_iso;
   const genOnDuration = entry.generated_on_duration_min;
   const genOnRefKind = entry.generated_on_reference_kind;
@@ -734,7 +749,7 @@ function HistoryCard({ entry, onReporterPress }: {
           {'  '}· أُكّد في {confirmedTime}
         </Text>
 
-        {/* V2.2: Offset State badge */}
+        {/* V2.1: Offset State badge */}
         {badgeLabel && (
           <View style={hcStyles.offsetRow}>
             <View style={[hcStyles.offsetChip, { borderColor: badgeColor + '55', backgroundColor: badgeColor + '12' }]}>
@@ -749,7 +764,7 @@ function HistoryCard({ entry, onReporterPress }: {
           </View>
         )}
 
-        {/* V2.2: Generated ON metadata */}
+        {/* V2.1: Generated ON metadata */}
         {genOnStart && genOnDuration && (
           <View style={hcStyles.genOnRow}>
             <Text style={hcStyles.genOnText}>
@@ -773,11 +788,13 @@ const hcStyles = StyleSheet.create({
   source: { color: T.textMuted, fontSize: 11 },
   time: { color: T.textSecondary, fontSize: 12, marginBottom: 3, textAlign: 'right' },
   reporter: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
+  // V2.1: offset state badge row
   offsetRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginTop: 8 },
   offsetChip: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
   offsetChipLabel: { fontSize: 10, fontWeight: '700' },
   offsetValue: { fontSize: 13, fontWeight: '800' },
   pendingNote: { color: T.warning, fontSize: 10, fontWeight: '600' },
+  // V2.1: Generated ON metadata
   genOnRow: { marginTop: 6, backgroundColor: '#052e16', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.success + '33' },
   genOnText: { color: T.success, fontSize: 10, fontWeight: '600', textAlign: 'right' },
 });
@@ -820,10 +837,12 @@ export default function CommunityScreen() {
   const requestLocation = useCallback(async () => {
     setLocationStatus('requesting');
     try {
+      // First check permission status without prompting
       const { status: current } = await Location.getForegroundPermissionsAsync();
       let finalStatus = current;
 
       if (current !== 'granted') {
+        // Request foreground location permission
         const { status: requested } = await Location.requestForegroundPermissionsAsync();
         finalStatus = requested;
       }
@@ -875,8 +894,13 @@ export default function CommunityScreen() {
     }
   }, [getStatusWith, following, pending, cancelOrUnfollow, respondToRequest, sendRequest]);
 
-  // TMMS V2.2: handleReport — always UTILITY_ON, engine computes Period 1/2/3.
+  // TMMS V2.1: handleReport signature changed — `state` param removed.
+  // Always submits a UTILITY_ON report. The engine computes the OffsetState
+  // (Positive/Negative/Neutral/PendingNegative) at submission time based on
+  // the OFF Progress rule; the user never chooses a state.
   const handleReport = useCallback(async (time: TimeOption) => {
+    // Capture snapshot BEFORE report is saved so "العودة إلى الحالة الأصلية" can
+    // fully restore the pre-report state (offset + resync + state start).
     await captureSnapshot(
       userPrediction?.currentState ?? 'OFF',
       userPrediction?.currentStateStartIso ?? null,
@@ -885,12 +909,14 @@ export default function CommunityScreen() {
       'user_report',
     );
 
+    // V2.1: hardcoded UTILITY_ON — no OFF reporting path.
     const { selfResync, error } = await submitReport('UTILITY_ON' as any, time);
     setReportModalVisible(false);
     if (error) {
       Alert.alert(AR.error, error);
     } else {
       if (selfResync) await applyResync(selfResync);
+      // V2.1: updated copy to mention Generated ON creation.
       Alert.alert(
         AR.reportShared,
         'تم إنشاء "حالة تشغيل مُولّدة" في خطّك الزمني وتحديث الجداول لديك ولدى من يتابعك. لا حاجة للإبلاغ عن الانطفاء — سيتولّاه النظام تلقائياً.',
@@ -898,12 +924,18 @@ export default function CommunityScreen() {
     }
   }, [submitReport, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
 
-  // TMMS V2.2: handleRespond — YES clones reporter's sync state.
+  // TMMS V2.1: handleRespond — the YES branch no longer recalculates anything.
+  // useResyncNotifications.respond() clones the reporter's OffsetState /
+  // OffsetValue / TimelineAlignment internally and returns them in yesResult.
+  // Here we just apply the resync point and surface the cloned state to the UI.
   const handleRespond = useCallback(async (notif: any, response: 'yes' | 'no' | 'ignore') => {
     const { yesResult, error } = await respond(notif, response);
     if (error) {
       Alert.alert(AR.error, error);
     } else if (response === 'yes' && yesResult) {
+      // TMMS V2 §GAP-3: capture snapshot BEFORE applying the community resync so
+      // "العودة إلى الحالة الأصلية" can fully restore the pre-confirmation state
+      // even when the Home tab is not currently mounted (snapshotCbRef would be null).
       await captureSnapshot(
         userPrediction?.currentState ?? 'OFF',
         userPrediction?.currentStateStartIso ?? null,
@@ -911,6 +943,7 @@ export default function CommunityScreen() {
         resyncPoint ?? null,
         'community_confirm',
       );
+      // Fetch reporter reliability to surface in community sync meta
       let reporterReliability: number | null = null;
       if (notif.reporter_id) {
         try {
@@ -922,12 +955,16 @@ export default function CommunityScreen() {
           if (data) reporterReliability = Math.round(data.reliability_score ?? 50);
         } catch (_) {}
       }
+      // V2.1: syncedState is ALWAYS 'ON' (no OFF reporting). The cloned
+      // OffsetState / OffsetValue / TimelineAlignment travel inside
+      // yesResult — applyResync will pass them through to the engine.
       await applyResync({
-        syncedState: 'ON',
+        syncedState: 'ON', // V2.1: hardcoded
         syncedAtIso: yesResult.effectiveTransitionAt,
         appliedAtIso: new Date().toISOString(),
         reporterName: yesResult.reporterName ?? notif.reporter_username ?? null,
         reporterReliability,
+        // V2.1 additions (cloned from reporter):
         offsetState: yesResult.offsetState,
         offsetValue: yesResult.offsetValue,
         timelineAlignment: yesResult.timelineAlignment,
@@ -937,6 +974,9 @@ export default function CommunityScreen() {
         generatedOnReferenceKind: yesResult.generatedOnReferenceKind,
       } as any);
 
+      // V2.1: confirmation-only copy. Per the spec, confirmation never
+      // modifies timeline calculations — it only validates the report and
+      // bumps confidence. The user message reflects that.
       const stateLabelAr: Record<string, string> = {
         POSITIVE: 'إيجابي',
         NEGATIVE: 'سلبي',
@@ -948,7 +988,7 @@ export default function CommunityScreen() {
         : `${(yesResult.offsetValue as number) > 0 ? '+' : ''}${yesResult.offsetValue}د`;
       Alert.alert(
         AR.scheduleUpdated,
-        `تمت مزامنة خطّك الزمني مع بلاغ المُبلِّغ وفق قواعد TMMS V2.2. الفارق المنسوخ: ${stateLabelAr[yesResult.offsetState]} · ${valueLabel}. لا يؤثر تأكيدك على وقت البلاغ الأصلي — يُؤثّر فقط على موثوقية المُبلِّغ.`,
+        `تمت مزامنة خطّك الزمني مع بلاغ المُبلِّغ وفق قواعد TMMS V2.1. الفارق المنسوخ: ${stateLabelAr[yesResult.offsetState]} · ${valueLabel}. لا يؤثر تأكيدك على وقت البلاغ الأصلي — يُؤثّر فقط على موثوقية المُبلِّغ.`,
       );
     }
   }, [respond, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
@@ -959,272 +999,335 @@ export default function CommunityScreen() {
 
   const isParticipationRestricted = myScore
     ? myScore.total_responses >= 10 &&
-      (myScore.yes_responses ?? 0) / myScore.total_responses < 0.3
+      myScore.ignored_notifications / myScore.total_responses > 0.7
     : false;
 
-  return (
-    <View style={{ flex: 1, backgroundColor: T.bg }}>
-      {/* Header */}
-      <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
-        <View style={styles.headerRow}>
-          <View style={styles.headerLeft}>
-            {myBadge && (
-              <View style={[styles.badge, { borderColor: myBadge.color + '44' }]}>
-                <Text style={[styles.badgeText, { color: myBadge.color }]}>{myBadge.label}</Text>
-              </View>
-            )}
-            <Text style={styles.headerName}>{displayName ?? 'مستخدم'}</Text>
-          </View>
-          <Text style={styles.headerTitle}>👥 المجتمع</Text>
-        </View>
+  const tabLabels: { key: Tab; label: string; badge?: number }[] = [
+    { key: 'nearby', label: AR.nearby },
+    { key: 'notifications', label: 'تنبيهات', badge: pendingCount > 0 ? pendingCount : undefined },
+    { key: 'history', label: AR.history },
+    { key: 'following', label: AR.following },
+    { key: 'leaderboard', label: AR.leaderboard },
+  ];
 
-        {/* Tab bar */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabBar}>
-          {([
-            { key: 'nearby', label: 'القريبون', icon: '📍' },
-            { key: 'notifications', label: `الإشعارات${pendingCount > 0 ? ` (${pendingCount})` : ''}`, icon: '🔔' },
-            { key: 'history', label: 'السجل', icon: '📋' },
-            { key: 'following', label: 'المتابَعون', icon: '👥' },
-            { key: 'leaderboard', label: 'المتصدرون', icon: '🏆' },
-          ] as const).map(t => (
-            <TouchableOpacity
-              key={t.key}
-              style={[styles.tab, tab === t.key && styles.tabActive]}
-              onPress={() => setTab(t.key)}
-              activeOpacity={0.8}
-            >
-              <Text style={[styles.tabText, tab === t.key && styles.tabTextActive]}>
-                {t.icon} {t.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
+  const isLoadingLocation = locationStatus === 'idle' || locationStatus === 'requesting';
+
+  return (
+    <View style={styles.root}>
+      {isParticipationRestricted && (
+        <View style={styles.restrictionBanner}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.restrictionTitle}>{AR.communityAlertsRestricted}</Text>
+            <Text style={styles.restrictionBody}>
+              {AR.ignoreRateTooHigh
+                .replace('{pct}', String(Math.round((myScore!.ignored_notifications / myScore!.total_responses) * 100)))
+                .replace('{total}', String(myScore!.total_responses))}
+            </Text>
+          </View>
+          <View style={styles.restrictionIconWrap}>
+            <Text style={styles.restrictionIcon}>🚫</Text>
+          </View>
+        </View>
+      )}
+
+      {myScore && (
+        <View style={styles.myScoreBar}>
+          <View style={styles.myScoreRight}>
+            <Text style={styles.myScoreSub}>{myScore.total_reports} {AR.reports} · {myScore.total_responses} {AR.responses}</Text>
+            <Text style={[styles.myBadge, { color: myBadge?.color }]}>{myBadge?.label}</Text>
+            <Text style={[styles.myScoreVal, { color: myBadge?.color }]}>{myScore.reliability_score}%</Text>
+          </View>
+          <View style={styles.myScoreLeft}>
+            <Text style={styles.myScoreLabel}>{AR.yourReliability}</Text>
+            {displayName ? <Text style={styles.myScoreName}>{displayName}</Text> : null}
+          </View>
+        </View>
+      )}
+
+      {/* Tab bar */}
+      <View style={styles.tabBar}>
+        {tabLabels.map(t => (
+          <TouchableOpacity key={t.key} style={[styles.tabBtn, tab === t.key && styles.tabBtnActive]} onPress={() => setTab(t.key)} activeOpacity={0.8}>
+            <View style={styles.tabLabelWrap}>
+              {t.badge ? (
+                <View style={styles.tabBadge}><Text style={styles.tabBadgeText}>{t.badge}</Text></View>
+              ) : null}
+              <Text style={[styles.tabLabel, tab === t.key && styles.tabLabelActive]}>{t.label}</Text>
+            </View>
+          </TouchableOpacity>
+        ))}
       </View>
 
-      {/* Content */}
-      <View style={{ flex: 1 }}>
-        {tab === 'nearby' && (
-          <>
-            {/* Location bar */}
-            <View style={styles.locBar}>
-              {locationStatus === 'granted' ? (
-                <View style={styles.locGranted}>
+      {tab === 'nearby' && (
+        <FlatList
+          style={styles.list}
+          contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]}
+          data={nearbyUsers}
+          keyExtractor={item => item.user_id}
+          showsVerticalScrollIndicator={false}
+          onRefresh={() => { refreshNearby(); refreshFollows(); }}
+          refreshing={nearbyLoading || followsLoading}
+          ListHeaderComponent={() => (
+            <>
+              {pending.length > 0 && (
+                <View style={styles.section}>
+                  <Text style={styles.sectionLabel}>{AR.followRequests} ({pending.length})</Text>
+                  {pending.map(f => (
+                    <FollowRequestCard
+                      key={f.id}
+                      follow={f}
+                      onAccept={() => respondToRequest(f.id, true)}
+                      onReject={() => respondToRequest(f.id, false)}
+                    />
+                  ))}
+                </View>
+              )}
+
+              {isLoadingLocation ? (
+                <View style={styles.locLoadingBox}>
+                  <Text style={styles.locLoadingText}>{AR.gettingLocation}</Text>
+                  <ActivityIndicator color={T.accent} size="small" />
+                </View>
+              ) : locationStatus === 'denied' ? (
+                <View style={styles.locDeniedBox}>
+                  <Text style={styles.locDeniedText}>{AR.locationDenied}</Text>
+                  <TouchableOpacity style={styles.retryBtn} onPress={requestLocation}>
+                    <Text style={styles.retryBtnText}>{AR.tryAgain}</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : myLat && myLon ? (
+                <View style={styles.locCard}>
                   <TouchableOpacity
-                    style={[styles.locSaveBtn, savingLocation && { opacity: 0.6 }]}
+                    style={[styles.shareBtn, (savingLocation || locationSaved) && (locationSaved ? styles.shareBtnSaved : { opacity: 0.6 })]}
                     onPress={handleSaveLocation}
                     disabled={savingLocation}
                     activeOpacity={0.85}
                   >
-                    <Text style={styles.locSaveText}>
-                      {savingLocation ? '...' : locationSaved ? '✓ تم الحفظ' : '💾 حفظ'}
-                    </Text>
+                    {savingLocation
+                      ? <ActivityIndicator color="#fff" size="small" />
+                      : <Text style={styles.shareBtnText}>{locationSaved ? '✓ ' + AR.locationShared : AR.shareMyLocation}</Text>
+                    }
                   </TouchableOpacity>
-                  <Text style={styles.locText}>📍 {myLat?.toFixed(4)}, {myLon?.toFixed(4)}</Text>
+                  <View style={styles.locRow}>
+                    <Text style={styles.locCoords}>{myLat.toFixed(4)}, {myLon.toFixed(4)}</Text>
+                    <Text style={styles.locIcon}>📍</Text>
+                  </View>
                 </View>
-              ) : locationStatus === 'denied' ? (
-                <View style={styles.locDenied}>
-                  <TouchableOpacity style={styles.locRetryBtn} onPress={requestLocation} activeOpacity={0.85}>
-                    <Text style={styles.locRetryText}>إعادة المحاولة</Text>
-                  </TouchableOpacity>
-                  <Text style={styles.locDeniedText}>📍 تم رفض إذن الموقع</Text>
-                </View>
-              ) : (
-                <View style={styles.locRequesting}>
-                  <ActivityIndicator color={T.accent} size="small" />
-                  <Text style={styles.locText}>جارٍ طلب الموقع...</Text>
-                </View>
+              ) : null}
+
+              {nearbyUsers.length > 0 && (
+                <Text style={styles.sectionLabel}>{AR.nearbyUsers} — {nearbyUsers.length} ضمن 0.5 كم</Text>
               )}
-            </View>
 
-            {/* Report button */}
-            <View style={styles.reportBar}>
-              <TouchableOpacity
-                style={[styles.reportBtn, isParticipationRestricted && { opacity: 0.5 }]}
-                onPress={() => setReportModalVisible(true)}
-                disabled={isParticipationRestricted}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.reportBtnText}>⚡ {AR.reportUtilityOn}</Text>
-              </TouchableOpacity>
-              {isParticipationRestricted && (
-                <Text style={styles.restrictionText}>⚠️ مُقيّد — نسبة الموافقة منخفضة</Text>
-              )}
-            </View>
-
-            <ReportModal
-              visible={reportModalVisible}
-              onClose={() => setReportModalVisible(false)}
-              onSubmit={handleReport}
-              submitting={submitting}
-            />
-
-            <FlatList
-              data={nearbyUsers}
-              keyExtractor={u => u.user_id}
-              contentContainerStyle={{ padding: 16, paddingTop: 0 }}
-              renderItem={({ item }) => (
-                <NearbyUserCard
-                  item={item}
-                  followStatus={getStatusWith(item.user_id)}
-                  onFollowAction={handleFollowAction}
+              {(following.length === 0 || following.length < 3) && nearbyUsers.length > 0 && (
+                <SuggestedUsers
+                  nearbyUsers={nearbyUsers}
+                  following={following}
+                  outgoing={outgoing}
+                  offsetMinutes={myOffsetMinutes}
+                  onFollow={handleFollowAction}
                 />
               )}
-              ListEmptyComponent={
-                nearbyLoading ? (
-                  <View style={styles.center}>
-                    <ActivityIndicator color={T.accent} />
-                    <Text style={styles.emptySub}>جارٍ البحث...</Text>
-                  </View>
-                ) : (
-                  <View style={styles.emptyBox}>
-                    <Text style={{ fontSize: 48, marginBottom: 14 }}>📍</Text>
-                    <Text style={styles.emptyTitle}>لا يوجد مستخدمون قريبون</Text>
-                    <Text style={styles.emptySub}>جرب حفظ موقعك أو عد لاحقاً.</Text>
-                  </View>
-                )
-              }
-            />
-
-            <SuggestedUsers
-              nearbyUsers={nearbyUsers}
-              following={following}
-              outgoing={outgoing}
-              offsetMinutes={myOffsetMinutes}
-              onFollow={handleFollowAction}
-            />
-          </>
-        )}
-
-        {tab === 'notifications' && (
-          <FlatList
-            data={notifications}
-            keyExtractor={n => String(n.id)}
-            contentContainerStyle={{ padding: 16 }}
-            renderItem={({ item }) => (
-              <NotifCard
-                notif={item}
-                onRespond={handleRespond}
-                onReporterPress={(reporterId) => router.push(`/user/${reporterId}`)}
-              />
-            )}
-            ListEmptyComponent={
-              notifLoading ? (
-                <View style={styles.center}>
-                  <ActivityIndicator color={T.accent} />
-                  <Text style={styles.emptySub}>جارٍ التحميل...</Text>
-                </View>
-              ) : (
-                <View style={styles.emptyBox}>
-                  <Text style={{ fontSize: 48, marginBottom: 14 }}>🔔</Text>
-                  <Text style={styles.emptyTitle}>لا توجد إشعارات</Text>
-                  <Text style={styles.emptySub}>ستظهر هنا بلاغات المجتمع من المستخدمين الذين تتابعهم.</Text>
-                </View>
-              )
-            }
-          />
-        )}
-
-        {tab === 'history' && (
-          <FlatList
-            data={history}
-            keyExtractor={h => String(h.id)}
-            contentContainerStyle={{ padding: 16 }}
-            renderItem={({ item }) => (
-              <HistoryCard
-                entry={item}
-                onReporterPress={(reporterId) => router.push(`/user/${reporterId}`)}
-              />
-            )}
-            ListEmptyComponent={
-              <View style={styles.emptyBox}>
-                <Text style={{ fontSize: 48, marginBottom: 14 }}>📋</Text>
-                <Text style={styles.emptyTitle}>لا يوجد سجل</Text>
-                <Text style={styles.emptySub}>ستظهر هنا بلاغاتك وتأكيداتك السابقة.</Text>
-              </View>
-            }
-          />
-        )}
-
-        {tab === 'following' && (
-          <FlatList
-            data={[...following, ...pending]}
-            keyExtractor={f => String(f.id)}
-            contentContainerStyle={{ padding: 16 }}
-            renderItem={({ item }) => {
-              const isPending = !item.target_id; // pending requests don't have target_id in this shape
-              return (
-                <View style={styles.followRow}>
-                  <Text style={styles.followName}>
-                    {isPending ? `⏳ ${item.requester_username ?? 'مجهول'}` : `👤 ${item.target_username ?? 'مجهول'}`}
-                  </Text>
-                  {isPending && (
-                    <View style={{ flexDirection: 'row-reverse', gap: 8 }}>
-                      <TouchableOpacity onPress={() => respondToRequest(item.id, false)} style={styles.followReject}>
-                        <Text style={styles.followRejectText}>رفض</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity onPress={() => respondToRequest(item.id, true)} style={styles.followAccept}>
-                        <Text style={styles.followAcceptText}>قبول</Text>
-                      </TouchableOpacity>
-                    </View>
-                  )}
-                </View>
-              );
-            }}
-            ListEmptyComponent={
+            </>
+          )}
+          renderItem={({ item }) => (
+            <NearbyUserCard item={item} followStatus={getStatusWith(item.user_id)} onFollowAction={handleFollowAction} />
+          )}
+          ListEmptyComponent={() => (
+            (nearbyLoading || isLoadingLocation) ? null : (
               <View style={styles.emptyBox}>
                 <Text style={{ fontSize: 48, marginBottom: 14 }}>👥</Text>
-                <Text style={styles.emptyTitle}>لا تتابع أحداً بعد</Text>
-                <Text style={styles.emptySub}>ابحث عن مستخدمين قريبين وابدأ بالمتابعة.</Text>
+                <Text style={styles.emptyTitle}>{AR.noNearbyUsers}</Text>
+                <Text style={styles.emptySub}>{AR.noNearbyUsersSub}</Text>
               </View>
-            }
-          />
-        )}
+            )
+          )}
+        />
+      )}
 
-        {tab === 'leaderboard' && (
-          <ScrollView contentContainerStyle={{ padding: 16 }}>
-            <LeaderboardTab myLat={myLat} myLon={myLon} />
-          </ScrollView>
-        )}
-      </View>
+      {tab === 'notifications' && (
+        <FlatList
+          style={styles.list}
+          contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]}
+          data={notifications}
+          keyExtractor={n => String(n.id)}
+          showsVerticalScrollIndicator={false}
+          onRefresh={refreshNotifs}
+          refreshing={notifLoading}
+          ListHeaderComponent={() => (
+            <Text style={styles.sectionLabel}>
+              {AR.communityAlerts} — {pendingCount > 0 ? `${pendingCount} ${AR.awaitingResponse}` : AR.allCaughtUp}
+            </Text>
+          )}
+          renderItem={({ item }) => <NotifCard notif={item} onRespond={handleRespond} onReporterPress={(rid) => router.push(`/(user)/reporter/${rid}` as any)} />}
+          ListEmptyComponent={() => (
+            notifLoading ? null : (
+              <View style={styles.emptyBox}>
+                <Text style={{ fontSize: 48, marginBottom: 14 }}>🔔</Text>
+                <Text style={styles.emptyTitle}>{AR.noAlerts}</Text>
+                <Text style={styles.emptySub}>{AR.noAlertsSub}</Text>
+              </View>
+            )
+          )}
+        />
+      )}
+
+      {tab === 'history' && (
+        <FlatList
+          style={styles.list}
+          contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]}
+          data={history}
+          keyExtractor={h => String(h.id)}
+          showsVerticalScrollIndicator={false}
+          ListHeaderComponent={() => (
+            <Text style={styles.sectionLabel}>سجل مزامنتك — آخر {history.length} أحداث</Text>
+          )}
+          renderItem={({ item }) => (
+            <HistoryCard
+              entry={item}
+              onReporterPress={item.reporter_id ? (rid) => router.push(`/(user)/reporter/${rid}` as any) : undefined}
+            />
+          )}
+          ListEmptyComponent={() => (
+            <View style={styles.emptyBox}>
+              <Text style={{ fontSize: 48, marginBottom: 14 }}>📋</Text>
+              <Text style={styles.emptyTitle}>{AR.noHistory}</Text>
+              <Text style={styles.emptySub}>{AR.noHistorySub}</Text>
+            </View>
+          )}
+        />
+      )}
+
+      {tab === 'leaderboard' && (
+        <ScrollView style={styles.list} contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]} showsVerticalScrollIndicator={false}>
+          <LeaderboardTab myLat={myLat} myLon={myLon} />
+        </ScrollView>
+      )}
+
+      {tab === 'following' && (
+        <ScrollView style={styles.list} contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 100 }]} showsVerticalScrollIndicator={false}>
+          {following.length > 0 && (
+            <>
+              <Text style={styles.sectionLabel}>{AR.following} ({following.length})</Text>
+              {following.map(f => (
+                <View key={f.id} style={styles.followRow}>
+                  <TouchableOpacity style={styles.unfollowBtn} onPress={() => cancelOrUnfollow(f.id)} activeOpacity={0.85}>
+                    <Text style={styles.unfollowText}>{AR.unfollow}</Text>
+                  </TouchableOpacity>
+                  <View style={styles.followRowLeft}>
+                    <Text style={styles.followName}>{f.target_username ?? 'مجهول'}</Text>
+                    <Text style={styles.followSub}>{AR.youReceiveAlerts}</Text>
+                  </View>
+                </View>
+              ))}
+            </>
+          )}
+
+          {followers.length > 0 && (
+            <>
+              <Text style={[styles.sectionLabel, { marginTop: 16 }]}>{AR.followingLabel} ({followers.length})</Text>
+              {followers.map(f => (
+                <View key={f.id} style={styles.followRow}>
+                  <TouchableOpacity style={styles.removeBtn} onPress={() => cancelOrUnfollow(f.id)} activeOpacity={0.85}>
+                    <Text style={styles.removeText}>{AR.remove}</Text>
+                  </TouchableOpacity>
+                  <View style={styles.followRowLeft}>
+                    <Text style={styles.followName}>{f.requester_username ?? 'مجهول'}</Text>
+                    <Text style={styles.followSub}>{AR.receivesYourAlerts}</Text>
+                  </View>
+                </View>
+              ))}
+            </>
+          )}
+
+          {outgoing.length > 0 && (
+            <>
+              <Text style={[styles.sectionLabel, { marginTop: 16 }]}>الطلبات المُرسَلة ({outgoing.length})</Text>
+              {outgoing.map(f => (
+                <View key={f.id} style={styles.followRow}>
+                  <TouchableOpacity style={styles.cancelBtn} onPress={() => cancelOrUnfollow(f.id)} activeOpacity={0.85}>
+                    <Text style={styles.cancelText}>{AR.cancel}</Text>
+                  </TouchableOpacity>
+                  <View style={styles.followRowLeft}>
+                    <Text style={styles.followName}>{f.target_username ?? 'مجهول'}</Text>
+                    <Text style={styles.followSub}>{AR.requestPending}</Text>
+                  </View>
+                </View>
+              ))}
+            </>
+          )}
+
+          {following.length === 0 && followers.length === 0 && outgoing.length === 0 && (
+            <View style={styles.emptyBox}>
+              <Text style={{ fontSize: 48, marginBottom: 14 }}>🤝</Text>
+              <Text style={styles.emptyTitle}>{AR.noConnections}</Text>
+              <Text style={styles.emptySub}>{AR.noConnectionsSub}</Text>
+            </View>
+          )}
+        </ScrollView>
+      )}
+
+      <ReportModal
+        visible={reportModalVisible}
+        onClose={() => setReportModalVisible(false)}
+        onSubmit={handleReport}
+        submitting={submitting}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  header: { backgroundColor: T.surface, borderBottomWidth: 1, borderBottomColor: T.border, paddingHorizontal: 16, paddingBottom: 8 },
-  headerRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
-  headerLeft: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
-  headerName: { color: T.textPrimary, fontSize: 14, fontWeight: '700' },
-  headerTitle: { color: T.textPrimary, fontSize: 18, fontWeight: '800' },
-  badge: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 2 },
-  badgeText: { fontSize: 9, fontWeight: '600' },
-  tabBar: { flexDirection: 'row-reverse', gap: 6, paddingBottom: 4 },
-  tab: { borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: T.elevated },
-  tabActive: { backgroundColor: T.primary + '33', borderWidth: 1, borderColor: T.primary + '66' },
-  tabText: { color: T.textMuted, fontSize: 11, fontWeight: '600' },
-  tabTextActive: { color: T.accent, fontWeight: '700' },
-  locBar: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: T.surface, borderBottomWidth: 1, borderBottomColor: T.border },
-  locGranted: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between' },
-  locText: { color: T.textMuted, fontSize: 12 },
-  locSaveBtn: { backgroundColor: T.primary, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5 },
-  locSaveText: { color: '#fff', fontSize: 11, fontWeight: '700' },
-  locDenied: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between' },
-  locDeniedText: { color: T.danger, fontSize: 12 },
-  locRetryBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.border },
-  locRetryText: { color: T.textSecondary, fontSize: 11 },
-  locRequesting: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
-  reportBar: { paddingHorizontal: 16, paddingVertical: 10 },
-  reportBtn: { backgroundColor: T.success, borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
-  reportBtnText: { color: '#fff', fontSize: 16, fontWeight: '800' },
-  restrictionText: { color: T.warning, fontSize: 10, textAlign: 'center', marginTop: 6 },
-  center: { alignItems: 'center', paddingVertical: 40 },
-  emptyBox: { alignItems: 'center', paddingVertical: 48, paddingHorizontal: 24 },
+  root: { flex: 1, backgroundColor: T.bg },
+  myScoreBar: { flexDirection: 'row-reverse', backgroundColor: T.surface, paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: T.border, alignItems: 'center', justifyContent: 'space-between' },
+  myScoreLeft: { flexDirection: 'column', justifyContent: 'center' },
+  myScoreLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, textAlign: 'right' },
+  myScoreName: { color: T.textPrimary, fontSize: 14, fontWeight: '700', marginTop: 2, textAlign: 'right' },
+  myScoreRight: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8 },
+  myScoreVal: { fontSize: 15, fontWeight: '800' },
+  myBadge: { fontSize: 12, fontWeight: '600' },
+  myScoreSub: { color: T.textMuted, fontSize: 10 },
+  tabBar: { flexDirection: 'row-reverse', backgroundColor: T.surface, borderBottomWidth: 1, borderBottomColor: T.border },
+  tabBtn: { flex: 1, paddingVertical: 13, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent' },
+  tabBtnActive: { borderBottomColor: T.accent },
+  tabLabelWrap: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5 },
+  tabLabel: { color: T.textMuted, fontSize: 11, fontWeight: '600' },
+  tabLabelActive: { color: T.accent },
+  tabBadge: { backgroundColor: T.danger, borderRadius: 8, minWidth: 16, height: 16, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
+  tabBadgeText: { color: '#fff', fontSize: 9, fontWeight: '800' },
+  list: { flex: 1 },
+  listContent: { paddingHorizontal: 16, paddingTop: 12 },
+  section: { marginBottom: 16 },
+  sectionLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 10, textAlign: 'right' },
+  locLoadingBox: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: T.surface, borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: T.border },
+  locLoadingText: { color: T.textMuted, fontSize: 12, textAlign: 'right' },
+  locDeniedBox: { backgroundColor: '#1a0a00', borderRadius: 12, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: '#451a03', alignItems: 'center' },
+  locDeniedText: { color: '#92400e', fontSize: 13, textAlign: 'center', lineHeight: 19, marginBottom: 10 },
+  retryBtn: { backgroundColor: T.primary, borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10 },
+  retryBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  locCard: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: T.border },
+  locRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 10 },
+  locIcon: { fontSize: 18 },
+  locCoords: { color: T.textMuted, fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  shareBtn: { backgroundColor: T.primary, borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginTop: 8 },
+  shareBtnSaved: { backgroundColor: '#065f46' },
+  shareBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  emptyBox: { alignItems: 'center', paddingVertical: 40, paddingHorizontal: 24 },
   emptyTitle: { color: T.textSecondary, fontSize: 18, fontWeight: '700', marginBottom: 10, textAlign: 'center' },
   emptySub: { color: T.textMuted, fontSize: 13, textAlign: 'center', lineHeight: 22 },
-  followRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: T.surface, borderRadius: 12, padding: 12, marginBottom: 8, borderWidth: 1, borderColor: T.border },
-  followName: { color: T.textPrimary, fontSize: 14, fontWeight: '700' },
-  followAccept: { backgroundColor: T.success, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 5 },
-  followAcceptText: { color: '#fff', fontSize: 11, fontWeight: '700' },
-  followReject: { backgroundColor: T.elevated, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.border },
-  followRejectText: { color: T.textMuted, fontSize: 11 },
+  followRow: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: T.surface, borderRadius: 12, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: T.border },
+  followRowLeft: { flex: 1 },
+  followName: { color: T.textPrimary, fontSize: 15, fontWeight: '700', textAlign: 'right' },
+  followSub: { color: T.textMuted, fontSize: 11, marginTop: 2, textAlign: 'right' },
+  unfollowBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
+  unfollowText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
+  removeBtn: { backgroundColor: '#2d0a0a', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.danger + '44' },
+  removeText: { color: T.danger, fontWeight: '600', fontSize: 12 },
+  cancelBtn: { backgroundColor: T.elevated, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: T.border },
+  cancelText: { color: T.textMuted, fontWeight: '600', fontSize: 12 },
+  restrictionBanner: { backgroundColor: '#1a0808', borderBottomWidth: 1, borderBottomColor: '#7f1d1d', paddingHorizontal: 16, paddingVertical: 12, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12 },
+  restrictionIconWrap: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#450a0a', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  restrictionIcon: { fontSize: 18 },
+  restrictionTitle: { color: '#f87171', fontSize: 10, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
+  restrictionBody: { color: '#fca5a5', fontSize: 12, lineHeight: 18, textAlign: 'right' },
 });
