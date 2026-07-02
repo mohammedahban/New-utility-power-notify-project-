@@ -897,3 +897,4 @@ export function computeAccuracyLogEvent(
 
 // ─── Type re-exports for backwards compat ───────────────────────────────────
 export type { ScheduleStateMode as ATCMode };
+// cache-bust: 2026-07-02
