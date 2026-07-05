@@ -148,16 +148,8 @@ function useCountdownSec(targetMinutes: number | null) {
 }
 
 // ── Format time — Western numerals + Arabic AM/PM suffix, always LTR (spec §20) ──
-function fmtTimeAr(iso: string | null | undefined): string {
-  // V2.2.1 FIX (Issues 1, 2a): this used to call `new Date(iso)` unguarded.
-  // When iso was missing/invalid (e.g. a nextTransition object that lost its
-  // rangeStartIso/rangeEndIso somewhere upstream), that produced a literal
-  // "Invalid Date" string rendered straight into the UI. Fall back to a
-  // neutral placeholder instead.
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return '—';
-  const raw = d.toLocaleString('en-US', {
+function fmtTimeAr(iso: string): string {
+  const raw = new Date(iso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
   });
   return raw.replace('AM', 'ص').replace('PM', 'م');
@@ -946,14 +938,14 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
             <Text style={utStyles.communityPrioText}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — شارك بملاحظاتك</Text>
           </View>
         )}
-        {effectiveNt && effectiveNt.rangeStartIso && (
+        {effectiveNt && (
           <View style={utStyles.rangeBox}>
             <Text style={[utStyles.rangeBoxLabel, { color: isCurrentOn ? T.danger : T.success }]}>
               {effectiveNt.type === 'UTILITY_ON' ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
             </Text>
             <View style={utStyles.rangeTimeStack} dir="ltr">
               <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeStartIso)}</Text>
-              {effectiveNt.rangeStartIso !== effectiveNt.rangeEndIso && effectiveNt.rangeEndIso && (
+              {effectiveNt.rangeStartIso !== effectiveNt.rangeEndIso && (
                 <>
                   <Text style={utStyles.rangeSep}>و</Text>
                   <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeEndIso)}</Text>
@@ -1473,16 +1465,7 @@ const sbStyles = StyleSheet.create({
 function useStableNextTransition(nt: UserPrediction['nextTransition'] | null | undefined) {
   const ref = useRef<{ key: string; rangeStartIso: string; rangeEndIso: string; rangeLabel: string } | null>(null);
   if (!nt) { ref.current = null; return nt ?? null; }
-  // V2.2.1 FIX (Issues 1, 2a): nt.rangeStartIso could be missing/invalid if
-  // an upstream object didn't carry the field. new Date(...).getTime() on
-  // that produced NaN, which still built a (bogus but truthy) cache key —
-  // so the broken rangeStartIso/rangeEndIso got cached and kept being
-  // served back on every subsequent render, showing "Invalid Date"
-  // persistently rather than just once. Treat an invalid source the same
-  // as "no transition" instead of caching it.
-  const startMs = nt.rangeStartIso ? new Date(nt.rangeStartIso).getTime() : NaN;
-  if (isNaN(startMs)) { ref.current = null; return null; }
-  const roundedStart = Math.round(startMs / (5 * 60_000));
+  const roundedStart = Math.round(new Date(nt.rangeStartIso).getTime() / (5 * 60_000));
   const key = `${nt.type}|${roundedStart}`;
   if (!ref.current || ref.current.key !== key) {
     ref.current = { key, rangeStartIso: nt.rangeStartIso, rangeEndIso: nt.rangeEndIso, rangeLabel: nt.rangeLabel };
@@ -1571,42 +1554,28 @@ export default function Home() {
   }, [snapshot, saveOffset, clearResync, clearSnapshot]);
 
   // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
-  // Priority 1: resyncedAtIso, but ONLY while still inside the COMMUNITY_SYNCED
-  //   window (see V2.2 FIX note below).
-  // Priority 2: POSITIVE_OFFSET_PENDING's held-state start (currentStateStartIso).
-  // Priority 3: reconciledCycleStartIso — anchor.startIso backdated by the offset.
+  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
   //   e.g. Growatt OFF at 12:00, offset -60 → reconciledStart = 11:00 → "منذ ساعة"
-  // Priority 4: userPrediction.currentStateStartIso — schedule-derived start.
+  //   This MUST win over anchor.startIso which always holds raw Growatt time.
+  // Priority 2: userPrediction.currentStateStartIso — schedule-derived start.
+  // Priority 3: anchor.startIso — Growatt raw time (correct for neutral/positive offset
+  //   users where no reconciliation is needed and schedule start = Growatt start).
+    // تم التعديل: إعطاء الأولوية لـ anchor الثابت لحماية الوقت من التصفير التلقائي
+    // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
+  // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
+  // Priority 2: anchor.startIso — Growatt raw time.
+  // Priority 3: userPrediction.currentStateStartIso — schedule-derived start.
+    // ── Mathematical Anchor: Bulletproof start time calculation ──────────
   const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
   const anchorStartIso = (() => {
-    const atcMode = userPrediction?.atc?.mode;
-    // V2.2 FIX: this used to key off `isResynced` (just `!!resyncPoint`), which
-    // stays true indefinitely once any resync point exists — including long
-    // after the Generated ON's own window has ended and later, correctly-
-    // shifted slots are active. That pinned "elapsed since" to the ORIGINAL
-    // report's timestamp forever instead of updating to each new active
-    // slot's real start. COMMUNITY_SYNCED is the engine's own signal for
-    // "we are still inside that freshly-synced window."
-    if (atcMode === 'COMMUNITY_SYNCED' && userPrediction?.resyncedAtIso) {
+    if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
       return userPrediction.resyncedAtIso;
     }
     // For POSITIVE_OFFSET_PENDING: anchor.state is the HELD state (before Growatt flipped)
     // currentState is also the HELD state — but anchor.state may differ if Growatt already flipped.
     // Use currentStateStartIso directly so it reflects the correct schedule slot start.
+    const atcMode = userPrediction?.atc?.mode;
     if (atcMode === 'POSITIVE_OFFSET_PENDING') {
-      return userPrediction?.currentStateStartIso ?? null;
-    }
-    // V2.2.1 FIX (Issue 5): when this ON slot just had UNCERTAIN_ZONE
-    // reconciliation applied (uncertainZoneElapsedMin > 0), the engine's
-    // own currentStateStartIso already correctly reflects the backdated
-    // "since" point (the personal-predicted start, per Period rules).
-    // anchor.startIso + offsetMs instead uses the STANDING baseline offset
-    // applied to Growatt's actual transition instant — which can disagree
-    // with the engine's value whenever this specific cycle's real timing
-    // drifted from that baseline (exactly the situation UNCERTAIN_ZONE
-    // exists for), showing a "since" that doesn't include the exceeded
-    // waiting time the person just watched tick up.
-    if ((userPrediction?.atc?.uncertainZoneElapsedMin ?? 0) > 0) {
       return userPrediction?.currentStateStartIso ?? null;
     }
     if (anchor && userPrediction && anchor.state === userPrediction.currentState) {

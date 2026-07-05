@@ -67,23 +67,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // the profile of the current user.
   const currentUidRef = useRef<string | null>(null);
 
-  // V2.2.1 FIX (Issue 7): fetchProfile had no retry. On a cold start after
-  // the app was closed a long time, the access token is definitely expired,
-  // so recovery always goes through a refresh (or a network round-trip)
-  // right before this call. If the device's network wasn't fully back yet
-  // at that exact moment (very plausible immediately after a cold launch —
-  // often just barely won the race with connectivity coming back), this
-  // request could fail even though the session itself was perfectly valid.
-  // The caller (applySession, called from the INITIAL_SESSION handler
-  // below) always calls clearLoading() right after this resolves — success
-  // or failure — so a failed fetch here permanently left `profile` null
-  // while `loading` was already false. AuthGate's own effect does nothing
-  // in that state ("if (!profile) return"), so the user was just stranded
-  // on whatever screen was already showing (apparently /login) until they
-  // force-closed and reopened the app — the exact reported symptom, and
-  // the second attempt succeeding simply because the network had caught up
-  // by then. A short bounded retry covers that window without it.
-  const fetchProfile = async (uid: string, retriesLeft = 3): Promise<void> => {
+  const fetchProfile = async (uid: string) => {
     currentUidRef.current = uid;
     try {
       const { data, error } = await supabase
@@ -93,12 +77,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .single();
       if (error) {
         console.error('[Auth] fetchProfile error:', error.message);
-        if (retriesLeft > 0 && currentUidRef.current === uid) {
-          await new Promise(res => setTimeout(res, 1200));
-          if (currentUidRef.current === uid) {
-            return fetchProfile(uid, retriesLeft - 1);
-          }
-        }
         return;
       }
       if (currentUidRef.current === uid) {
@@ -106,12 +84,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     } catch (e) {
       console.error('[Auth] fetchProfile exception:', e);
-      if (retriesLeft > 0 && currentUidRef.current === uid) {
-        await new Promise(res => setTimeout(res, 1200));
-        if (currentUidRef.current === uid) {
-          return fetchProfile(uid, retriesLeft - 1);
-        }
-      }
     }
   };
 
@@ -230,29 +202,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return null;
     };
 
-    // V2.2.1 FIX (Issue 7): this refresh runs right at cold-start, the same
-    // moment network connectivity is least likely to be fully ready. Its
-    // caller treats any failure here as "refresh token expired/revoked"
-    // and signs the user out LOCALLY — a much more severe outcome than the
-    // fetchProfile case above (this clears the session from storage
-    // entirely, so a second app open wouldn't recover it either). One
-    // short retry gives a transient network hiccup a chance to clear
-    // before we conclude the token is genuinely invalid.
-    const attemptRefresh = async (): Promise<{ session: Session | null; failed: boolean }> => {
-      try {
-        const { data, error } = await supabase.auth.refreshSession();
-        if (!mounted) return { session: null, failed: false };
-        if (error) {
-          console.warn('[Auth] refreshSession error:', error.message);
-          return { session: null, failed: true };
-        }
-        return { session: data.session, failed: false };
-      } catch (e: any) {
-        console.warn('[Auth] refreshSession exception:', e?.message ?? e);
-        return { session: null, failed: true };
-      }
-    };
-
     const maybeRefresh = async (s: Session): Promise<Session | null> => {
       const expiresAt = s.expires_at ?? 0;
       const nowSec = Math.floor(Date.now() / 1000);
@@ -260,17 +209,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (!needsRefresh) return s;
 
-      let result = await attemptRefresh();
-      if (!mounted) return null;
-      if (result.session) return result.session;
-      if (result.failed) {
-        await new Promise(res => setTimeout(res, 1000));
+      try {
+        const { data, error } = await supabase.auth.refreshSession();
         if (!mounted) return null;
-        result = await attemptRefresh();
-        if (!mounted) return null;
-        if (result.session) return result.session;
+        if (error) {
+          console.warn('[Auth] refreshSession error:', error.message);
+          return null;
+        }
+        return data.session;
+      } catch (e: any) {
+        console.warn('[Auth] refreshSession exception:', e?.message ?? e);
+        return null;
       }
-      return null;
     };
 
     const initialize = async () => {
@@ -483,5 +433,3 @@ export function useAuth() {
   if (!ctx) throw new Error('useAuth must be used within AuthProvider');
   return ctx;
 }
-
-

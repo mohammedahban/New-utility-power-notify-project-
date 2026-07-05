@@ -12,24 +12,12 @@ import { useUserOffset } from '../../hooks/useUserOffset';
 import { useResync } from '../../contexts/ResyncContext';
 import { AR } from '../../constants/arabic';
 
-// V2.2.1: Widened from now/5/10/15/20min to a 30min-6h half-hour-step range
-// (see useUtilityReports.ts TimeOption). Labels are inlined here rather than
-// added to AR.* because constants/arabic.ts wasn't part of this review — if
-// the project keeps all UI strings centralized there, feel free to move
-// these into that file under matching keys.
 const TIME_OPTS: { key: TimeOption; label: string }[] = [
-  { key: '30min', label: '30 دقيقة' },
-  { key: '1h',    label: 'ساعة' },
-  { key: '1h30m', label: 'ساعة ونصف' },
-  { key: '2h',    label: 'ساعتين' },
-  { key: '2h30m', label: 'ساعتين ونصف' },
-  { key: '3h',    label: '3 ساعات' },
-  { key: '3h30m', label: '3 ساعات ونصف' },
-  { key: '4h',    label: '4 ساعات' },
-  { key: '4h30m', label: '4 ساعات ونصف' },
-  { key: '5h',    label: '5 ساعات' },
-  { key: '5h30m', label: '5 ساعات ونصف' },
-  { key: '6h',    label: '6 ساعات' },
+  { key: 'now',   label: AR.timeNow   },
+  { key: '5min',  label: AR.time5min  },
+  { key: '10min', label: AR.time10min },
+  { key: '15min', label: AR.time15min },
+  { key: '20min', label: AR.time20min },
 ];
 
 // TMMS V2.2: Global Report Modal — ON-ONLY reporting.
@@ -44,8 +32,7 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
   isCoolingDown: boolean;
   cooldownLabel: string | null;
 }) {
-  // V2.2.1: default to the shortest available option (was 'now', now removed)
-  const [time, setTime] = useState<TimeOption>('30min');
+  const [time, setTime] = useState<TimeOption>('now');
 
   const T = {
     surface: '#0f172a', elevated: '#1e293b', border: '#334155',

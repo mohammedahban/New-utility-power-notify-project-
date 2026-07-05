@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
 
 export interface PatternStats {
@@ -112,7 +112,6 @@ export function usePredictions() {
   const [prediction, setPrediction] = useState<Prediction | null>(null);
   const [computedAt, setComputedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const lastTriggerRef = useRef<number>(0);
 
   const fetchPredictions = useCallback(async () => {
     const { data, error } = await supabase
@@ -132,34 +131,6 @@ export function usePredictions() {
     setLoading(false);
   }, []);
 
-  // V2.2.1 FIX (Issue 8): the APPPE computation ('analyze-patterns') was
-  // only ever invoked by the admin Predictions screen — on mount, and via
-  // its manual refresh button. That meant a Growatt state change only
-  // produced a fresh prediction if an admin happened to have that specific
-  // screen open at the time; every other screen, and every regular user,
-  // just kept showing whatever was last (manually) computed, sometimes
-  // long stale.
-  //
-  // usePredictions() is the one hook nearly every screen in both apps
-  // already mounts, so triggering the recompute here — the moment a new
-  // row lands in power_events, the same table useUserPredictions.ts and
-  // useResyncNotifications.ts already watch for Growatt transitions —
-  // means it fires automatically from whichever screen happens to be
-  // open, in either app, with no manual step required. (If your project
-  // renamed the raw Growatt-event table, update the table name below to
-  // match — this assumes 'power_events' based on where it's used
-  // elsewhere in this codebase.)
-  const triggerAnalysis = useCallback(async () => {
-    const now = Date.now();
-    if (now - lastTriggerRef.current < 5000) return; // basic debounce
-    lastTriggerRef.current = now;
-    try {
-      await supabase.functions.invoke('analyze-patterns', { body: {} });
-    } catch (e) {
-      console.warn('[usePredictions] auto analyze-patterns trigger failed:', e);
-    }
-  }, []);
-
   useEffect(() => {
     fetchPredictions();
 
@@ -177,13 +148,6 @@ export function usePredictions() {
           }
         }
       )
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'power_events' },
-        () => {
-          triggerAnalysis();
-        }
-      )
       .subscribe((status) => {
         console.log('[usePredictions] channel status:', status);
       });
@@ -191,7 +155,7 @@ export function usePredictions() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [fetchPredictions, triggerAnalysis]);
+  }, [fetchPredictions]);
 
   return { prediction, computedAt, loading };
 }

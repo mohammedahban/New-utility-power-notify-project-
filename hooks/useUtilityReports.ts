@@ -69,15 +69,7 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResyncPoint, OffsetState, OffsetValue } from '../contexts/ResyncContext';
 
-// V2.2.1: Replaced the old now/5/10/15/20-minute set with a wider, half-hour
-// step range up to 6 hours. Users often don't notice/report a transition
-// within 20 minutes of it happening, so the old ceiling forced inaccurate
-// reports. The period-detection logic in calculateReporterOffset already
-// works off the resulting backdated timestamp generically, so widening this
-// range needs no change there — it just needs a real timestamp to look up.
-export type TimeOption =
-  | '30min' | '1h' | '1h30m' | '2h' | '2h30m' | '3h'
-  | '3h30m' | '4h' | '4h30m' | '5h' | '5h30m' | '6h';
+export type TimeOption = 'now' | '5min' | '10min' | '15min' | '20min';
 export type ReportedState = 'UTILITY_ON' | 'UTILITY_OFF';
 
 export interface UtilityReport {
@@ -92,18 +84,11 @@ export interface UtilityReport {
 }
 
 const TIME_OFFSETS_MIN: Record<TimeOption, number> = {
-  '30min': 30,
-  '1h': 60,
-  '1h30m': 90,
-  '2h': 120,
-  '2h30m': 150,
-  '3h': 180,
-  '3h30m': 210,
-  '4h': 240,
-  '4h30m': 270,
-  '5h': 300,
-  '5h30m': 330,
-  '6h': 360,
+  now: 0,
+  '5min': 5,
+  '10min': 10,
+  '15min': 15,
+  '20min': 20,
 };
 
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
@@ -692,28 +677,6 @@ export function useUtilityReports() {
           }
         }
       });
-
-      // V2.2 FIX: persist the reporter's own correctly-computed offset to
-      // user_offsets right away (mirrors the approver "YES" flow in
-      // useResyncNotifications.ts). Previously only approvers got their
-      // numeric offset written here — a reporter's own user_offsets row was
-      // left stale until an unrelated, less precise recomputation happened
-      // to run elsewhere. PENDING_NEGATIVE reports store 0 as a placeholder,
-      // the same convention the approver flow uses, to be replaced once
-      // Growatt ON resolves it.
-      const numericOffsetForUserRow = typeof offsetValue === 'number' ? offsetValue : 0;
-      supabase
-        .from('user_offsets')
-        .upsert({
-          user_id: user!.id,
-          offset_minutes: numericOffsetForUserRow,
-          offset_state: offsetState,
-          offset_value: offsetValue,
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'user_id' })
-        .then(({ error: offErr }) => {
-          if (offErr) console.warn('[useUtilityReports] user_offsets upsert error:', offErr.message);
-        });
 
       // Distribute push notifications to followers (non-blocking)
       supabase.functions.invoke('distribute-resync', {
