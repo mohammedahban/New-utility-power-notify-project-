@@ -484,5 +484,4 @@ export function useAuth() {
   return ctx;
 }
 
-Privacy and cookie settings
-Managed by Google. Complies with IAB TCF. CMP ID: 300
+
