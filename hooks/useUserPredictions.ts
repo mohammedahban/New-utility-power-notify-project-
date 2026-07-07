@@ -1,5 +1,5 @@
 /**
- * useUserPredictions — Production hook that feeds the User Home Screen.
+ * usserPredictions — Production hook that feeds the User Home Screen.
  *
  * Architecture:
  *   usePredictions (raw Supabase) → applyOffsetToPrediction (tmmsEngine) → UserPrediction
@@ -55,6 +55,7 @@ import { usePredictions } from './usePredictions';
 import { supabase } from '../lib/supabase';
 import {
   applyOffsetToPrediction as _applyOffsetToPrediction,
+  fmtYemenTime,
   type UserPrediction as _EngineUserPrediction,
   type ResyncPoint,
   type TransitionMode,
@@ -163,6 +164,12 @@ export type UserPrediction = _EngineUserPrediction & {
   pendingNegativeResolutionIso?: string | null;
   isPendingNegative?: boolean; // DEPRECATED: always false in corrected V2.1
   isGeneratedOnCurrent?: boolean;
+  /**
+   * V2.2 (#4): set when an UNCERTAIN_ZONE deduction has been applied — the
+   * backdated start of the current ON cycle. The Home screen gives this
+   * TOP priority as the elapsed-time ("منذ") source.
+   */
+  reconciledCycleStartIso?: string | null;
 };
 
 /**
@@ -284,6 +291,107 @@ function markEstimatedPendingOffset(
   });
 }
 
+// ── V2.2 (#4): UNCERTAIN_ZONE exceeded-time deduction ────────────────────
+// While the user waits in UNCERTAIN_ZONE (predicted OFF exceeded, Growatt
+// not yet ON), the exceeded wait must be DEDUCTED from the next ON cycle:
+//   exceeded = GrowattON − predictedOffEnd
+//   ON start = predictedOffEnd  → "منذ" shows the exceeded time
+//   ON end   = start + predicted ON duration → remaining = predicted − exceeded
+// The entry anchor is persisted so it survives app restarts.
+const UNCERTAIN_ZONE_ENTRY_KEY = 'tmms_uncertain_zone_entry_iso';
+// Never backdate by more than 6 hours — protects against stale anchors.
+const UNCERTAIN_DEDUCTION_CAP_MS = 6 * 3600_000;
+
+function applyUncertainZoneDeduction(
+  pred: UserPrediction,
+  entryIso: string,
+  nowMs: number,
+): UserPrediction {
+  const entryMs = new Date(entryIso).getTime();
+  if (!Number.isFinite(entryMs)) return pred;
+  const slots = (pred.daySchedule ?? []) as ShiftedScheduleSlot[];
+
+  // Locate the ON cycle that began with the Growatt confirmation.
+  const idx = slots.findIndex(s => {
+    const st = new Date(s.startIso).getTime();
+    const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    return s.state === 'ON' && nowMs >= st && nowMs < en;
+  });
+  if (idx < 0) return pred;
+  const slot = slots[idx];
+  if (!slot.endIso) return pred;
+
+  const oldStartMs = new Date(slot.startIso).getTime();
+  const oldEndMs = new Date(slot.endIso).getTime();
+  if (entryMs >= oldStartMs) return pred;                       // nothing exceeded
+  if (oldStartMs - entryMs > UNCERTAIN_DEDUCTION_CAP_MS) return pred; // stale anchor
+
+  const spanMs = oldEndMs - oldStartMs; // predicted ON duration (preserved)
+  const newStartMs = entryMs;
+  const newEndMs = newStartMs + spanMs;
+  const delta = newEndMs - oldEndMs;    // negative — everything moves earlier
+
+  const newSlots = slots.map((s, i) => {
+    if (i < idx) return s;
+    const stMs = i === idx ? newStartMs : new Date(s.startIso).getTime() + delta;
+    const enMs = i === idx ? newEndMs : (s.endIso ? new Date(s.endIso).getTime() + delta : null);
+    const stIso = new Date(stMs).toISOString();
+    const enIso = enMs !== null ? new Date(enMs).toISOString() : null;
+    return {
+      ...s,
+      startIso: stIso,
+      endIso: enIso,
+      startFormatted: fmtYemenTime(stIso),
+      endFormatted: enIso ? fmtYemenTime(enIso) : null,
+      shiftedStartFormatted: fmtYemenTime(stIso),
+      shiftedEndFormatted: enIso ? fmtYemenTime(enIso) : null,
+    };
+  });
+
+  // Re-derive the current state from the adjusted slots — the deducted ON
+  // may already be over when the wait consumed most of its budget.
+  const active = newSlots.find(s => {
+    const st = new Date(s.startIso).getTime();
+    const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    return nowMs >= st && nowMs < en;
+  }) ?? null;
+  const currentState = active?.state ?? pred.currentState;
+  const currentStateStartIso = active?.startIso ?? new Date(newStartMs).toISOString();
+
+  // Rebuild nextTransition from the adjusted slots.
+  const target: 'ON' | 'OFF' = currentState === 'ON' ? 'OFF' : 'ON';
+  const nextSlot = newSlots.find(s =>
+    s.state === target && new Date(s.startIso).getTime() > nowMs,
+  ) ?? null;
+  let nextTransition: any = pred.nextTransition;
+  if (nextSlot) {
+    const min = Math.max(0, (new Date(nextSlot.startIso).getTime() - nowMs) / 60_000);
+    nextTransition = {
+      type: target === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
+      earliestTime: nextSlot.startIso,
+      latestTime: nextSlot.startIso,
+      earliestFormatted: fmtYemenTime(nextSlot.startIso),
+      latestFormatted: fmtYemenTime(nextSlot.startIso),
+      minFromNowMin: min,
+      maxFromNowMin: min,
+      rangeLabel: fmtYemenTime(nextSlot.startIso),
+      rangeStartIso: nextSlot.startIso,
+      rangeEndIso: nextSlot.startIso,
+      inRangeWindow: min <= 0,
+    };
+  }
+
+  const result: any = {
+    ...pred,
+    daySchedule: newSlots,
+    currentState,
+    currentStateStartIso,
+    nextTransition,
+    reconciledCycleStartIso: currentStateStartIso,
+  };
+  return result as UserPrediction;
+}
+
 // ── V2.1: Auto-resolve Pending Negative when Growatt turns ON ──────────────
 // PDF §Rule 2: "When Growatt finally turns ON ... the system immediately
 // replaces Pending Negative → Negative. This replacement must happen
@@ -371,6 +479,14 @@ export function useUserPredictions(
   const frozenOffsetStateRef = useRef<OffsetState | null>(null);
   const frozenAlignmentRef = useRef<TimelineAlignment | null>(null);
   const [frozenOffsetLoaded, setFrozenOffsetLoaded] = useState(false);
+
+  // ── V2.2 (#4): UNCERTAIN_ZONE entry anchor — restored across restarts ──
+  const uncertainEntryRef = useRef<string | null>(null);
+  useEffect(() => {
+    AsyncStorage.getItem(UNCERTAIN_ZONE_ENTRY_KEY)
+      .then(v => { if (v) uncertainEntryRef.current = v; })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!resyncPoint) {
@@ -580,7 +696,50 @@ export function useUserPredictions(
         isGeneratedOnCurrent,
       };
 
-      return v21Result;
+      // ── V2.2 layer (#4): UNCERTAIN_ZONE exceeded-time accounting ────────
+      // 1. Record when the user's predicted OFF ended (entry into the
+      //    UNCERTAIN family). The anchor survives restarts (AsyncStorage).
+      // 2. When Growatt confirms ON, backdate the new ON cycle to that
+      //    anchor and deduct the exceeded wait from the predicted ON
+      //    duration: "منذ" = exceeded time, remaining = predicted − exceeded.
+      // 3. Clear the anchor when superseded by a community sync, when the
+      //    cycle completes (back to a normal OFF), or when stale.
+      const nowV22 = Date.now();
+      const modeV22 = v21Result.atc.mode;
+      const inUncertainFamily =
+        v21Result.currentState === 'OFF' &&
+        (modeV22 === 'UNCERTAIN_ZONE' || modeV22 === 'GRACE_MODE' || modeV22 === 'WAITING_FOR_GROWATT');
+
+      if (inUncertainFamily && !uncertainEntryRef.current) {
+        const entryIso = new Date(
+          nowV22 - Math.max(0, v21Result.atc.overrunMinutes) * 60_000,
+        ).toISOString();
+        uncertainEntryRef.current = entryIso;
+        AsyncStorage.setItem(UNCERTAIN_ZONE_ENTRY_KEY, entryIso).catch(() => {});
+      }
+
+      let finalResult: UserPrediction = v21Result;
+      if (uncertainEntryRef.current) {
+        const entryAgeMs = nowV22 - new Date(uncertainEntryRef.current).getTime();
+        const isStale = !Number.isFinite(entryAgeMs) || entryAgeMs >= 12 * 3600_000;
+        if (
+          !isStale &&
+          prediction.currentState === 'ON' &&
+          v21Result.currentState === 'ON' &&
+          modeV22 !== 'COMMUNITY_SYNCED'
+        ) {
+          finalResult = applyUncertainZoneDeduction(v21Result, uncertainEntryRef.current, nowV22);
+        } else if (
+          isStale ||
+          modeV22 === 'COMMUNITY_SYNCED' ||
+          (!inUncertainFamily && v21Result.currentState === 'OFF')
+        ) {
+          uncertainEntryRef.current = null;
+          AsyncStorage.removeItem(UNCERTAIN_ZONE_ENTRY_KEY).catch(() => {});
+        }
+      }
+
+      return finalResult;
     } catch (e) {
       console.error('[useUserPredictions] engine error:', e);
       return null;
@@ -591,6 +750,20 @@ export function useUserPredictions(
   // and resolves a pending negative state.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick]);
+
+  // ── Precise auto-transition timer (#2b) ────────────────────────────────
+  // POSITIVE_OFFSET_PENDING / COMMUNITY_SYNCED expose a scheduled
+  // auto-transition ISO. Re-derive EXACTLY when it arrives (plus a small
+  // buffer) instead of waiting up to 30s for the next heartbeat, so the
+  // held state flips the moment the countdown reaches zero.
+  const scheduledFlipIso = userPrediction?.atc?.scheduledAutoTransitionIso ?? null;
+  useEffect(() => {
+    if (!scheduledFlipIso) return;
+    const delayMs = new Date(scheduledFlipIso).getTime() - Date.now();
+    if (Number.isNaN(delayMs) || delayMs <= 0) return;
+    const id = setTimeout(() => setTick(t => t + 1), delayMs + 500);
+    return () => clearTimeout(id);
+  }, [scheduledFlipIso]);
 
   return { userPrediction, loading };
 }
