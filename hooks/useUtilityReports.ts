@@ -69,7 +69,10 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ResyncPoint, OffsetState, OffsetValue } from '../contexts/ResyncContext';
 
-export type TimeOption = 'now' | '5min' | '10min' | '15min' | '20min';
+export type TimeOption =
+  | 'now' | '5min' | '10min' | '15min' | '20min'
+  | '30min' | '1h' | '1.5h' | '2h' | '2.5h' | '3h'
+  | '3.5h' | '4h' | '4.5h' | '5h' | '5.5h' | '6h';
 export type ReportedState = 'UTILITY_ON' | 'UTILITY_OFF';
 
 export interface UtilityReport {
@@ -89,6 +92,18 @@ const TIME_OFFSETS_MIN: Record<TimeOption, number> = {
   '10min': 10,
   '15min': 15,
   '20min': 20,
+  '30min': 30,
+  '1h': 60,
+  '1.5h': 90,
+  '2h': 120,
+  '2.5h': 150,
+  '3h': 180,
+  '3.5h': 210,
+  '4h': 240,
+  '4.5h': 270,
+  '5h': 300,
+  '5.5h': 330,
+  '6h': 360,
 };
 
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
@@ -491,23 +506,30 @@ export function useUtilityReports() {
     // ── V2.2: Fetch the current Growatt schedule to compute Period 1/2/3 ─────
     let schedule: ScheduleSlot[] = [];
     try {
+      // FIX (#3): the schedule lives in `utility_predictions` (row id=1,
+      // JSON column `prediction.daySchedule`). The previous query targeted
+      // a non-existent `predictions` table, so the schedule was ALWAYS
+      // empty — Period 1/2/3 offsets silently defaulted to NEUTRAL and
+      // generated_on_duration_min was stored as NULL, which made the
+      // Generated ON cycle hold forever (no automatic ON→OFF).
       const { data: predData } = await supabase
-        .from('predictions')
-        .select('day_schedule, schedule')
-        .order('created_at', { ascending: false })
-        .limit(1)
+        .from('utility_predictions')
+        .select('prediction')
+        .eq('id', 1)
         .maybeSingle();
 
-      if (predData) {
-        const rawSchedule = predData.day_schedule || predData.schedule;
-        if (Array.isArray(rawSchedule)) {
-          schedule = rawSchedule.map((s: any) => ({
-            state: s.state,
-            start: s.start || s.startFormatted || s.start_time || '',
-            end: s.end || s.endFormatted || s.end_time || '',
-            durationMin: s.durationMin || s.duration_min || 0,
-          }));
-        }
+      const rawSchedule = (predData?.prediction as any)?.daySchedule;
+      if (Array.isArray(rawSchedule)) {
+        schedule = rawSchedule.map((s: any) => {
+          const startIso = s.startIso ?? s.start ?? s.start_time ?? '';
+          const endIso = s.endIso ?? s.end ?? s.end_time ?? '';
+          let durationMin = s.durationMin || s.duration_min || 0;
+          if (!durationMin && startIso && endIso) {
+            const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
+            if (Number.isFinite(ms) && ms > 0) durationMin = Math.round(ms / 60_000);
+          }
+          return { state: s.state, start: startIso, end: endIso, durationMin };
+        });
       }
     } catch (e) {
       console.warn('[useUtilityReports] Failed to fetch schedule for offset calculation:', e);
