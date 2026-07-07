@@ -431,9 +431,12 @@ export default function ScheduleScreen() {
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
   const { mode: transitionMode } = useTransitionMode();
+  // FIX: useStateAnchor() must be declared BEFORE it is consumed by
+  // useUserPredictions — previously `anchor` was referenced in its
+  // temporal dead zone, crashing/nullifying the anchor on this screen.
+  const { anchor } = useStateAnchor();
   const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode, anchor?.startIso ?? null);
   const { history: resyncHistory } = useResyncNotifications();
-  const { anchor } = useStateAnchor();
 
   const stableStartMapRef   = useRef<Record<string, string>>({});
   const stableEndMapRef     = useRef<Record<string, string>>({});
