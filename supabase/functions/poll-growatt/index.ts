@@ -206,20 +206,35 @@ Deno.serve(async (req) => {
 
     // ── Auto-trigger analyze-patterns immediately ───────────────────────────
     console.log("[poll-growatt] Triggering analyze-patterns after state change...");
-    try {
+    {
       const analyzeUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/analyze-patterns`;
-      await fetch(analyzeUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
-        },
-        body: JSON.stringify({}),
-        signal: AbortSignal.timeout(30000),
-      });
-      console.log("[poll-growatt] analyze-patterns triggered successfully");
-    } catch (err) {
-      console.error("[poll-growatt] analyze-patterns trigger failed:", err);
+      let triggered = false;
+      for (let attempt = 1; attempt <= 3 && !triggered; attempt++) {
+        try {
+          const res = await fetch(analyzeUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+              apikey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+            },
+            body: JSON.stringify({ trigger: "poll-growatt", eventType, occurredAt: now }),
+            signal: AbortSignal.timeout(60000),
+          });
+          if (res.ok) {
+            triggered = true;
+            console.log(`[poll-growatt] analyze-patterns triggered successfully (attempt ${attempt})`);
+          } else {
+            const bodyText = await res.text().catch(() => "");
+            console.error(`[poll-growatt] analyze-patterns HTTP ${res.status} (attempt ${attempt}):`, bodyText.slice(0, 200));
+          }
+        } catch (err) {
+          console.error(`[poll-growatt] analyze-patterns trigger failed (attempt ${attempt}):`, err);
+        }
+      }
+      if (!triggered) {
+        console.error("[poll-growatt] analyze-patterns could NOT be triggered after 3 attempts — APPPE will refresh on next manual/cron run");
+      }
     }
 
     // ── Log prediction accuracy (read-only analytics — never affects predictions) ──
