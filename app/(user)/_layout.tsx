@@ -18,6 +18,18 @@ const TIME_OPTS: { key: TimeOption; label: string }[] = [
   { key: '10min', label: AR.time10min },
   { key: '15min', label: AR.time15min },
   { key: '20min', label: AR.time20min },
+  { key: '30min', label: AR.time30min },
+  { key: '1h',    label: AR.time1h    },
+  { key: '1.5h',  label: AR.time1_5h  },
+  { key: '2h',    label: AR.time2h    },
+  { key: '2.5h',  label: AR.time2_5h  },
+  { key: '3h',    label: AR.time3h    },
+  { key: '3.5h',  label: AR.time3_5h  },
+  { key: '4h',    label: AR.time4h    },
+  { key: '4.5h',  label: AR.time4_5h  },
+  { key: '5h',    label: AR.time5h    },
+  { key: '5.5h',  label: AR.time5_5h  },
+  { key: '6h',    label: AR.time6h    },
 ];
 
 // TMMS V2.2: Global Report Modal — ON-ONLY reporting.
