@@ -56,6 +56,15 @@ export interface NextTransition {
   minFromNowMin: number;
   maxFromNowMin: number;
   rangeLabel: string;
+  /**
+   * ISO aliases consumed by the Home screen (UpcomingTransitionCard,
+   * useStableNextTransition) and useUserPredictions. Always populated by
+   * the engine — previously missing, which rendered "Invalid Date".
+   */
+  rangeStartIso?: string;
+  rangeEndIso?: string;
+  /** true when now is already inside the predicted range window. */
+  inRangeWindow?: boolean;
 }
 
 export interface RangeLabel {
@@ -362,13 +371,28 @@ function computeATCMode(
   // synced to the community report's Generated ON.
   if (resyncPoint) {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
-    const durationMin = resyncPoint.generatedOnDurationMin ?? 0;
+    // FIX (#3): a missing/zero Generated-ON duration previously matched the
+    // `durationMin === 0` branch below and held the synced state FOREVER —
+    // the automatic ON→OFF transition never fired. Resolve a usable
+    // duration instead: explicit value → average same-state slot duration
+    // from the shifted schedule → 120 min default.
+    let durationMin = resyncPoint.generatedOnDurationMin ?? 0;
+    if (durationMin <= 0) {
+      const sameStateSlots = shiftedSlots.filter(
+        s => s.state === resyncPoint.syncedState && s.endIso,
+      );
+      durationMin = sameStateSlots.length > 0
+        ? Math.round(sameStateSlots.reduce((sum, s) =>
+            sum + (new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60_000, 0,
+          ) / sameStateSlots.length)
+        : 120;
+    }
     const cycleEndMs = syncedMs + durationMin * 60_000;
     const inWindow = nowMs < cycleEndMs;
     const validationWindowRemainingMin = inWindow
       ? Math.max(0, (cycleEndMs - nowMs) / 60_000) : 0;
 
-    if (inWindow || durationMin === 0) {
+    if (inWindow) {
       return {
         mode: 'COMMUNITY_SYNCED',
         currentState: resyncPoint.syncedState,
@@ -378,9 +402,37 @@ function computeATCMode(
         communityElevated: true,
         inValidationWindow: inWindow,
         validationWindowRemainingMin,
-        scheduledAutoTransitionIso: durationMin > 0 ? new Date(cycleEndMs).toISOString() : null,
+        scheduledAutoTransitionIso: new Date(cycleEndMs).toISOString(),
         statusLine: 'الحالة مُزامَنة مجتمعياً',
       };
+    }
+
+    // FIX (#3) NEXT OFF RULE: when the synced/Generated ON cycle ends, the
+    // OFF state begins AUTOMATICALLY at the cycle end — no confirmation
+    // needed for the ON→OFF direction. The OFF lasts until the next ON slot
+    // of the shifted schedule; that OFF→ON boundary then follows the normal
+    // rule-driven machine below (verification window / UNCERTAIN_ZONE /
+    // Growatt or community confirmation).
+    if (resyncPoint.syncedState === 'ON') {
+      const cycleEndIso = new Date(cycleEndMs).toISOString();
+      const nextOn = shiftedSlots
+        .filter(s => s.state === 'ON' && new Date(s.startIso).getTime() > cycleEndMs)
+        .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0] ?? null;
+      if (!nextOn || nowMs < new Date(nextOn.startIso).getTime()) {
+        return {
+          mode: 'NORMAL',
+          currentState: 'OFF',
+          currentStateStartIso: cycleEndIso,
+          isHoldingState: false,
+          overrunMinutes: 0,
+          communityElevated: false,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: '',
+        };
+      }
+      // Past the next ON start — fall through to the standard machine.
     }
   }
 
@@ -401,11 +453,24 @@ function computeATCMode(
         .filter(s => new Date(s.startIso).getTime() > nowMs)
         .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
 
-      if (nextSlot && nextSlot.state !== growattCurrentState) {
+      // FIX (#2b): the user's upcoming shifted slot mirrors the state Growatt
+      // has ALREADY transitioned to — so the correct trigger is state
+      // EQUALITY. The previous `!==` comparison was inverted, which meant
+      // POSITIVE_OFFSET_PENDING never activated and positive-offset users
+      // flipped instantly with Growatt instead of holding their
+      // pre-transition state until the scheduled time.
+      if (nextSlot && nextSlot.state === growattCurrentState) {
+        const heldState: 'ON' | 'OFF' = growattCurrentState === 'ON' ? 'OFF' : 'ON';
+        // FIX (#2c): the held state started when the user's most recently
+        // ended slot of that state began — surface it so "منذ" and the
+        // timeline's الآن slot show the real start time.
+        const prevHeldSlot = shiftedSlots
+          .filter(s => s.state === heldState && s.endIso && new Date(s.endIso).getTime() <= nowMs)
+          .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
         return {
           mode: 'POSITIVE_OFFSET_PENDING',
-          currentState: growattCurrentState === 'ON' ? 'OFF' : 'ON',
-          currentStateStartIso: null,
+          currentState: heldState,
+          currentStateStartIso: prevHeldSlot?.startIso ?? null,
           isHoldingState: true,
           overrunMinutes: 0,
           communityElevated: false,
@@ -432,6 +497,24 @@ function computeATCMode(
         .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
 
       if (recentlyEnded) {
+        // FIX (#3): holding while "waiting for Growatt" applies ONLY to the
+        // OFF→ON direction. If the slot that just ended was ON, the ON→OFF
+        // transition is ALWAYS automatic at the predicted end — never held
+        // in GRACE_MODE / UNCERTAIN_ZONE.
+        if (recentlyEnded.state === 'ON') {
+          return {
+            mode: 'NORMAL',
+            currentState: 'OFF',
+            currentStateStartIso: recentlyEnded.endIso,
+            isHoldingState: false,
+            overrunMinutes: 0,
+            communityElevated: false,
+            inValidationWindow: false,
+            validationWindowRemainingMin: 0,
+            scheduledAutoTransitionIso: null,
+            statusLine: '',
+          };
+        }
         const slotEndMs = new Date(recentlyEnded.endIso!).getTime();
         const overrunMin = Math.round((nowMs - slotEndMs) / 60_000);
         const offsetMs = offsetMinutes * 60_000;
@@ -594,20 +677,23 @@ export function applyOffsetToPrediction(
   let finalSlots: ShiftedScheduleSlot[] = [...shiftedSlots];
   if (atcResult.mode === 'POSITIVE_OFFSET_PENDING' && atcResult.scheduledAutoTransitionIso) {
     const heldState: 'ON' | 'OFF' = atcResult.currentState;
-    const nowIso = new Date(nowMs).toISOString();
+    // FIX (#2c): anchor the synthetic slot at the REAL held-state start
+    // (from computeATCMode) instead of "now", so the الآن slot's start
+    // time no longer drifts forward on every 30s re-derivation.
+    const heldStartIso = atcResult.currentStateStartIso ?? new Date(nowMs).toISOString();
     const schedIso = atcResult.scheduledAutoTransitionIso;
     finalSlots = [{
       state: heldState,
-      startIso: nowIso,
+      startIso: heldStartIso,
       endIso: schedIso,
-      startFormatted: fmtYemenTime(nowIso),
+      startFormatted: fmtYemenTime(heldStartIso),
       endFormatted: fmtYemenTime(schedIso),
       durationLabel: durationLabelFromMin(
-        Math.round((new Date(schedIso).getTime() - nowMs) / 60_000),
+        Math.round((new Date(schedIso).getTime() - new Date(heldStartIso).getTime()) / 60_000),
       ),
-      zone: getZoneFromIso(nowIso),
+      zone: getZoneFromIso(heldStartIso),
       isEstimated: false,
-      shiftedStartFormatted: fmtYemenTime(nowIso),
+      shiftedStartFormatted: fmtYemenTime(heldStartIso),
       shiftedEndFormatted: fmtYemenTime(schedIso),
     }, ...shiftedSlots];
   }
@@ -684,9 +770,21 @@ export function applyOffsetToPrediction(
       minFromNowMin: minFromNow,
       maxFromNowMin: minFromNow + rangeWidthMs / 60_000,
       rangeLabel: nextSlot.shiftedStartFormatted ?? fmtYemenTime(nextSlot.startIso),
+      rangeStartIso: nextSlot.startIso,
+      rangeEndIso: endIso,
+      inRangeWindow: minFromNow <= 0,
     };
   } else if (prediction.nextTransition) {
-    nextTransition = prediction.nextTransition;
+    // FIX (#1): raw server passthrough — alias the ISO fields the Home
+    // screen consumes (rangeStartIso/rangeEndIso) from the raw
+    // earliestTime/latestTime so "Invalid Date" can never render.
+    const rawNt = prediction.nextTransition;
+    nextTransition = {
+      ...rawNt,
+      rangeStartIso: rawNt.rangeStartIso ?? rawNt.earliestTime,
+      rangeEndIso: rawNt.rangeEndIso ?? rawNt.latestTime,
+      inRangeWindow: rawNt.inRangeWindow ?? (new Date(rawNt.earliestTime).getTime() <= nowMs),
+    };
   }
 
   // ── 7. Determine V2.1 fields ──────────────────────────────────────────────
@@ -858,6 +956,7 @@ export function deriveNextTransitionExport(
       earliestFormatted: fmtYemenTime(scheduledAutoTransitionIso),
       latestFormatted: fmtYemenTime(scheduledAutoTransitionIso),
       minFromNowMin: min, maxFromNowMin: min, rangeLabel: fmtYemenTime(scheduledAutoTransitionIso),
+      rangeStartIso: scheduledAutoTransitionIso, rangeEndIso: scheduledAutoTransitionIso,
     };
   }
   const target = currentState === 'ON' ? 'OFF' : 'ON';
@@ -874,6 +973,7 @@ export function deriveNextTransitionExport(
         latestFormatted: slot.shiftedEndFormatted ?? (slot.endIso ? fmtYemenTime(slot.endIso) : ''),
         minFromNowMin: Math.max(0, min), maxFromNowMin: Math.max(0, min),
         rangeLabel: slot.shiftedStartFormatted ?? fmtYemenTime(slot.startIso),
+        rangeStartIso: slot.startIso, rangeEndIso: slot.endIso ?? slot.startIso,
       };
     }
   }
