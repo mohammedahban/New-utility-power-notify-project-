@@ -43,6 +43,15 @@ function translateCrisisReason(reason: string): string {
   return r;
 }
 
+// Issue #4: format exceeded/overrun minutes as hours + minutes once ≥ 1h.
+function fmtOverrunAr(min: number): string {
+  if (min < 60) return `${min} دقيقة`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  const hLabel = h === 1 ? 'ساعة' : h === 2 ? 'ساعتين' : `${h} ساعات`;
+  return m === 0 ? hLabel : `${hLabel} و ${m} دقيقة`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TRANSITION MODE TOGGLE — TMMS
 // Placed at the top of the Home screen (spec: §TRANSITION MODES).
@@ -148,11 +157,51 @@ function useCountdownSec(targetMinutes: number | null) {
 }
 
 // ── Format time — Western numerals + Arabic AM/PM suffix, always LTR (spec §20) ──
-function fmtTimeAr(iso: string): string {
-  const raw = new Date(iso).toLocaleString('en-US', {
+// Issue 1: guards against null/undefined/invalid ISO strings so the UI never
+// renders the literal "Invalid Date". Returns '' so callers can fall back to
+// server-formatted labels (earliestFormatted / latestFormatted).
+function fmtTimeAr(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const raw = d.toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
   });
   return raw.replace('AM', 'ص').replace('PM', 'م');
+}
+
+// ── Issue 6: duration labels in Arabic WORDS ─────────────────────────────────
+// Converts numeric duration labels (e.g. "2س 30د", "2h 30m", "90د") into
+// human-friendly Arabic words (e.g. "ساعتان ونصف") for the
+// "عادةً تستمر الكهرباء" / "عادةً يستمر الانقطاع" chips.
+const HOUR_WORDS_AR = ['', 'ساعة', 'ساعتان', 'ثلاث ساعات', 'أربع ساعات', 'خمس ساعات', 'ست ساعات', 'سبع ساعات', 'ثماني ساعات', 'تسع ساعات', 'عشر ساعات'];
+function hoursToArabicWords(h: number): string {
+  if (h >= 1 && h <= 10) return HOUR_WORDS_AR[h];
+  return `${h} ساعة`;
+}
+function durationWordsAr(label: string | null | undefined): string | null {
+  if (!label) return null;
+  let hours = 0; let minutes = 0; let matched = false;
+  const hMatch = label.match(/(\d+(?:\.\d+)?)\s*(?:س(?:اعات|اعة)?|h)/i);
+  if (hMatch) { hours = parseFloat(hMatch[1]); matched = true; }
+  const mMatch = label.match(/(\d+)\s*(?:د(?:قيقة|قائق)?|m)/i);
+  if (mMatch) { minutes = parseInt(mMatch[1], 10); matched = true; }
+  if (!matched) return label; // unknown format — show as-is
+  const totalMin = Math.round(hours * 60) + minutes;
+  const H = Math.floor(totalMin / 60);
+  const M = totalMin % 60;
+  if (H === 0) {
+    if (M === 30) return 'نصف ساعة';
+    if (M === 15) return 'ربع ساعة';
+    if (M === 45) return 'ثلاثة أرباع الساعة';
+    return `${M} دقيقة`;
+  }
+  const hWords = hoursToArabicWords(H);
+  if (M === 0) return hWords;
+  if (M === 30) return `${hWords} ونصف`;
+  if (M === 15) return `${hWords} وربع`;
+  if (M === 45) return `${hWords} وثلاثة أرباع`;
+  return `${hWords} و${M} دقيقة`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -633,7 +682,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         <View style={[psStyles.durChip, { borderColor: T.success + '44' }]}>
           <View style={{ flex: 1 }}>
             <Text style={psStyles.durChipLabel}>عادةً تستمر الكهرباء:</Text>
-            <Text style={[psStyles.durChipValue, { color: T.success }]}>{prediction.expectedOnDurationLabel}</Text>
+            <Text style={[psStyles.durChipValue, { color: T.success }]}>{durationWordsAr(prediction.expectedOnDurationLabel)}</Text>
           </View>
           <Text style={psStyles.durChipIcon}>🟢</Text>
         </View>
@@ -642,7 +691,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         <View style={[psStyles.durChip, { borderColor: T.danger + '44' }]}>
           <View style={{ flex: 1 }}>
             <Text style={psStyles.durChipLabel}>عادةً يستمر الانقطاع:</Text>
-            <Text style={[psStyles.durChipValue, { color: T.danger }]}>{prediction.expectedOffDurationLabel}</Text>
+            <Text style={[psStyles.durChipValue, { color: T.danger }]}>{durationWordsAr(prediction.expectedOffDurationLabel)}</Text>
           </View>
           <Text style={psStyles.durChipIcon}>🔴</Text>
         </View>
@@ -761,7 +810,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           UNCERTAIN_ZONE: {
             icon: '⚠',  bg: '#1a0e00', border: T.warning + '55', textColor: T.warning,
             body: overrunMin > 0
-              ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — سيُخصم وقت الانتظار من مدة التشغيل القادمة`
+              ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — سيُخصم وقت الانتظار من مدة التشغيل القادمة`
               : undefined,
           },
           WAITING_FOR_GROWATT: {
@@ -896,7 +945,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
       UNCERTAIN_ZONE: {
         icon: '⚠️', title: 'استمرار غير معتاد',
         body: overrunMin > 0
-          ? `تجاوزت المدة المتوقعة بـ ${overrunMin} دقيقة — سيُخصم وقت الانتظار من مدة التشغيل القادمة`
+          ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — سيُخصم وقت الانتظار من مدة التشغيل القادمة`
           : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد',
         borderColor: T.warning + '44', iconColor: T.warning,
       },
@@ -944,11 +993,11 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
               {effectiveNt.type === 'UTILITY_ON' ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
             </Text>
             <View style={utStyles.rangeTimeStack} dir="ltr">
-              <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeStartIso)}</Text>
+              <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeStartIso) || (effectiveNt as any).earliestFormatted || '—'}</Text>
               {effectiveNt.rangeStartIso !== effectiveNt.rangeEndIso && (
                 <>
                   <Text style={utStyles.rangeSep}>و</Text>
-                  <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeEndIso)}</Text>
+                  <Text style={[utStyles.rangeTime, { color: isCurrentOn ? T.danger : T.success }]}>{fmtTimeAr(effectiveNt.rangeEndIso) || (effectiveNt as any).latestFormatted || '—'}</Text>
                 </>
               )}
             </View>
@@ -1035,9 +1084,9 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
           {isNextOn ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}
         </Text>
         <View style={utStyles.rangeTimeStack} dir="ltr">
-          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeStartIso)}</Text>
+          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeStartIso) || (nt as any).earliestFormatted || '—'}</Text>
           <Text style={[utStyles.rangeSep, { color: color + '88' }]}>و</Text>
-          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeEndIso)}</Text>
+          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeEndIso) || (nt as any).latestFormatted || '—'}</Text>
         </View>
       </View>
 
@@ -1568,6 +1617,12 @@ export default function Home() {
     // ── Mathematical Anchor: Bulletproof start time calculation ──────────
   const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
   const anchorStartIso = (() => {
+    // Issue #4: when an UNCERTAIN_ZONE deduction has been applied, the
+    // reconciled (backdated) cycle start MUST win over every other source —
+    // "منذ" shows the exceeded wait and the remaining time is reduced.
+    if ((userPrediction as any)?.reconciledCycleStartIso) {
+      return (userPrediction as any).reconciledCycleStartIso as string;
+    }
     if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
       return userPrediction.resyncedAtIso;
     }
