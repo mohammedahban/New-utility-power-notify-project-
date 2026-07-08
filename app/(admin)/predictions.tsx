@@ -92,6 +92,59 @@ const lapStyles = StyleSheet.create({
   sub: { color: '#475569', fontSize: 10, textAlign: 'right', marginBottom: 4 },
 });
 
+// ── Coverage Row ────────────────────────────────────────────────────────────────
+function useCoverageStats() {
+  const [stats, setStats] = React.useState<{ events: number; logged: number } | null>(null);
+  const load = React.useCallback(async () => {
+    try {
+      const since = new Date(Date.now() - 7 * 86400000).toISOString();
+      const [evRes, logRes] = await Promise.all([
+        supabase.from('power_events').select('id', { count: 'exact', head: true }).gte('occurred_at', since),
+        supabase.from('prediction_accuracy_logs').select('id', { count: 'exact', head: true }).gte('created_at', since),
+      ]);
+      setStats({ events: evRes.count ?? 0, logged: logRes.count ?? 0 });
+    } catch { /* non-fatal */ }
+  }, []);
+  React.useEffect(() => { load(); }, [load]);
+  return stats;
+}
+
+function CoverageRow() {
+  const stats = useCoverageStats();
+  if (!stats) return null;
+  const pct = stats.events > 0 ? Math.round((stats.logged / stats.events) * 100) : 100;
+  const color = pct >= 90 ? '#22c55e' : pct >= 70 ? '#f59e0b' : '#ef4444';
+  const bar = `${Math.min(100, pct)}%` as any;
+  return (
+    <View style={covStyles.wrap}>
+      <View style={covStyles.top}>
+        <Text style={[covStyles.pct, { color }]}>{pct}%</Text>
+        <View style={covStyles.trackWrap}>
+          <View style={covStyles.track}>
+            <View style={[covStyles.fill, { width: bar, backgroundColor: color }]} />
+          </View>
+          <Text style={[covStyles.count, { color }]}>{stats.logged}/{stats.events} أحداث مُغطّاة</Text>
+        </View>
+        <Text style={covStyles.label}>تغطية السجلات · 7 أيام</Text>
+      </View>
+    </View>
+  );
+}
+
+const covStyles = StyleSheet.create({
+  wrap: {
+    backgroundColor: '#1e293b', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10,
+    marginBottom: 12, borderWidth: 1, borderColor: '#334155',
+  },
+  top: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
+  label: { color: '#475569', fontSize: 10, fontWeight: '700', letterSpacing: 0.8 },
+  pct: { fontSize: 15, fontWeight: '900', minWidth: 40, textAlign: 'left' },
+  trackWrap: { flex: 1, gap: 4 },
+  track: { height: 5, backgroundColor: '#0f172a', borderRadius: 3, overflow: 'hidden' },
+  fill: { height: 5, borderRadius: 3 },
+  count: { fontSize: 11, fontWeight: '700', textAlign: 'right' },
+});
+
 // ── ATC System-Wide Indicator ─────────────────────────────────────────────────
 function ATCSystemIndicator({ prediction }: { prediction: Prediction | null }) {
   const [userCount, setUserCount] = useState<number>(0);
@@ -814,6 +867,7 @@ export default function AdminPredictions() {
       )}
 
       <LatestAccuracyPill />
+      <CoverageRow />
 
       <View style={[styles.stateBar, { borderColor: isOn ? '#22c55e' : '#ef4444' }]}>
         <Text style={styles.stateBarLabel}>{AR.currentState}</Text>
