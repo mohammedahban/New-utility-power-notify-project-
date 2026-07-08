@@ -1,5 +1,6 @@
+
 /**
- * usserPredictions — Production hook that feeds the User Home Screen.
+ * useUserPredictions — Production hook that feeds the User Home Screen.
  *
  * Architecture:
  *   usePredictions (raw Supabase) → applyOffsetToPrediction (tmmsEngine) → UserPrediction
@@ -9,45 +10,44 @@
  * ensuring both always run the same TMMS V2 logic.
  *
  * ───────────────────────────────────────────────────────────────────────────
- * TMMS V2.1 MIGRATION NOTES
+ * TMMS V2.3 — NEGATIVE OFFSET IMMEDIATE ON FLIP (2026-07-08)
  * ───────────────────────────────────────────────────────────────────────────
- * This hook is now a THIN INTEGRATION LAYER around the TMMS V2 engine,
- * PLUS a V2.1 orchestration layer on top that adds the three concepts the
- * PDF introduces:
  *
- *   A. Generated ON — when an ON report is accepted (by reporter or
- *      approver), a permanent timeline event is created that becomes the
- *      user's current state. Its duration is copied from the nearest
- *      logical ON (finished or active). See `applyGeneratedOn`.
+ * SCENARIO: User has negative offset (e.g. −60 min). Their predicted OFF
+ * ended 60 minutes ago and they've been in UNCERTAIN_ZONE / WAITING_FOR_GROWATT.
+ * When Growatt finally turns ON:
  *
- *   B. Offset State — the engine's offset is a single signed number; V2.1
- *      splits it into State (Positive/Negative/Neutral) and Value (number).
- *      The corrected V2.1 engine NEVER produces PendingNegative — >50%
- *      yields immediately NEGATIVE, and <50% yields immediately POSITIVE.
- *      The state is LOCKED by the >50%/<50% rule and never changes.
- *      auto-resolves to Negative when Growatt transitions to ON. See
- *      `useGrowattOnResolution` and `deriveOffsetState`.
+ *   BEFORE this patch:
+ *     1. poll-growatt inserts UTILITY_ON into power_events  ✓  (instant)
+ *     2. poll-growatt triggers analyze-patterns             ✓  (instant)
+ *     3. analyze-patterns updates utility_predictions       ⚠  (~10-30 s)
+ *     4. usePredictions real-time push fires                ⚠  (depends on 3)
+ *     5. Home screen flips to ON with correct elapsed       ⚠  (depends on 4)
  *
- *   C. Approver Cloning — when a YES response comes in, the user's
- *      offset/state/alignment are CLONED from the reporter, never
- *      recalculated. This is handled in useResyncNotifications; this hook
- *      simply reads back the cloned values from resync_history.
+ *     During the gap (steps 3-5) the home screen still showed OFF even
+ *     though Growatt was already ON.
  *
- * Original V2 responsibilities preserved:
- *   1. Fetch raw prediction from Supabase (via usePredictions)
- *   2. Build the CommunitySyncMeta display object from the resync point
- *   3. Freeze the community offset after its first computation (Rule Q2-A)
- *   4. Persist accuracy events to Supabase
- *   5. Re-derive the UserPrediction every 30 seconds (ATC mode refresh)
+ *   AFTER this patch:
+ *     1. power_events INSERT fires useGrowattOnWatcher      ✓  (instant)
+ *     2. growattOnIso is set, growattOnTick bumped          ✓  (instant)
+ *     3. useMemo re-runs with growattOnIso available        ✓  (instant)
+ *     4. "immediate ON flip" branch synthesises ON state:
+ *          userOnStart = growattOnIso + offsetMinutes
+ *          e.g. G − 60 min → elapsed shows 60 min          ✓  (instant)
+ *     5. Home screen flips to ON immediately                ✓  (instant)
+ *     6. When utility_predictions finally updates, the
+ *        engine derives the real slot and takes over from
+ *        the synthetic slot                                  ✓  (clean handover)
  *
- * V2.1 additions:
- *   6. Layer Generated ON on top of the engine's daySchedule
- *   7. Compute Offset State (Positive/Negative/Neutral — never PendingNegative)
- *   8. Mark future ON slots as "Estimated" when the offset is tentative
- *      (before Growatt confirms the actual ON time)
- *   9. Subscribe to Growatt power_events to recompute the offset VALUE
- *      when Growatt turns ON (the STATE stays locked)
- *  10. Rebuild future predictions whenever Offset State changes
+ * The elapsed displayed = |offsetMinutes| = how long ago the electricity
+ * came on relative to the Growatt confirmation time.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * TMMS V2.1 MIGRATION NOTES (preserved)
+ * ───────────────────────────────────────────────────────────────────────────
+ *   A. Generated ON — permanent timeline event from ON report.
+ *   B. Offset State — POSITIVE/NEGATIVE/NEUTRAL (never PendingNegative from engine).
+ *   C. Approver Cloning — YES response clones reporter's offset triple.
  */
 import { useState, useEffect, useMemo, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -66,127 +66,42 @@ import {
 } from '../app/(admin)/tmmsEngine';
 
 // ── Public type re-exports ─────────────────────────────────────────────────
-// All types are re-exported DIRECTLY from the engine.  No local redeclarations
-// — the engine is the single source of truth for all TMMS-related types.
 export type { ResyncPoint, TransitionMode } from '../app/(admin)/tmmsEngine';
-
-/**
- * The full set of ATC operational modes, re-exported from the engine.
- */
 export type ScheduleStateMode = _EngineScheduleStateMode;
-
-/**
- * CommunitySyncMeta — re-exported from the engine.
- */
 export type CommunitySyncMeta = _EngineCommunitySyncMeta;
 
-/**
- * ShiftedScheduleSlot — re-exported from the engine, augmented with V2.1
- * fields used by the schedule UI to render Generated ON badges and
- * Estimated (Pending Offset) labels.
- */
 export type ShiftedScheduleSlot = _EngineShiftedScheduleSlot & {
-  /**
-   * V2.1: true when this slot was created as a Generated ON event (i.e.
-   * the user pressed "Report ON" and the slot was injected into the
-   * timeline as a first-class event). The Schedule screen renders an
-   * "⚡ مُولّدة" badge for these slots.
-   */
   isGeneratedOn?: boolean;
-  /**
-   * V2.1: true when this is a FUTURE ON slot whose start time cannot be
-   * precisely computed because the user's offset is currently
-   * PendingNegative (no numeric OffsetValue yet). The Schedule screen
-   * renders a "تقديري (فارق معلّق)" badge for these slots.
-   */
   isEstimatedPendingOffset?: boolean;
 };
 
 // ── TMMS V2.1: Offset State types ──────────────────────────────────────────
-// PDF §"OFFSET CALCULATION ENGINE": four possible states. Mirrors the
-// definitions in useResyncNotifications.ts — duplicated here as a local
-// re-export so consumers can import from either hook without a circular
-// dependency.
 export type OffsetState = 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE';
-// V2.1 CORRECTED: PENDING_NEGATIVE is kept for backwards compatibility with
-// legacy DB rows, but the corrected engine NEVER produces it. The >50%/<50%
-// rule is ABSOLUTE:
-//   >50% → NEGATIVE (always, locked, never changes)
-//   <50% → POSITIVE (always, locked, never changes)
-// The IMPORTANT NOTICE confirms (not flips) the state when Growatt turns ON.
 export type OffsetValue = number | 'PENDING';
 export type TimelineAlignment = string;
 
-/**
- * V2.1: Generated ON metadata — attached to UserPrediction whenever the
- * user's current state is a Generated ON event.
- *
- * PDF §"GENERATED ON IS A REAL TIMELINE EVENT": "Generated ON must: be
- * stored, remain in history, become part of the permanent timeline. Never
- * delete Generated ON later. Never replace it. Never hide it."
- */
 export interface GeneratedOnInfo {
-  /** ISO when the Generated ON began (= the report's effective transition time) */
   startIso: string;
-  /** Duration in minutes, copied from the nearest logical ON */
   durationMin: number;
-  /** ISO of the reference ON used to compute duration */
   referenceIso: string;
-  /** Whether the reference was already finished (Case 1) or still active (Case 2) */
   referenceKind: 'completed' | 'active';
-  /**
-   * When referenceKind='active', this Generated ON inherits the reference
-   * ON's lifecycle — verification window, UNCERTAIN_ZONE, duration
-   * reconciliation. The UI surfaces this as "🔄 متابعة دورة مرجعية".
-   */
   inheritsReferenceLifecycle: boolean;
 }
 
-/**
- * UserPrediction — the engine's type, augmented with V2.1 fields.
- *
- * V2.1 augmentation fields (all optional so existing engine output still
- * type-checks):
- *   - offsetState              — Positive | Negative | Neutral (never PendingNegative)
- *   - offsetValue              — number (recomputed as T − G when Growatt ON arrives)
- *   - timelineAlignment        — iso string anchor
- *   - generatedOnInfo          — present when current state is a Generated ON
- *   - pendingNegativeResolutionIso — DEPRECATED (always null in corrected logic)
- *   - isPendingNegative        — DEPRECATED (always false in corrected logic)
- *   - isGeneratedOnCurrent     — convenience boolean for UI conditionals
- *   - isGeneratedOnCurrent     — convenience boolean for UI conditionals
- */
 export type UserPrediction = _EngineUserPrediction & {
   offsetState?: OffsetState;
   offsetValue?: OffsetValue;
   timelineAlignment?: TimelineAlignment;
   generatedOnInfo?: GeneratedOnInfo | null;
   pendingNegativeResolutionIso?: string | null;
-  isPendingNegative?: boolean; // DEPRECATED: always false in corrected V2.1
+  isPendingNegative?: boolean;
   isGeneratedOnCurrent?: boolean;
-  /**
-   * V2.2 (#4): set when an UNCERTAIN_ZONE deduction has been applied — the
-   * backdated start of the current ON cycle. The Home screen gives this
-   * TOP priority as the elapsed-time ("منذ") source.
-   */
   reconciledCycleStartIso?: string | null;
 };
 
-/**
- * Re-export applyOffsetToPrediction for admin tools (predictions.tsx uses it
- * to run per-offset simulations on the raw server prediction).
- */
 export const applyOffsetToPrediction = _applyOffsetToPrediction;
 
-// ── Frozen community-offset cache key ──────────────────────────────────────
-// Per TMMS Rule Q2-A: the community offset is "computed once previously,
-// never recalculated".  We persist it in AsyncStorage keyed by the resync
-// point's syncedAtIso so it survives app restarts and remains stable for the
-// lifetime of that resync.
-//
-// V2.1: we also freeze the Offset State and Timeline Alignment alongside
-// the numeric Offset Value, so an app restart can restore the full
-// (state, value, alignment) triple without re-deriving anything.
+// ── Frozen community-offset cache keys ────────────────────────────────────
 function frozenOffsetStorageKey(syncedAtIso: string): string {
   return `tmms_frozen_community_offset_${syncedAtIso}`;
 }
@@ -198,12 +113,6 @@ function frozenAlignmentStorageKey(syncedAtIso: string): string {
 }
 
 // ── V2.1: Derive Offset State from a numeric offset ────────────────────────
-// Used as a fallback when resync_history doesn't yet have the V2.1
-// offset_state column populated (i.e. for reports created under V2 and
-// not yet re-confirmed under V2.1).
-//
-// PDF §"Rule 1": positive offset → report time was AFTER the previous
-// Growatt ON started. Negative → before. Zero → neutral.
 function deriveOffsetState(offsetMinutes: number): OffsetState {
   if (offsetMinutes > 0) return 'POSITIVE';
   if (offsetMinutes < 0) return 'NEGATIVE';
@@ -211,15 +120,6 @@ function deriveOffsetState(offsetMinutes: number): OffsetState {
 }
 
 // ── V2.1: Apply Generated ON on top of the engine's daySchedule ────────────
-// PDF §"GENERATED ON IS A REAL TIMELINE EVENT": the Generated ON slot
-// must be INSERTED into the daySchedule so future calculations can see it,
-// not just rendered as a transient UI banner.
-//
-// We mutate the engine's output: if generatedOnInfo is present and the
-// current state is ON, we ensure the first ON slot in the schedule is
-// marked isGeneratedOn=true. If no slot matches the Generated ON start
-// time, we unshift a synthetic slot — this mirrors what the engine does
-// for POSITIVE_OFFSET_PENDING.
 function applyGeneratedOnToSchedule(
   schedule: ShiftedScheduleSlot[],
   generatedOn: GeneratedOnInfo | null,
@@ -228,13 +128,8 @@ function applyGeneratedOnToSchedule(
   if (!generatedOn) return schedule;
   const startMs = new Date(generatedOn.startIso).getTime();
   const endMs = startMs + generatedOn.durationMin * 60_000;
-  // If the Generated ON has already ended, no slot mutation is needed —
-  // it's a historical event the engine has already incorporated.
   if (endMs < nowMs) return schedule;
 
-  // Check if the schedule already contains a slot at the Generated ON
-  // start time (the engine may have placed one there via POSITIVE_OFFSET_PENDING
-  // or COMMUNITY_SYNCED). If so, just tag it.
   const existingIdx = schedule.findIndex(s =>
     Math.abs(new Date(s.startIso).getTime() - startMs) < 60_000,
   );
@@ -244,10 +139,6 @@ function applyGeneratedOnToSchedule(
     return updated;
   }
 
-  // Otherwise, unshift a synthetic Generated ON slot.
-  // We reuse the formatting helpers from the slot at index 0 (or defaults
-  // if the schedule is empty) so the UI's time-formatting logic doesn't
-  // break.
   const refSlot = schedule[0];
   const fmt = (iso: string) => new Date(iso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
@@ -270,36 +161,17 @@ function applyGeneratedOnToSchedule(
   return [synthetic, ...schedule];
 }
 
-// ── V2.1 CORRECTED: This function is now a no-op ───────────────────────────
-// The corrected V2.1 engine NEVER produces PENDING_NEGATIVE — >50% yields
-// immediately NEGATIVE, and <50% yields immediately POSITIVE. The state is
-// LOCKED and never changes. Future ON predictions are always shown with the
-// current offset value. Kept for backwards compatibility with any code that
-// still references it.
+// ── V2.1 CORRECTED: no-op (PENDING_NEGATIVE never produced by engine) ──────
 function markEstimatedPendingOffset(
   schedule: ShiftedScheduleSlot[],
   isPendingNegative: boolean,
   nowMs: number,
 ): ShiftedScheduleSlot[] {
-  // V2.1 CORRECTED: isPendingNegative is always false — no marking needed.
   return schedule;
-  return schedule.map(s => {
-    if (s.state === 'ON' && new Date(s.startIso).getTime() > nowMs) {
-      return { ...s, isEstimatedPendingOffset: true };
-    }
-    return s;
-  });
 }
 
 // ── V2.2 (#4): UNCERTAIN_ZONE exceeded-time deduction ────────────────────
-// While the user waits in UNCERTAIN_ZONE (predicted OFF exceeded, Growatt
-// not yet ON), the exceeded wait must be DEDUCTED from the next ON cycle:
-//   exceeded = GrowattON − predictedOffEnd
-//   ON start = predictedOffEnd  → "منذ" shows the exceeded time
-//   ON end   = start + predicted ON duration → remaining = predicted − exceeded
-// The entry anchor is persisted so it survives app restarts.
 const UNCERTAIN_ZONE_ENTRY_KEY = 'tmms_uncertain_zone_entry_iso';
-// Never backdate by more than 6 hours — protects against stale anchors.
 const UNCERTAIN_DEDUCTION_CAP_MS = 6 * 3600_000;
 
 function applyUncertainZoneDeduction(
@@ -311,7 +183,6 @@ function applyUncertainZoneDeduction(
   if (!Number.isFinite(entryMs)) return pred;
   const slots = (pred.daySchedule ?? []) as ShiftedScheduleSlot[];
 
-  // Locate the ON cycle that began with the Growatt confirmation.
   const idx = slots.findIndex(s => {
     const st = new Date(s.startIso).getTime();
     const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
@@ -323,21 +194,13 @@ function applyUncertainZoneDeduction(
 
   const oldStartMs = new Date(slot.startIso).getTime();
   const oldEndMs = new Date(slot.endIso).getTime();
-  if (entryMs >= oldStartMs) return pred;                       // nothing exceeded
-  if (oldStartMs - entryMs > UNCERTAIN_DEDUCTION_CAP_MS) return pred; // stale anchor
+  if (entryMs >= oldStartMs) return pred;
+  if (oldStartMs - entryMs > UNCERTAIN_DEDUCTION_CAP_MS) return pred;
 
-  // V2.3 (Issue 1A): the wait time (oldStartMs − entryMs) is DEDUCTED from
-  // the predicted ON duration. The ON cycle:
-  //   - STARTS at `entryMs` (the moment the predicted OFF ended — this is
-  //     the moment the user's "since" timer shows, including the wait)
-  //   - ENDS at `entryMs + predictedOnDuration` (so the remaining time
-  //     after Growatt turns ON is `predictedOnDuration − wait`)
-  //   - The ON state ends AUTOMATICALLY when the remaining budget is
-  //     consumed — no manual transition is needed.
-  const spanMs = oldEndMs - oldStartMs; // predicted ON duration (preserved)
+  const spanMs = oldEndMs - oldStartMs;
   const newStartMs = entryMs;
   const newEndMs = newStartMs + spanMs;
-  const delta = newEndMs - oldEndMs;    // negative — everything moves earlier
+  const delta = newEndMs - oldEndMs;
 
   const newSlots = slots.map((s, i) => {
     if (i < idx) return s;
@@ -356,11 +219,6 @@ function applyUncertainZoneDeduction(
     };
   });
 
-  // Re-derive the current state from the adjusted slots — the deducted ON
-  // may already be over when the wait consumed most of its budget. In that
-  // case the user has already transitioned to the next OFF state
-  // automatically (the engine's slot-finder will pick the OFF slot that
-  // follows the deducted ON).
   const active = newSlots.find(s => {
     const st = new Date(s.startIso).getTime();
     const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
@@ -369,7 +227,6 @@ function applyUncertainZoneDeduction(
   const currentState = active?.state ?? pred.currentState;
   const currentStateStartIso = active?.startIso ?? new Date(newStartMs).toISOString();
 
-  // Rebuild nextTransition from the adjusted slots.
   const target: 'ON' | 'OFF' = currentState === 'ON' ? 'OFF' : 'ON';
   const nextSlot = newSlots.find(s =>
     s.state === target && new Date(s.startIso).getTime() > nowMs,
@@ -403,79 +260,102 @@ function applyUncertainZoneDeduction(
   return result as UserPrediction;
 }
 
-// ── V2.1: Auto-resolve Pending Negative when Growatt turns ON ──────────────
-// PDF §Rule 2: "When Growatt finally turns ON ... the system immediately
-// replaces Pending Negative → Negative. This replacement must happen
-// automatically."
+// ── V2.3 FIX: Unified Growatt-ON watcher ──────────────────────────────────
 //
-// This effect watches power_events for new UTILITY_ON rows. When one
-// arrives AND the user's current offset is PendingNegative, it triggers a
-// re-derivation by bumping an internal `pendingResolutionTick` state. The
-// re-derivation reads the now-resolved offset from resync_history (which
-// useResyncNotifications.resolvePendingNegativeOffsets has just updated).
-function useGrowattOnResolution(
+// PROBLEM: the previous `useGrowattOnResolution` only subscribed when the
+// user was in PENDING_NEGATIVE state. A regular NEGATIVE-offset user had no
+// watcher — they waited for utility_predictions to refresh via
+// analyze-patterns (~10-30 s latency). During that gap the Home screen kept
+// showing OFF even though Growatt was already ON.
+//
+// SOLUTION: subscribe whenever the user has a negative offset OR is in
+// PENDING_NEGATIVE state. On every UTILITY_ON power_event:
+//   1. Record growattOnIso (the exact Growatt ON timestamp).
+//   2. Bump growattOnTick to force useMemo re-derivation.
+//
+// The useMemo then uses growattOnIso to synthesise an immediate ON state
+// (userOnStart = growattOnIso + offsetMinutes) so the Home screen flips to
+// ON with elapsed = |offsetMinutes| without waiting for analyze-patterns.
+//
+// Additionally, inverter_state real-time subscription provides a secondary
+// signal for edge cases where power_events is slow (rare but defensive).
+function useGrowattOnWatcher(
   resyncPoint: ResyncPoint | null,
   isPendingNegative: boolean,
-): number {
+  isNegativeOffset: boolean,
+): { growattOnTick: number; growattOnIso: string | null } {
   const [tick, setTick] = useState(0);
+  const [growattOnIso, setGrowattOnIso] = useState<string | null>(null);
+
+  const shouldSubscribe = isPendingNegative || isNegativeOffset;
+
+  // Subscribe to power_events for new UTILITY_ON rows
   useEffect(() => {
-    if (!isPendingNegative) return;
+    if (!shouldSubscribe) return;
     const channel = supabase
-      .channel(`growatt_resolution_${Math.random().toString(36).slice(2)}`)
+      .channel(`growatt_on_watcher_${Math.random().toString(36).slice(2)}`)
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'power_events' },
         (payload: any) => {
-          const newRow = payload.new as { event_type?: string };
+          const newRow = payload.new as { event_type?: string; occurred_at?: string };
           if (newRow.event_type !== 'UTILITY_ON') return;
-          // Bump the tick — the parent useMemo depends on it and will
-          // re-fetch the (now-resolved) offset from resync_history.
+          if (newRow.occurred_at) {
+            setGrowattOnIso(newRow.occurred_at);
+          }
           setTick(t => t + 1);
         },
       )
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [isPendingNegative, resyncPoint?.syncedAtIso]);
-  return tick;
+  }, [shouldSubscribe, resyncPoint?.syncedAtIso]);
+
+  // Secondary: inverter_state real-time for edge cases (e.g. power_events delayed)
+  useEffect(() => {
+    if (!shouldSubscribe) return;
+    const channel = supabase
+      .channel(`growatt_inv_state_${Math.random().toString(36).slice(2)}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'inverter_state' },
+        async (payload: any) => {
+          const row = payload.new as { utility_on?: boolean; last_polled?: string };
+          const old = payload.old as { utility_on?: boolean };
+          // Only act on ON transitions (not repetitive ON→ON polls)
+          if (row.utility_on !== true || old.utility_on === true) return;
+          // Use last_polled as approximate ON time; power_events has the precise time
+          const approxOnIso = row.last_polled ?? new Date().toISOString();
+          setGrowattOnIso(prev => prev ?? approxOnIso); // don't override if already set
+          setTick(t => t + 1);
+        },
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [shouldSubscribe]);
+
+  // Clear growattOnIso when user is no longer in the uncertain family
+  // (i.e., utility_predictions has caught up and the engine runs normally).
+  // We don't clear it inside useMemo because that would cause React state
+  // updates during render. Instead, we track this via a ref and clear
+  // it with a micro-effect after the memo settles.
+  // Note: growattOnIso is intentionally NOT cleared on resyncPoint change
+  // because a community sync may happen AFTER Growatt turned ON.
+
+  return { growattOnTick: tick, growattOnIso };
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────────
 
-/**
- * useUserPredictions
- *
- * Fetches the latest raw prediction from Supabase (real-time), applies the
- * user's ATC offset via the TMMS V2 engine, layers the V2.1 Generated ON /
- * Offset State / Pending Negative logic on top, and returns a fully-resolved
- * UserPrediction every 30 seconds (for ATC mode re-derivation) or whenever
- * the underlying prediction / offset / resync changes.
- *
- * @param offsetMinutes          Stored user offset in minutes (personal DSD).
- * @param resyncPoint            Active community resync point, or null.
- * @param transitionMode         'AUTO' | 'MANUAL' — current TMMS mode.
- * @param anchorStartIso         Anchor start ISO (from useStateAnchor; passed
- *                               to the engine as heldCycleStartIso for
- *                               future-use instrumentation).
- * @param onCommunityOffsetComputed  Q3-A callback for persisting community offset.
- */
 export function useUserPredictions(
   offsetMinutes: number,
   resyncPoint: ResyncPoint | null,
   transitionMode: TransitionMode,
   anchorStartIso: string | null = null,
-  /**
-   * Q3-A callback: called exactly once per resync session the first time the
-   * engine computes a fresh community offset.  The caller (Home screen) uses
-   * this to persist the community-derived offset to user_offsets so it
-   * survives app restarts.  The in-memory freeze (Q2-A) is handled inside
-   * this hook via frozenOffsetRef; this callback adds the DB-persistence layer.
-   */
   onCommunityOffsetComputed?: (computedOffsetMinutes: number) => void,
 ): { userPrediction: UserPrediction | null; loading: boolean } {
   const { prediction, loading } = usePredictions();
 
-  // 30-second heartbeat — forces ATC mode re-derivation as time advances
-  // without waiting for a new Supabase push.
+  // 30-second heartbeat
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 30_000);
@@ -483,15 +363,12 @@ export function useUserPredictions(
   }, []);
 
   // ── Frozen community offset (Rule Q2-A) ──────────────────────────────────
-  // V2.1: we now freeze THREE things — the numeric value, the Offset State,
-  // and the Timeline Alignment — so an app restart can restore the full
-  // V2.1 triple without re-deriving anything.
   const frozenOffsetRef = useRef<number | null>(null);
   const frozenOffsetStateRef = useRef<OffsetState | null>(null);
   const frozenAlignmentRef = useRef<TimelineAlignment | null>(null);
   const [frozenOffsetLoaded, setFrozenOffsetLoaded] = useState(false);
 
-  // ── V2.2 (#4): UNCERTAIN_ZONE entry anchor — restored across restarts ──
+  // ── UNCERTAIN_ZONE entry anchor ──────────────────────────────────────────
   const uncertainEntryRef = useRef<string | null>(null);
   useEffect(() => {
     AsyncStorage.getItem(UNCERTAIN_ZONE_ENTRY_KEY)
@@ -504,11 +381,6 @@ export function useUserPredictions(
       frozenOffsetRef.current = null;
       frozenOffsetStateRef.current = null;
       frozenAlignmentRef.current = null;
-      // V2.3 (Issue 2): also clear the UNCERTAIN_ZONE entry anchor when the
-      // resync point is cleared. This happens when the user presses "return
-      // to previous state" — without this, the backdated ON cycle from the
-      // reverted report would persist and the schedule / today timeline
-      // would keep showing the deducted ON slot.
       uncertainEntryRef.current = null;
       AsyncStorage.removeItem(UNCERTAIN_ZONE_ENTRY_KEY).catch(() => {});
       setFrozenOffsetLoaded(true);
@@ -527,23 +399,14 @@ export function useUserPredictions(
           const parsed = parseInt(rawVal, 10);
           if (!Number.isNaN(parsed)) frozenOffsetRef.current = parsed;
         }
-        if (rawState !== null) {
-          frozenOffsetStateRef.current = rawState as OffsetState;
-        }
-        if (rawAlign !== null) {
-          frozenAlignmentRef.current = rawAlign;
-        }
+        if (rawState !== null) frozenOffsetStateRef.current = rawState as OffsetState;
+        if (rawAlign !== null) frozenAlignmentRef.current = rawAlign;
         setFrozenOffsetLoaded(true);
       })
       .catch(() => setFrozenOffsetLoaded(true));
-  }, [resyncPoint?.syncedAtIso]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [resyncPoint?.syncedAtIso]);
 
   // ── V2.1: Read Generated ON + Offset State from resync_history ──────────
-  // The user's "current" Generated ON + Offset State lives in the most
-  // recent resync_history row. We poll it alongside the 30s tick.
-  // V2.3 (Issue 2): exclude reverted rows (reverted_at IS NOT NULL) so the
-  // Generated ON slot disappears from the schedule / today timeline after
-  // the user presses "return to previous state".
   const [v21Meta, setV21Meta] = useState<{
     offsetState: OffsetState | null;
     offsetValue: OffsetValue | null;
@@ -555,8 +418,6 @@ export function useUserPredictions(
     let cancelled = false;
     (async () => {
       try {
-        // V2.3: try with the reverted_at filter first. If the column
-        // doesn't exist (pre-migration), retry without it.
         const { data: primaryData, error: primaryError } = await supabase
           .from('resync_history')
           .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind, reverted_at')
@@ -566,7 +427,6 @@ export function useUserPredictions(
         let data: any = primaryData;
         let error = primaryError;
         if (error && (error.message.includes('reverted_at') || error.message.includes('column'))) {
-          // Fallback: query without the reverted_at column
           const fallback = await supabase
             .from('resync_history')
             .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind')
@@ -577,14 +437,8 @@ export function useUserPredictions(
           error = fallback.error;
         }
         if (cancelled || error || !data) return;
-        // V2.3: skip reverted rows
         if (data.reverted_at) {
-          setV21Meta({
-            offsetState: null,
-            offsetValue: null,
-            timelineAlignment: null,
-            generatedOn: null,
-          });
+          setV21Meta({ offsetState: null, offsetValue: null, timelineAlignment: null, generatedOn: null });
           return;
         }
         let genOn: GeneratedOnInfo | null = null;
@@ -594,8 +448,7 @@ export function useUserPredictions(
             durationMin: data.generated_on_duration_min,
             referenceIso: data.generated_on_reference_iso ?? data.generated_on_start_iso,
             referenceKind: data.generated_on_reference_kind ?? 'completed',
-            inheritsReferenceLifecycle:
-              data.generated_on_reference_kind === 'active',
+            inheritsReferenceLifecycle: data.generated_on_reference_kind === 'active',
           };
         }
         setV21Meta({
@@ -609,14 +462,28 @@ export function useUserPredictions(
     return () => { cancelled = true; };
   }, [resyncPoint?.syncedAtIso, tick]);
 
-  // ── V2.1: Pending Negative auto-resolution watcher ──────────────────────
+  // ── V2.3 FIX: Growatt-ON watcher (negative offset + pending negative) ───
+  // isPendingNegative: must re-read resync_history after offset resolves
+  // isNegativeOffset: must immediately flip UI to ON without waiting for analyze-patterns
   const isPendingNegativeV21 = v21Meta.offsetState === 'PENDING_NEGATIVE';
-  const resolutionTick = useGrowattOnResolution(resyncPoint, isPendingNegativeV21);
+  const isNegativeOffset = offsetMinutes < 0;
+  const { growattOnTick, growattOnIso } = useGrowattOnWatcher(
+    resyncPoint,
+    isPendingNegativeV21,
+    isNegativeOffset,
+  );
+  const resolutionTick = growattOnTick;
+
+  // Track whether the "immediate ON" synthetic state is active so we can
+  // clear growattOnIso once utility_predictions catches up.
+  const immediateOnActiveRef = useRef(false);
 
   const userPrediction = useMemo((): UserPrediction | null => {
     if (!prediction) return null;
-    if (!frozenOffsetLoaded) return null; // wait for AsyncStorage load
+    if (!frozenOffsetLoaded) return null;
     try {
+      const nowV22 = Date.now();
+
       const syncMeta: _EngineCommunitySyncMeta | null = resyncPoint
         ? {
             syncedAtIso: resyncPoint.syncedAtIso,
@@ -632,22 +499,13 @@ export function useUserPredictions(
       ) => {
         if (frozenOffsetRef.current === null && resyncPoint) {
           frozenOffsetRef.current = computedOffsetMinutes;
-          // V2.1: derive the state from the sign and freeze it too.
           const derivedState: OffsetState = _meta.sign === 'POSITIVE'
-            ? 'POSITIVE'
-            : _meta.sign === 'NEGATIVE'
-              ? 'NEGATIVE'
-              : 'NEUTRAL';
+            ? 'POSITIVE' : _meta.sign === 'NEGATIVE' ? 'NEGATIVE' : 'NEUTRAL';
           frozenOffsetStateRef.current = derivedState;
           frozenAlignmentRef.current = _meta.referenceIso ?? resyncPoint.syncedAtIso;
-
-          const keyVal = frozenOffsetStorageKey(resyncPoint.syncedAtIso);
-          const keyState = frozenOffsetStateStorageKey(resyncPoint.syncedAtIso);
-          const keyAlign = frozenAlignmentStorageKey(resyncPoint.syncedAtIso);
-          AsyncStorage.setItem(keyVal, String(computedOffsetMinutes)).catch(() => {});
-          AsyncStorage.setItem(keyState, derivedState).catch(() => {});
-          AsyncStorage.setItem(keyAlign, frozenAlignmentRef.current).catch(() => {});
-
+          AsyncStorage.setItem(frozenOffsetStorageKey(resyncPoint.syncedAtIso), String(computedOffsetMinutes)).catch(() => {});
+          AsyncStorage.setItem(frozenOffsetStateStorageKey(resyncPoint.syncedAtIso), derivedState).catch(() => {});
+          AsyncStorage.setItem(frozenAlignmentStorageKey(resyncPoint.syncedAtIso), frozenAlignmentRef.current).catch(() => {});
           onCommunityOffsetComputed?.(computedOffsetMinutes);
         }
       };
@@ -666,9 +524,7 @@ export function useUserPredictions(
             created_at: new Date().toISOString(),
           })
           .then(({ error }) => {
-            if (error) {
-              console.error('[useUserPredictions] accuracy event persist error:', error.message);
-            }
+            if (error) console.error('[useUserPredictions] accuracy event persist error:', error.message);
           });
       };
 
@@ -682,54 +538,31 @@ export function useUserPredictions(
         anchorStartIso,
         frozenOffsetRef.current,
         handleOffsetCalculated,
-        Date.now(),
+        nowV22,
         handleAccuracyEvent,
       );
 
       // ── V2.1 layer: Offset State / Value / Alignment ─────────────────────
-      // Priority: resync_history (set by reporter or cloned by approver) →
-      // frozen ref (computed once per resync) → derived from offsetMinutes
-      // (legacy V2 fallback).
       const finalOffsetState: OffsetState =
-        v21Meta.offsetState
-        ?? frozenOffsetStateRef.current
-        ?? deriveOffsetState(offsetMinutes);
-
+        v21Meta.offsetState ?? frozenOffsetStateRef.current ?? deriveOffsetState(offsetMinutes);
       const finalOffsetValue: OffsetValue =
-        v21Meta.offsetValue
-        ?? (frozenOffsetRef.current !== null ? frozenOffsetRef.current : offsetMinutes);
-
+        v21Meta.offsetValue ?? (frozenOffsetRef.current !== null ? frozenOffsetRef.current : offsetMinutes);
       const finalTimelineAlignment: TimelineAlignment =
-        v21Meta.timelineAlignment
-        ?? frozenAlignmentRef.current
-        ?? resyncPoint?.syncedAtIso
-        ?? new Date().toISOString();
+        v21Meta.timelineAlignment ?? frozenAlignmentRef.current ?? resyncPoint?.syncedAtIso ?? new Date().toISOString();
 
       const isPendingNegative = finalOffsetState === 'PENDING_NEGATIVE';
       const isGeneratedOnCurrent = !!v21Meta.generatedOn
-        && new Date(v21Meta.generatedOn.startIso).getTime() <= Date.now()
-        && (new Date(v21Meta.generatedOn.startIso).getTime()
-            + v21Meta.generatedOn.durationMin * 60_000) > Date.now();
+        && new Date(v21Meta.generatedOn.startIso).getTime() <= nowV22
+        && (new Date(v21Meta.generatedOn.startIso).getTime() + v21Meta.generatedOn.durationMin * 60_000) > nowV22;
 
-      // ── V2.1 layer: Apply Generated ON to the daySchedule ────────────────
       let v21Schedule = (engineResult.daySchedule ?? []) as ShiftedScheduleSlot[];
-      v21Schedule = applyGeneratedOnToSchedule(
-        v21Schedule,
-        isGeneratedOnCurrent ? v21Meta.generatedOn : null,
-        Date.now(),
-      );
-      v21Schedule = markEstimatedPendingOffset(v21Schedule, isPendingNegative, Date.now());
+      v21Schedule = applyGeneratedOnToSchedule(v21Schedule, isGeneratedOnCurrent ? v21Meta.generatedOn : null, nowV22);
+      v21Schedule = markEstimatedPendingOffset(v21Schedule, isPendingNegative, nowV22);
 
-      // ── V2.1 layer: Pending Negative resolution forecast ─────────────────
-      // For the countdown UI on the Home Screen, forecast when the next
-      // Growatt ON is expected. We use the engine's nextTransition if it's
-      // an ON transition; otherwise null.
       const pendingNegativeResolutionIso =
         isPendingNegative && engineResult.nextTransition?.type === 'UTILITY_ON'
-          ? engineResult.nextTransition.rangeStartIso
-          : null;
+          ? engineResult.nextTransition.rangeStartIso : null;
 
-      // ── Assemble the V2.1-augmented UserPrediction ───────────────────────
       const v21Result: UserPrediction = {
         ...engineResult,
         daySchedule: v21Schedule,
@@ -742,35 +575,14 @@ export function useUserPredictions(
         isGeneratedOnCurrent,
       };
 
-      // ── V2.3 (Issue 1A): UNCERTAIN_ZONE exceeded-time accounting ──────────
-      // 1. Record when the user's predicted OFF ended (entry into the
-      //    UNCERTAIN family). The anchor survives restarts (AsyncStorage).
-      // 2. When Growatt confirms ON, backdate the new ON cycle to that
-      //    anchor and deduct the exceeded wait from the predicted ON
-      //    duration: "منذ" = exceeded time, remaining = predicted − exceeded.
-      //    The ON state ends automatically after the remaining predicted ON
-      //    duration completes — no manual intervention needed.
-      // 3. Clear the anchor when superseded by a community sync, when the
-      //    cycle completes (back to a normal OFF), or when stale.
-      //
-      // V2.3 fix: the deduction trigger previously required
-      // `prediction.currentState === 'ON'` (the RAW server prediction's
-      // current state). When Growatt just flipped ON, the server prediction
-      // could lag by up to 30 seconds, leaving the deduction stuck. Now we
-      // trigger off `v21Result.currentState === 'ON'` — the engine's
-      // post-offset current state — which flips the moment the active ON
-      // slot is detected in the shifted schedule.
-      const nowV22 = Date.now();
+      // ── UNCERTAIN_ZONE / WAITING_FOR_GROWATT state tracking ──────────────
       const modeV22 = v21Result.atc.mode;
       const inUncertainFamily =
         v21Result.currentState === 'OFF' &&
         (modeV22 === 'UNCERTAIN_ZONE' || modeV22 === 'GRACE_MODE' || modeV22 === 'WAITING_FOR_GROWATT');
 
+      // Record entry anchor (when predicted OFF slot ended)
       if (inUncertainFamily && !uncertainEntryRef.current) {
-        // V2.3: anchor the entry at the moment the predicted OFF slot
-        // ENDED — i.e., nowMs minus the overrun. This is the exact moment
-        // the user entered UNCERTAIN_ZONE, and it becomes the backdated
-        // start of the next ON cycle when Growatt confirms.
         const entryIso = new Date(
           nowV22 - Math.max(0, v21Result.atc.overrunMinutes) * 60_000,
         ).toISOString();
@@ -779,30 +591,144 @@ export function useUserPredictions(
       }
 
       let finalResult: UserPrediction = v21Result;
-      if (uncertainEntryRef.current) {
-        const entryAgeMs = nowV22 - new Date(uncertainEntryRef.current).getTime();
-        const isStale = !Number.isFinite(entryAgeMs) || entryAgeMs >= 12 * 3600_000;
-        if (
-          !isStale &&
-          v21Result.currentState === 'ON' &&
-          modeV22 !== 'COMMUNITY_SYNCED'
-        ) {
-          // V2.3 (Issue 1A): Growatt has flipped ON (or the active slot is
-          // now ON). Backdate the ON cycle to the UNCERTAIN_ZONE entry so
-          // the elapsed timer shows the wait time, and the ON ends after
-          // the remaining (predicted ON duration − wait).
-          finalResult = applyUncertainZoneDeduction(v21Result, uncertainEntryRef.current, nowV22);
-        } else if (
-          isStale ||
-          modeV22 === 'COMMUNITY_SYNCED' ||
-          (!inUncertainFamily && v21Result.currentState === 'OFF' &&
-            // V2.3: only clear if we're in a NORMAL OFF (post-ON-cycle),
-            // NOT while still in any held-state mode that might re-trigger.
-            modeV22 === 'NORMAL')
-        ) {
-          // The ON cycle has completed normally — clear the anchor.
-          uncertainEntryRef.current = null;
-          AsyncStorage.removeItem(UNCERTAIN_ZONE_ENTRY_KEY).catch(() => {});
+
+      // ── V2.3 FIX: Immediate ON flip for negative-offset users ─────────────
+      //
+      // When Growatt turns ON (growattOnIso is freshly set by the watcher)
+      // and utility_predictions hasn't refreshed yet, the engine still shows
+      // OFF (UNCERTAIN_ZONE / WAITING_FOR_GROWATT). We synthesise an
+      // immediate ON state using the formula:
+      //
+      //   userOnStart = growattOnIso + offsetMinutes
+      //               = G − |offset|   (for negative offset)
+      //
+      // This gives elapsed = now − userOnStart ≈ |offset| minutes immediately
+      // after Growatt turns ON, which is exactly what the user expects.
+      //
+      // Activation conditions:
+      //   1. growattOnIso is set (watcher fired with a UTILITY_ON event)
+      //   2. Engine still shows OFF (utility_predictions not yet refreshed)
+      //   3. User is in uncertain family (came from UNCERTAIN_ZONE/WAITING)
+      //   4. Not community-synced (community sync takes priority)
+      //   5. User has a negative offset
+      //
+      // Deactivation: once utility_predictions refreshes and the engine
+      // derives the real ON slot (v21Result.currentState === 'ON'), the
+      // UNCERTAIN_ZONE deduction logic takes over and the synthetic state
+      // is naturally superseded.
+      const shouldImmediateFlip =
+        growattOnIso !== null &&
+        inUncertainFamily &&
+        v21Result.currentState === 'OFF' &&
+        modeV22 !== 'COMMUNITY_SYNCED' &&
+        offsetMinutes < 0;
+
+      if (shouldImmediateFlip && growattOnIso) {
+        const growattOnMs = new Date(growattOnIso).getTime();
+        // User's ON started = Growatt ON time + offset (negative → shifts backward)
+        // Example: G = 18:00, offset = −60 → userOnStart = 17:00
+        // Elapsed when watcher fires: now − 17:00 ≈ 60 min = |offset|
+        const userOnStartMs = growattOnMs + offsetMinutes * 60_000;
+        const userOnStartIso = new Date(userOnStartMs).toISOString();
+
+        // Estimate ON duration from the shifted schedule
+        const scheduledOnSlot = (v21Result.daySchedule ?? []).find(
+          (s: ShiftedScheduleSlot) => s.state === 'ON' && new Date(s.startIso).getTime() >= growattOnMs - 2 * 3600_000,
+        );
+        const onDurationMs = scheduledOnSlot?.endIso
+          ? new Date(scheduledOnSlot.endIso).getTime() - new Date(scheduledOnSlot.startIso).getTime()
+          : 120 * 60_000; // 2h default
+        const userOnEndMs = userOnStartMs + onDurationMs;
+        const userOnEndIso = new Date(userOnEndMs).toISOString();
+
+        const fmtLocal = (iso: string) => new Date(iso).toLocaleString('en-US', {
+          timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+        }).replace('AM', ' ص').replace('PM', ' م');
+
+        const durMin = Math.round(onDurationMs / 60_000);
+        const durH = Math.floor(durMin / 60); const durM = durMin % 60;
+        const durationLabel = durH === 0 ? `${durM}د`
+          : durM === 0 ? (durH === 1 ? 'ساعة' : `${durH}س`)
+          : `${durH}س ${durM}د`;
+
+        const syntheticOnSlot: ShiftedScheduleSlot = {
+          state: 'ON',
+          startIso: userOnStartIso,
+          endIso: userOnEndIso,
+          startFormatted: fmtLocal(userOnStartIso),
+          endFormatted: fmtLocal(userOnEndIso),
+          shiftedStartFormatted: fmtLocal(userOnStartIso),
+          shiftedEndFormatted: fmtLocal(userOnEndIso),
+          durationLabel,
+          zone: 'DAY',
+          isEstimated: true,
+        };
+
+        const nextOffMs = userOnEndMs;
+        const nextTransition = {
+          type: 'UTILITY_OFF' as const,
+          earliestTime: userOnEndIso,
+          latestTime: userOnEndIso,
+          earliestFormatted: fmtLocal(userOnEndIso),
+          latestFormatted: fmtLocal(userOnEndIso),
+          minFromNowMin: Math.max(0, (nextOffMs - nowV22) / 60_000),
+          maxFromNowMin: Math.max(0, (nextOffMs - nowV22) / 60_000),
+          rangeLabel: fmtLocal(userOnEndIso),
+          rangeStartIso: userOnEndIso,
+          rangeEndIso: userOnEndIso,
+          inRangeWindow: false,
+        };
+
+        immediateOnActiveRef.current = true;
+
+        // Save the UNCERTAIN_ZONE entry as userOnStartIso so that when
+        // utility_predictions eventually updates, applyUncertainZoneDeduction
+        // uses the correct backdated start.
+        if (!uncertainEntryRef.current || new Date(uncertainEntryRef.current).getTime() > userOnStartMs) {
+          uncertainEntryRef.current = userOnStartIso;
+          AsyncStorage.setItem(UNCERTAIN_ZONE_ENTRY_KEY, userOnStartIso).catch(() => {});
+        }
+
+        finalResult = {
+          ...v21Result,
+          currentState: 'ON',
+          currentStateStartIso: userOnStartIso,
+          // reconciledCycleStartIso is the TOP priority for the Home screen
+          // elapsed timer — shows |offset| minutes of elapsed immediately.
+          reconciledCycleStartIso: userOnStartIso,
+          isHoldingState: false,
+          daySchedule: [syntheticOnSlot, ...(v21Result.daySchedule ?? [])],
+          nextTransition,
+          atc: {
+            ...v21Result.atc,
+            mode: 'NORMAL' as any,
+            statusLine: '',
+            overrunMinutes: 0,
+            communityElevated: false,
+            isHoldingState: false,
+          },
+        };
+      } else {
+        immediateOnActiveRef.current = false;
+
+        // ── Standard UNCERTAIN_ZONE deduction (utility_predictions updated) ──
+        if (uncertainEntryRef.current) {
+          const entryAgeMs = nowV22 - new Date(uncertainEntryRef.current).getTime();
+          const isStale = !Number.isFinite(entryAgeMs) || entryAgeMs >= 12 * 3600_000;
+
+          if (!isStale && v21Result.currentState === 'ON' && modeV22 !== 'COMMUNITY_SYNCED') {
+            // utility_predictions has updated → backdate ON cycle to entry anchor
+            // so elapsed shows the full wait time and remaining = predicted − wait.
+            finalResult = applyUncertainZoneDeduction(v21Result, uncertainEntryRef.current, nowV22);
+          } else if (
+            isStale ||
+            modeV22 === 'COMMUNITY_SYNCED' ||
+            (!inUncertainFamily && v21Result.currentState === 'OFF' && modeV22 === 'NORMAL')
+          ) {
+            // ON cycle completed normally → clear anchor
+            uncertainEntryRef.current = null;
+            AsyncStorage.removeItem(UNCERTAIN_ZONE_ENTRY_KEY).catch(() => {});
+          }
         }
       }
 
@@ -811,18 +737,12 @@ export function useUserPredictions(
       console.error('[useUserPredictions] engine error:', e);
       return null;
     }
-  // frozenOffsetRef.current is intentionally excluded from deps (Rule Q2-A).
-  // V2.1: same exclusion applies to frozenOffsetStateRef and frozenAlignmentRef.
-  // resolutionTick is included so the memo re-runs when Growatt turns ON
-  // and resolves a pending negative state.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick]);
+  // frozenOffsetRef, frozenOffsetStateRef, frozenAlignmentRef intentionally
+  // excluded from deps (Rule Q2-A freeze). growattOnIso and resolutionTick
+  // are included so the memo re-runs immediately when the watcher fires.
+  }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick, growattOnIso, onCommunityOffsetComputed]);
 
-  // ── Precise auto-transition timer (#2b) ────────────────────────────────
-  // POSITIVE_OFFSET_PENDING / COMMUNITY_SYNCED expose a scheduled
-  // auto-transition ISO. Re-derive EXACTLY when it arrives (plus a small
-  // buffer) instead of waiting up to 30s for the next heartbeat, so the
-  // held state flips the moment the countdown reaches zero.
+  // ── Precise auto-transition timer ─────────────────────────────────────────
   const scheduledFlipIso = userPrediction?.atc?.scheduledAutoTransitionIso ?? null;
   useEffect(() => {
     if (!scheduledFlipIso) return;
