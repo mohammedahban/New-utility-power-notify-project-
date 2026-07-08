@@ -453,11 +453,26 @@ function computeATCMode(
   }
 
   // ── CASE 1: No active slot — user is between slots ───────────────────────
-  // This happens when the user's shifted schedule has a gap, meaning:
-  //   - POSITIVE offset: Growatt already transitioned, user's next slot
-  //     hasn't started yet → POSITIVE_OFFSET_PENDING
-  //   - NEGATIVE offset: user's predicted OFF ended before Growatt's OFF,
-  //     user is waiting for Growatt to confirm → UNCERTAIN_ZONE
+  //
+  // THREE CASES BY OFFSET SIGN:
+  //
+  // POSITIVE offset (Issue 1C): User turns ON AFTER Growatt.
+  //   - If Growatt has transitioned but the user's next slot hasn't started
+  //     yet → POSITIVE_OFFSET_PENDING (hold current state, wait for scheduled
+  //     transition time). The user NEVER flips automatically before their
+  //     scheduled time, even if the predicted OFF slot has ended.
+  //
+  // NEGATIVE offset (Issue 1A): User turns ON BEFORE Growatt.
+  //   - If the user's shifted OFF slot ended but Growatt hasn't confirmed ON
+  //     yet → UNCERTAIN_ZONE (hold OFF state indefinitely, no automatic flip).
+  //     The state NEVER automatically changes — only Growatt ON or a community
+  //     ON report resolves this. The wait time is later deducted from the
+  //     next ON cycle. There is NO time limit on UNCERTAIN_ZONE / WAITING_FOR_GROWATT.
+  //
+  // NEUTRAL offset (Issue 1B): User clones Growatt exactly.
+  //   - If there is a gap (brief API delay), the user falls through to NORMAL
+  //     which picks up the correct state from the shifted schedule / Growatt.
+  //     Neutral never enters UNCERTAIN_ZONE — it mirrors Growatt 1:1.
   if (!activeSlot) {
     // ── POSITIVE_OFFSET_PENDING ──────────────────────────────────────────
     // Positive offset = user turns ON AFTER Growatt.
@@ -469,17 +484,12 @@ function computeATCMode(
         .filter(s => new Date(s.startIso).getTime() > nowMs)
         .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
 
-      // FIX (#2b): the user's upcoming shifted slot mirrors the state Growatt
-      // has ALREADY transitioned to — so the correct trigger is state
-      // EQUALITY. The previous `!==` comparison was inverted, which meant
-      // POSITIVE_OFFSET_PENDING never activated and positive-offset users
-      // flipped instantly with Growatt instead of holding their
-      // pre-transition state until the scheduled time.
-      if (nextSlot && nextSlot.state === growattCurrentState) {
-        const heldState: 'ON' | 'OFF' = growattCurrentState === 'ON' ? 'OFF' : 'ON';
-        // FIX (#2c): the held state started when the user's most recently
-        // ended slot of that state began — surface it so "منذ" and the
-        // timeline's الآن slot show the real start time.
+      if (nextSlot) {
+        // The held state is the OPPOSITE of the upcoming slot's state.
+        // e.g. next slot is ON → user is currently holding OFF.
+        const heldState: 'ON' | 'OFF' = nextSlot.state === 'ON' ? 'OFF' : 'ON';
+        // Anchor the held state at the start of the most recently ended slot
+        // of the held state type, so "منذ" and الآن show the real start time.
         const prevHeldSlot = shiftedSlots
           .filter(s => s.state === heldState && s.endIso && new Date(s.endIso).getTime() <= nowMs)
           .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
@@ -496,27 +506,46 @@ function computeATCMode(
           statusLine: `تغيير تلقائي مجدول في ${fmtYemenTime(nextSlot.startIso)}`,
         };
       }
+
+      // No next slot found in schedule — hold the most recent state.
+      // This prevents positive-offset users from auto-flipping when the
+      // schedule runs out of future slots.
+      const lastSlot = shiftedSlots
+        .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
+        .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
+      if (lastSlot) {
+        return {
+          mode: 'WAITING_FOR_GROWATT',
+          currentState: lastSlot.state,
+          currentStateStartIso: lastSlot.startIso,
+          isHoldingState: true,
+          overrunMinutes: Math.max(0, Math.round((nowMs - new Date(lastSlot.endIso!).getTime()) / 60_000)),
+          communityElevated: true,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: 'بانتظار تحديث الجدول',
+        };
+      }
     }
 
-    // ── NEGATIVE OFFSET: UNCERTAIN_ZONE ──────────────────────────────────
+    // ── NEGATIVE OFFSET: UNCERTAIN_ZONE / WAITING_FOR_GROWATT ────────────
     // Negative offset = user turns ON BEFORE Growatt.
     // The user's predicted OFF has ended (shifted earlier by negative offset),
-    // but Growatt hasn't transitioned to ON yet. The user doesn't know
-    // exactly when Growatt will turn ON, so they enter UNCERTAIN_ZONE.
-    // The ON state will use the predicted ON duration automatically.
-    // Remains in UNCERTAIN_ZONE until:
-    //   - Growatt finally transitions to ON, OR
-    //   - A new accepted community ON report arrives
+    // but Growatt hasn't transitioned to ON yet. The user MUST stay in the
+    // held OFF state INDEFINITELY (no automatic flip at any overrun threshold).
+    // Only resolved by:
+    //   - Growatt actually turns ON (handled by useGrowattOnWatcher)
+    //   - A new accepted community ON report
+    // The wait time (overrun) is DEDUCTED from the next ON cycle duration.
     if (offsetMinutes < 0) {
       const recentlyEnded = shiftedSlots
         .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
         .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
 
       if (recentlyEnded) {
-        // FIX (#3): holding while "waiting for Growatt" applies ONLY to the
-        // OFF→ON direction. If the slot that just ended was ON, the ON→OFF
-        // transition is ALWAYS automatic at the predicted end — never held
-        // in GRACE_MODE / UNCERTAIN_ZONE.
+        // Holding only applies to the OFF→ON direction:
+        // If an ON slot just ended, the ON→OFF transition is always automatic.
         if (recentlyEnded.state === 'ON') {
           return {
             mode: 'NORMAL',
@@ -531,26 +560,19 @@ function computeATCMode(
             statusLine: '',
           };
         }
-        // ── V2.3 (Issue 1A): UNCERTAIN_ZONE entry anchor ──────────────────────
-        // The predicted OFF ended at `slotEndMs`. From that moment the user is
-        // in UNCERTAIN_ZONE: still OFF (held), waiting for Growatt to turn ON.
-        // The wait time (overrun) is DEDUCTED from the next ON cycle later
-        // (see applyUncertainZoneDeduction in useUserPredictions.ts).
-        //
-        // `currentStateStartIso` MUST be the START of the held OFF state
-        // (the shifted start of the recently-ended OFF slot), so the
-        // elapsed timer shows the full OFF duration including the overrun.
-        // The previous calculation `slotEndMs + offsetMs` was wrong — it
-        // returned the original (unshifted) Growatt OFF end, not the start
-        // of the user's held OFF state.
+
+        // OFF slot just ended — enter / stay in UNCERTAIN_ZONE.
+        // There is NO maximum overrun limit: the user stays here until
+        // Growatt confirms ON. The overrunMinutes grows indefinitely and
+        // feeds the exceeded-time badge in the UI.
         const slotEndMs = new Date(recentlyEnded.endIso!).getTime();
         const overrunMin = Math.max(0, Math.round((nowMs - slotEndMs) / 60_000));
-        const heldStartIso = recentlyEnded.startIso; // shifted start of held OFF
+        const heldStartIso = recentlyEnded.startIso; // shifted start of held OFF slot
 
         if (overrunMin <= GRACE_MODE_MAX_MIN) {
           return {
             mode: overrunMin <= 5 ? 'GRACE_MODE' : 'UNCERTAIN_ZONE',
-            currentState: recentlyEnded.state,
+            currentState: 'OFF',
             currentStateStartIso: heldStartIso,
             isHoldingState: true,
             overrunMinutes: overrunMin,
@@ -563,14 +585,11 @@ function computeATCMode(
               : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
           };
         }
-        // Overrun > 30 min — escalate to WAITING_FOR_GROWATT.
-        // V2.3 (Issue 1A): the user is STILL in the held OFF state. We must
-        // NOT release the held state by flipping to `growattCurrentState` —
-        // doing so caused the UNCERTAIN_ZONE entry anchor to be cleared
-        // prematurely (because `inUncertainFamily` in useUserPredictions
-        // checked `currentState === 'OFF'`). The held OFF state continues
-        // until Growatt actually turns ON, at which point the deduction
-        // logic backdates the next ON cycle to the UNCERTAIN_ZONE entry.
+
+        // Overrun > 30 min → WAITING_FOR_GROWATT.
+        // CRITICAL: currentState MUST remain 'OFF', isHoldingState MUST remain true.
+        // NEVER flip to growattCurrentState here — that caused the bug.
+        // The held OFF state continues indefinitely until Growatt turns ON.
         return {
           mode: 'WAITING_FOR_GROWATT',
           currentState: 'OFF',
@@ -584,7 +603,29 @@ function computeATCMode(
           statusLine: `بانتظار تأكيد Growatt — تأخير ${overrunMin} دقيقة`,
         };
       }
+
+      // No recently ended slot found but we're past the schedule — hold OFF.
+      // This defensive branch prevents accidental auto-flip when the shifted
+      // schedule produces no usable reference slot.
+      return {
+        mode: 'WAITING_FOR_GROWATT',
+        currentState: 'OFF',
+        currentStateStartIso: null,
+        isHoldingState: true,
+        overrunMinutes: 0,
+        communityElevated: true,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso: null,
+        statusLine: 'بانتظار تأكيد Growatt',
+      };
     }
+
+    // ── NEUTRAL OFFSET: brief schedule gap ───────────────────────────────
+    // Neutral users clone Growatt exactly. A gap between slots means a brief
+    // API/polling delay. Fall through to the NORMAL block below which picks
+    // up growattCurrentState as the current state — this is correct since
+    // neutral users are a perfect mirror of the Growatt sensor.
   }
 
   // ── CASE 2: Active slot exists — check end-of-slot behavior ──────────────
@@ -683,10 +724,20 @@ function computeATCMode(
 
   // ── NORMAL ───────────────────────────────────────────────────────────────
   // User is in the middle of a slot, not near the end. Everything is fine.
-  // For neutral offset: this means the user's timeline matches Growatt exactly.
+  //
+  // For NEUTRAL offset: the user's timeline mirrors Growatt exactly, so using
+  // growattCurrentState when there is no active slot (brief gap) is correct.
+  //
+  // For POSITIVE offset: this branch is only reached when there ARE no future
+  // slots in the shifted schedule (schedule exhausted). In that case fall back
+  // to the held state logic above; we should not reach here for positive users.
+  //
+  // For NEGATIVE offset: this branch should NEVER be reached when there is no
+  // active slot (the negative-offset no-slot case is handled above). It is only
+  // reached when an active slot IS present (user is inside a slot boundary).
   return {
     mode: 'NORMAL',
-    currentState: activeSlot ? activeSlot.state : growattCurrentState,
+    currentState: activeSlot ? activeSlot.state : (offsetMinutes === 0 ? growattCurrentState : 'OFF'),
     currentStateStartIso: activeSlot ? activeSlot.startIso : null,
     isHoldingState: false,
     overrunMinutes: 0,

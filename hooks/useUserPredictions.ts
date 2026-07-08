@@ -577,8 +577,14 @@ export function useUserPredictions(
 
       // ── UNCERTAIN_ZONE / WAITING_FOR_GROWATT state tracking ──────────────
       const modeV22 = v21Result.atc.mode;
+      // inUncertainFamily: the engine placed the user in UNCERTAIN_ZONE,
+      // GRACE_MODE, or WAITING_FOR_GROWATT AND is actively HOLDING the OFF
+      // state. isHoldingState=true is the authoritative signal — we must NOT
+      // enter this branch for a NORMAL OFF (e.g. neutral/positive users whose
+      // shifted schedule has a brief gap and the engine correctly set NORMAL).
       const inUncertainFamily =
         v21Result.currentState === 'OFF' &&
+        v21Result.isHoldingState === true &&
         (modeV22 === 'UNCERTAIN_ZONE' || modeV22 === 'GRACE_MODE' || modeV22 === 'WAITING_FOR_GROWATT');
 
       // Record entry anchor (when predicted OFF slot ended)
@@ -607,10 +613,9 @@ export function useUserPredictions(
       //
       // Activation conditions:
       //   1. growattOnIso is set (watcher fired with a UTILITY_ON event)
-      //   2. Engine still shows OFF (utility_predictions not yet refreshed)
-      //   3. User is in uncertain family (came from UNCERTAIN_ZONE/WAITING)
-      //   4. Not community-synced (community sync takes priority)
-      //   5. User has a negative offset
+      //   2. Engine still shows OFF with isHoldingState=true (in uncertain family)
+      //   3. Not community-synced (community sync takes priority)
+      //   4. User has a negative offset
       //
       // Deactivation: once utility_predictions refreshes and the engine
       // derives the real ON slot (v21Result.currentState === 'ON'), the
@@ -619,7 +624,6 @@ export function useUserPredictions(
       const shouldImmediateFlip =
         growattOnIso !== null &&
         inUncertainFamily &&
-        v21Result.currentState === 'OFF' &&
         modeV22 !== 'COMMUNITY_SYNCED' &&
         offsetMinutes < 0;
 
@@ -723,7 +727,10 @@ export function useUserPredictions(
           } else if (
             isStale ||
             modeV22 === 'COMMUNITY_SYNCED' ||
-            (!inUncertainFamily && v21Result.currentState === 'OFF' && modeV22 === 'NORMAL')
+            // Only clear the anchor when the user is genuinely back to NORMAL OFF
+            // (not holding — i.e. they have completed a full ON→OFF cycle after
+            // the UNCERTAIN_ZONE resolved). Never clear while still in uncertain family.
+            (!inUncertainFamily && v21Result.currentState === 'OFF' && modeV22 === 'NORMAL' && !v21Result.isHoldingState)
           ) {
             // ON cycle completed normally → clear anchor
             uncertainEntryRef.current = null;
