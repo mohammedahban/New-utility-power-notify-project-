@@ -1,20 +1,36 @@
 /**
- * tmmsEngine.ts — TMMS V2.1 Final Engine
+ * tmmsEngine.ts — TMMS V2.3 Final Engine (Fix Patch 2026-07-08)
  *
  * Dependency-free TypeScript — shared between the production hook
  * (hooks/useUserPredictions.ts) and admin tooling.
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * TMMS V2.1 FINAL RULES (Period 1 / Period 2)
+ * TMMS V2.3 FINAL RULES (Patch: Issues 1A / 1B / 1C)
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Period 1 = first half of OFF (<50% consumed) → POSITIVE offset
- *   - Offset is ADDED (push) to start/end of EACH state (ON and OFF)
- *   - Verification Window: true
+ * POSITIVE offset (Issue 1C):
+ *   - Offset is computed from Growatt ON START TIME (not the duration-based
+ *     end-of-ON reference). User turns ON AFTER Growatt.
+ *   - Offset is ADDED (push) to start/end of EACH state (ON and OFF).
+ *   - Verification Window: true (kept, working fine).
  *
- * Period 2 = second half of OFF (>50% consumed) → NEGATIVE offset
- *   - Offset is DECLINED (pull) from start/end of EACH state (ON and OFF)
- *   - UNCERTAIN_ZONE: true
+ * NEUTRAL offset (Issue 1B):
+ *   - User clones Growatt EXACTLY. Same start/end times and durations.
+ *   - NO automatic changes, NO UNCERTAIN_ZONE, NO verification window.
+ *   - The personal timeline is identical to Growatt's timeline.
+ *
+ * NEGATIVE offset (Issue 1A):
+ *   - Offset is DECLINED (pull) from start/end of EACH state (ON and OFF).
+ *   - When predicted OFF ends, the OFF state HELDS in UNCERTAIN_ZONE
+ *     until Growatt turns ON. The wait time is DEDUCTED from the next ON
+ *     cycle: ON starts at the predicted-OFF-end moment (elapsed shows the
+ *     wait), ON ends after the remaining (predicted ON duration − wait).
+ *   - WAITING_FOR_GROWATT still holds the OFF state — it does NOT flip to
+ *     `growattCurrentState` until Growatt actually turns ON. This is the
+ *     fix for the bug where after 30 minutes of overrun the held state
+ *     was being released prematurely.
+ *   - PENDING_NEGATIVE offset values are resolved immediately when the
+ *     reporter submits during a Growatt ON state (see useUtilityReports.ts).
  *
  * The offset is FINAL at report time. No recomputation.
  *
@@ -515,16 +531,27 @@ function computeATCMode(
             statusLine: '',
           };
         }
+        // ── V2.3 (Issue 1A): UNCERTAIN_ZONE entry anchor ──────────────────────
+        // The predicted OFF ended at `slotEndMs`. From that moment the user is
+        // in UNCERTAIN_ZONE: still OFF (held), waiting for Growatt to turn ON.
+        // The wait time (overrun) is DEDUCTED from the next ON cycle later
+        // (see applyUncertainZoneDeduction in useUserPredictions.ts).
+        //
+        // `currentStateStartIso` MUST be the START of the held OFF state
+        // (the shifted start of the recently-ended OFF slot), so the
+        // elapsed timer shows the full OFF duration including the overrun.
+        // The previous calculation `slotEndMs + offsetMs` was wrong — it
+        // returned the original (unshifted) Growatt OFF end, not the start
+        // of the user's held OFF state.
         const slotEndMs = new Date(recentlyEnded.endIso!).getTime();
-        const overrunMin = Math.round((nowMs - slotEndMs) / 60_000);
-        const offsetMs = offsetMinutes * 60_000;
-        const backedStartIso = new Date(slotEndMs + offsetMs).toISOString();
+        const overrunMin = Math.max(0, Math.round((nowMs - slotEndMs) / 60_000));
+        const heldStartIso = recentlyEnded.startIso; // shifted start of held OFF
 
         if (overrunMin <= GRACE_MODE_MAX_MIN) {
           return {
             mode: overrunMin <= 5 ? 'GRACE_MODE' : 'UNCERTAIN_ZONE',
             currentState: recentlyEnded.state,
-            currentStateStartIso: backedStartIso,
+            currentStateStartIso: heldStartIso,
             isHoldingState: true,
             overrunMinutes: overrunMin,
             communityElevated: overrunMin >= PREDICTION_RANGE_MIN,
@@ -536,12 +563,19 @@ function computeATCMode(
               : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
           };
         }
-        // Overrun > 30 min — escalate to WAITING_FOR_GROWATT
+        // Overrun > 30 min — escalate to WAITING_FOR_GROWATT.
+        // V2.3 (Issue 1A): the user is STILL in the held OFF state. We must
+        // NOT release the held state by flipping to `growattCurrentState` —
+        // doing so caused the UNCERTAIN_ZONE entry anchor to be cleared
+        // prematurely (because `inUncertainFamily` in useUserPredictions
+        // checked `currentState === 'OFF'`). The held OFF state continues
+        // until Growatt actually turns ON, at which point the deduction
+        // logic backdates the next ON cycle to the UNCERTAIN_ZONE entry.
         return {
           mode: 'WAITING_FOR_GROWATT',
-          currentState: growattCurrentState,
-          currentStateStartIso: null,
-          isHoldingState: false,
+          currentState: 'OFF',
+          currentStateStartIso: heldStartIso,
+          isHoldingState: true,
           overrunMinutes: overrunMin,
           communityElevated: true,
           inValidationWindow: false,
@@ -570,10 +604,13 @@ function computeATCMode(
     const minutesUntilEnd = (endMs - nowMs) / 60_000;
 
     if (minutesUntilEnd >= 0 && minutesUntilEnd <= VERIFICATION_WINDOW_MIN) {
-      if (offsetMinutes >= 0) {
-        // ── VERIFICATION WINDOW (Positive / Neutral) ─────────────────────
-        // User is confident — Growatt already confirmed (positive) or
-        // will confirm at the same time (neutral). Short window only.
+      if (offsetMinutes > 0) {
+        // ── VERIFICATION WINDOW (Positive ONLY) ─────────────────────────
+        // V2.3 (Issue 1B): NEUTRAL offset no longer gets a verification
+        // window — neutral users clone Growatt EXACTLY. Only POSITIVE
+        // offset users (who turn ON AFTER Growatt) keep the short
+        // verification window — the user trusts the prediction and Growatt
+        // has already confirmed.
         return {
           mode: 'NORMAL', // Still NORMAL mode, but with verification window active
           currentState: activeSlot.state,
@@ -585,6 +622,25 @@ function computeATCMode(
           validationWindowRemainingMin: Math.round(minutesUntilEnd),
           scheduledAutoTransitionIso: null,
           statusLine: `نافذة التحقق — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
+        };
+      } else if (offsetMinutes === 0) {
+        // ── NEUTRAL (Issue 1B): clone Growatt EXACTLY ───────────────────
+        // No verification window, no UNCERTAIN_ZONE, no automatic changes.
+        // The user's timeline mirrors Growatt's timeline 1:1. We render a
+        // very short (1-minute) window purely as a UI softener so the
+        // transition doesn't appear to flip mid-second, but it does NOT
+        // hold the state or trigger any community elevation.
+        return {
+          mode: 'NORMAL',
+          currentState: activeSlot.state,
+          currentStateStartIso: activeSlot.startIso,
+          isHoldingState: false,
+          overrunMinutes: 0,
+          communityElevated: false,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: '',
         };
       } else {
         // ── PREDICTION_RANGE (Negative — preparing for UNCERTAIN_ZONE) ──
@@ -606,7 +662,10 @@ function computeATCMode(
     }
 
     // ── PREDICTION_RANGE (beyond verification window, within 15 min) ──────
-    if (minutesUntilEnd >= 0 && minutesUntilEnd <= PREDICTION_RANGE_MIN) {
+    // V2.3 (Issue 1B): NEUTRAL offset skips this branch entirely — neutral
+    // users never see PREDICTION_RANGE because their timeline mirrors
+    // Growatt and there is no uncertainty to warn about.
+    if (offsetMinutes !== 0 && minutesUntilEnd >= 0 && minutesUntilEnd <= PREDICTION_RANGE_MIN) {
       return {
         mode: 'PREDICTION_RANGE',
         currentState: activeSlot.state,
@@ -614,8 +673,8 @@ function computeATCMode(
         isHoldingState: false,
         overrunMinutes: 0,
         communityElevated: false,
-        inValidationWindow: offsetMinutes >= 0,
-        validationWindowRemainingMin: offsetMinutes >= 0 ? Math.round(minutesUntilEnd) : 0,
+        inValidationWindow: offsetMinutes > 0,
+        validationWindowRemainingMin: offsetMinutes > 0 ? Math.round(minutesUntilEnd) : 0,
         scheduledAutoTransitionIso: null,
         statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
       };
