@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+
+import React, { useEffect, useState, useRef } from 'react';
 import {
-  View, Text, ScrollView, StyleSheet, ActivityIndicator,
+  View, Text, ScrollView, StyleSheet, ActivityIndicator, Animated,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
@@ -212,6 +213,148 @@ function useOverrunHistory(userId: string | undefined) {
   return { entries, loading };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MINI BAR CHART
+// Shows overrun duration per cycle, oldest → newest (left → right).
+// Bars animate in on mount; color encodes severity.
+// ─────────────────────────────────────────────────────────────────────────────
+function MiniBarChart({ entries }: { entries: OverrunEntry[] }) {
+  // Use last 10 entries, reversed so oldest is on the left
+  const chartEntries = [...entries].slice(0, 10).reverse();
+  const maxVal = Math.max(...chartEntries.map(e => e.deductedMin), 1);
+
+  // One Animated.Value per bar
+  const animRefs = useRef<Animated.Value[]>([]);
+  if (animRefs.current.length !== chartEntries.length) {
+    animRefs.current = chartEntries.map(() => new Animated.Value(0));
+  }
+
+  useEffect(() => {
+    const anims = animRefs.current.map((av, i) =>
+      Animated.timing(av, {
+        toValue: chartEntries[i].deductedMin / maxVal,
+        duration: 500 + i * 60,
+        useNativeDriver: false,
+      }),
+    );
+    Animated.stagger(40, anims).start();
+  }, [chartEntries.map(e => e.id).join(','), maxVal]); // Added maxVal to dependency array
+
+  const MAX_BAR_HEIGHT = 64;
+  const BAR_WIDTH = 22;
+
+  return (
+    <View style={chartStyles.wrap}>
+      {/* Y-axis label */}
+      <Text style={chartStyles.yLabel}>وقت الانتظار (دقيقة)</Text>
+
+      {/* Bars */}
+      <View style={chartStyles.barsRow}>
+        {chartEntries.map((entry, i) => {
+          const severity =
+            entry.deductedMin >= 60 ? 'high'
+            : entry.deductedMin >= 20 ? 'medium'
+            : 'low';
+          const barColor =
+            severity === 'high' ? T.danger
+            : severity === 'medium' ? T.warning
+            : T.success;
+
+          const animH = animRefs.current[i]?.interpolate({
+            inputRange: [0, 1],
+            outputRange: [0, MAX_BAR_HEIGHT],
+          }) ?? new Animated.Value(0);
+
+          // Shorten date: "Jul 3" style
+          const dateLabel = new Date(entry.confirmed_at).toLocaleDateString('en-US', {
+            timeZone: 'Asia/Aden', month: 'short', day: 'numeric',
+          });
+
+          return (
+            <View key={entry.id} style={[chartStyles.barCol, { width: BAR_WIDTH + 8 }]}>
+              {/* Value label above bar */}
+              <Text style={[chartStyles.barVal, { color: barColor }]}>
+                {entry.deductedMin}
+              </Text>
+              {/* Bar container — fixed height, bar grows from bottom */}
+              <View style={[chartStyles.barTrack, { height: MAX_BAR_HEIGHT }]}>
+                <Animated.View
+                  style={[
+                    chartStyles.barFill,
+                    {
+                      width: BAR_WIDTH,
+                      height: animH,
+                      backgroundColor: barColor,
+                    },
+                  ]}
+                />
+              </View>
+              {/* Date label below bar */}
+              <Text style={chartStyles.barDate} numberOfLines={1}>{dateLabel}</Text>
+            </View>
+          );
+        })}
+      </View>
+
+      {/* Trend caption */}
+      {chartEntries.length >= 3 && (() => {
+        const firstHalf = chartEntries.slice(0, Math.floor(chartEntries.length / 2));
+        const secondHalf = chartEntries.slice(Math.floor(chartEntries.length / 2));
+        const avgFirst = firstHalf.reduce((s, e) => s + e.deductedMin, 0) / firstHalf.length;
+        const avgSecond = secondHalf.reduce((s, e) => s + e.deductedMin, 0) / secondHalf.length;
+        const diff = avgSecond - avgFirst;
+        if (Math.abs(diff) < 5) return (
+          <Text style={chartStyles.trendNeutral}>📊 الانتظار مستقر نسبياً عبر الدورات</Text>
+        );
+        if (diff > 0) return (
+          <Text style={chartStyles.trendUp}>📈 الانتظار يتزايد — قد تحتاج لتعديل فارقك</Text>
+        );
+        return (
+          <Text style={chartStyles.trendDown}>📉 الانتظار يتناقص — النمط يتحسّن</Text>
+        );
+      })()}
+    </View>
+  );
+}
+
+const chartStyles = StyleSheet.create({
+  wrap: {
+    backgroundColor: T.elevated, borderRadius: 14, padding: 14,
+    marginBottom: 16, borderWidth: 1, borderColor: T.border,
+  },
+  yLabel: {
+    color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 0.5,
+    textAlign: 'right', marginBottom: 10,
+  },
+  barsRow: {
+    flexDirection: 'row', alignItems: 'flex-end', gap: 4,
+    justifyContent: 'flex-start', flexWrap: 'wrap',
+  },
+  barCol: { alignItems: 'center', gap: 4 },
+  barVal: { fontSize: 9, fontWeight: '800', textAlign: 'center' },
+  barTrack: {
+    justifyContent: 'flex-end', alignItems: 'center',
+    backgroundColor: T.bg, borderRadius: 4, overflow: 'hidden',
+  },
+  barFill: { borderRadius: 4, opacity: 0.9 },
+  barDate: {
+    color: T.textMuted, fontSize: 8, textAlign: 'center',
+    width: '100%', marginTop: 2,
+  },
+  trendUp: {
+    color: T.danger, fontSize: 10, fontWeight: '700', textAlign: 'right',
+    marginTop: 10,
+  },
+  trendDown: {
+    color: T.success, fontSize: 10, fontWeight: '700', textAlign: 'right',
+    marginTop: 10,
+  },
+  trendNeutral: {
+    color: T.textMuted, fontSize: 10, fontWeight: '600', textAlign: 'right',
+    marginTop: 10,
+  },
+});
+
 function fmtShortTime(iso: string): string {
   return new Date(iso).toLocaleString('en-US', {
     timeZone: 'Asia/Aden', month: 'short', day: 'numeric',
@@ -266,6 +409,11 @@ function OverrunHistoryCard({ userId }: { userId: string | undefined }) {
             <Text style={[ovStyles.summaryChipValue, { color: T.accent }]}>{entries.length}</Text>
           </View>
         </View>
+      )}
+
+      {/* Mini bar chart — rendered above the entries list */}
+      {!loading && entries.length >= 2 && (
+        <MiniBarChart entries={entries} />
       )}
 
       {loading ? (
