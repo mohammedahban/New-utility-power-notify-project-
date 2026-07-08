@@ -446,9 +446,34 @@ export function useResyncNotifications() {
       .from('resync_history')
       .select('*')
       .eq('user_id', user.id)
+      // V2.3 (Issue 2): exclude reverted rows from the active history list.
+      // Reverted rows remain in the table for audit but are no longer
+      // "active" — they don't contribute to the user's current Generated ON
+      // or offset state.
+      .is('reverted_at', null)
       .order('confirmed_at', { ascending: false })
       .limit(15);
-    if (error) console.error('[useResyncNotifications] history error:', error.message);
+    if (error) {
+      // V2.3: if the reverted_at column doesn't exist yet (pre-migration),
+      // retry without the filter so the UI doesn't break.
+      if (error.message.includes('reverted_at') || error.message.includes('column')) {
+        const { data: fallbackData, error: fallbackErr } = await supabase
+          .from('resync_history')
+          .select('*')
+          .eq('user_id', user.id)
+          .order('confirmed_at', { ascending: false })
+          .limit(15);
+        if (fallbackErr) {
+          console.error('[useResyncNotifications] history error:', fallbackErr.message);
+        }
+        const v21Entries = (fallbackData ?? []).filter(
+          (row: any) => row.reported_state !== 'UTILITY_OFF',
+        ) as ResyncHistoryEntry[];
+        setHistory(v21Entries);
+        return;
+      }
+      console.error('[useResyncNotifications] history error:', error.message);
+    }
     // V2.1: filter out legacy OFF entries from history display.
     const v21Entries = (data ?? []).filter(
       (row: any) => row.reported_state !== 'UTILITY_OFF',
