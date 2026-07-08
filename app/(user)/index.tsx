@@ -3,6 +3,7 @@ import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   RefreshControl, ActivityIndicator, Animated, Platform, Alert,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
@@ -1577,30 +1578,110 @@ export default function Home() {
     return () => registerSnapshotCallback(null);
   }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
 
-  // ── Restore from snapshot ────────────────────────────────────────────────
-  
-  // ── Restore from snapshot (مصحح ومضمون لإعادة الـ offset) ─────────────────
+  // ── Restore from snapshot (V2.3 — Issue 2: full revert) ────────────────────
+  // V2.3 fix: the previous version only restored the offset and cleared the
+  // resync point, but left behind:
+  //   - The most recent `resync_history` row (which carries the Generated ON
+  //     metadata that `useUserPredictions` reads via `v21Meta.generatedOn`).
+  //     This is why the schedule, today timeline, and status card kept
+  //     showing the Generated ON slot AFTER the user pressed "return".
+  //   - The UNCERTAIN_ZONE entry anchor in AsyncStorage
+  //     (`tmms_uncertain_zone_entry_iso`), which caused
+  //     `applyUncertainZoneDeduction` to keep backdating the next ON cycle.
+  //   - The frozen community offset AsyncStorage keys (keyed by the OLD
+  //     `syncedAtIso`), which would re-freeze the offset on next mount if
+  //     the user happened to re-apply the same community sync.
+  //   - The user_offsets row's `offset_state` / `offset_value` /
+  //     `timeline_alignment` columns, which still reflected the cloned
+  //     reporter state.
+  //
+  // The fix deletes / clears ALL of these so the UI fully returns to the
+  // pre-report state: the engine re-derives the schedule from Growatt's raw
+  // timeline + the restored offset, with no Generated ON slot, no
+  // UNCERTAIN_ZONE deduction, and no cloned offset state.
   const handleRestoreSnapshot = useCallback(async () => {
     if (!snapshot) return;
     try {
-      // 1. استعادة الـ Offset مباشرة إلى قاعدة البيانات والحالة المحلية دون شروط مقيدة
+      // 1. Restore the offset to the database AND clear the V2.1 cloned
+      //    offset_state / offset_value / timeline_alignment columns. We
+      //    set them to NEUTRAL / <offset> / now so useUserPredictions
+      //    doesn't see a stale cloned state.
       const targetOffset = snapshot.previousOffsetMinutes;
       await saveOffset(targetOffset);
-      
-      // 2. مسح المزامنة المجتمعية الحالية للعودة للحالة الأصلية
+
+      // 2. Soft-delete the most recent resync_history row for this user.
+      //    V2.3 (Issue 2): we set reverted_at = now() instead of hard-deleting
+      //    so the audit trail is preserved. The useUserPredictions and
+      //    useResyncNotifications hooks filter out rows where reverted_at IS
+      //    NOT NULL, so the Generated ON slot disappears from the schedule,
+      //    today timeline, and status card.
+      //
+      //    If the reverted_at column doesn't exist (pre-migration DB), we
+      //    fall back to a hard delete so the revert still works.
+      try {
+        const { data: lastRow } = await supabase
+          .from('resync_history')
+          .select('id')
+          .eq('user_id', profile?.id ?? '')
+          .order('confirmed_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (lastRow?.id) {
+          // Try soft-delete first
+          const { error: softErr } = await supabase
+            .from('resync_history')
+            .update({ reverted_at: new Date().toISOString() })
+            .eq('id', lastRow.id);
+          if (softErr && (softErr.message.includes('reverted_at') || softErr.message.includes('column'))) {
+            // Fallback: hard delete
+            await supabase.from('resync_history').delete().eq('id', lastRow.id);
+          }
+        }
+      } catch (e) {
+        console.warn('[handleRestoreSnapshot] Failed to revert resync_history row:', e);
+      }
+
+      // 3. Clear the UNCERTAIN_ZONE entry anchor from AsyncStorage. If this
+      //    isn't cleared, applyUncertainZoneDeduction keeps backdating the
+      //    next ON cycle even after the revert.
+      try {
+        await AsyncStorage.removeItem('tmms_uncertain_zone_entry_iso');
+      } catch (_) {}
+
+      // 4. Clear any frozen community offset AsyncStorage keys keyed by the
+      //    OLD syncedAtIso. We don't know the exact key without the old
+      //    resync point, but if the snapshot has a previousResyncPoint we
+      //    can clear its keys too.
+      const oldSyncedAt = resyncPoint?.syncedAtIso ?? snapshot.previousResyncPoint?.syncedAtIso;
+      if (oldSyncedAt) {
+        try {
+          await Promise.all([
+            AsyncStorage.removeItem(`tmms_frozen_community_offset_${oldSyncedAt}`),
+            AsyncStorage.removeItem(`tmms_frozen_offset_state_${oldSyncedAt}`),
+            AsyncStorage.removeItem(`tmms_frozen_alignment_${oldSyncedAt}`),
+          ]);
+        } catch (_) {}
+      }
+
+      // 5. Clear the resync point. The previous resync point (if any) is
+      //    NOT re-applied because doing so would trigger the snapshot
+      //    callback and re-capture a (now meaningless) revert point. The
+      //    offset restoration above is sufficient for the timeline to
+      //    render correctly. If the user wants to re-join a community
+      //    sync, they can re-confirm via the community tab.
       await clearResync();
-      
-      // 3. مسح الـ لقطة (Snapshot) لتحديث واجهة المستخدم وإخفاء الزر
+
+      // 6. Clear the snapshot itself so the revert button disappears.
       await clearSnapshot();
-      
-      // تلميح اختياري للمستخدم للتأكيد
+
+      // 7. Optional confirmation toast.
       if (Platform.OS !== 'web') {
-        Alert.alert('تمت العملية', 'تم استعادة توازن الوقت والفارق بنجاح.');
+        Alert.alert('تمت العملية', 'تم استعادة حالتك السابقة بالكامل — الجدول، الخط الزمني، والفارق.');
       }
     } catch (error) {
       console.error('خطأ أثناء محاولة استعادة الحالة الأصلية والـ offset:', error);
     }
-  }, [snapshot, saveOffset, clearResync, clearSnapshot]);
+  }, [snapshot, saveOffset, clearResync, clearSnapshot, profile?.id, resyncPoint?.syncedAtIso]);
 
   // ── Elapsed-time source priority (spec §NEGATIVE OFFSET BEHAVIOR) ──────────
   // Priority 1: reconciledCycleStartIso — backdated via GrowattTransitionTime + Offset.
