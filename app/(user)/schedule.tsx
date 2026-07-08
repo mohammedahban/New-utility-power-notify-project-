@@ -448,9 +448,17 @@ export default function ScheduleScreen() {
   const atcMode = userPrediction?.atc?.mode;
   const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
 
+  // reconciledCycleStartIso: set when an UNCERTAIN_ZONE deduction backdates the ON cycle.
+  // When present, it MUST be the start-time anchor so the schedule shows the
+  // correct elapsed time (= wait duration) and remaining time (= predicted ON − wait).
+  const reconciledStartIso = (userPrediction as any)?.reconciledCycleStartIso as string | null ?? null;
+  const isReconciledFlip = !!reconciledStartIso && userPrediction?.atc?.mode === 'NORMAL' && userPrediction?.currentState === 'ON';
+
   // For POSITIVE_OFFSET_PENDING: use currentStateStartIso as the actual start
+  // For reconciledCycleStartIso (immediate ON flip): use the backdated start
   // For others: use anchor + offset or resync
   const mathematicalActiveStartIso = (() => {
+    if (isReconciledFlip) return reconciledStartIso;
     if (userPrediction?.isResynced && userPrediction.resyncedAtIso) {
       return userPrediction.resyncedAtIso;
     }
@@ -481,9 +489,29 @@ export default function ScheduleScreen() {
   const allSlots = userPrediction?.daySchedule ?? [];
   const nowMs = Date.now();
 
-  // For POSITIVE_OFFSET_PENDING: the synthetic slot (at index 0) is the active slot
+  // For POSITIVE_OFFSET_PENDING: the synthetic slot (at index 0) is the active slot.
+  // For isReconciledFlip: the first ON slot in the schedule whose startIso is
+  // closest to reconciledStartIso is the active slot (it may be at index 0 if
+  // useUserPredictions injected the synthetic slot there).
   const activeIdx = (() => {
     if (isPositiveOffsetPending && allSlots.length > 0) return 0;
+    if (isReconciledFlip && reconciledStartIso) {
+      // Find the ON slot that best represents the reconciledCycleStartIso anchor.
+      // The synthetic slot injected by useUserPredictions has startIso = reconciledStartIso,
+      // so an exact match is ideal. Fall back to the first active ON slot.
+      const reconMs = new Date(reconciledStartIso).getTime();
+      const exactIdx = allSlots.findIndex(
+        s => s.state === 'ON' && Math.abs(new Date(s.startIso).getTime() - reconMs) < 5 * 60_000,
+      );
+      if (exactIdx >= 0) return exactIdx;
+      // Fall back: the ON slot that is currently active (now is inside it)
+      return allSlots.findIndex(s => {
+        if (s.state !== 'ON') return false;
+        const start = new Date(s.startIso).getTime();
+        const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+        return nowMs >= start && nowMs < end;
+      });
+    }
     return allSlots.findIndex(s => {
       const start = new Date(s.startIso).getTime();
       const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
@@ -597,7 +625,8 @@ export default function ScheduleScreen() {
             const isActive = isPositiveOffsetPending ? i === 0 : (nowMs >= slotStartMs && nowMs < slotEndMs);
             const slotKey = `${slot.state}|${Math.round(slotStartMs / 60_000)}`;
 
-            // Active start: use mathematicalActiveStartIso for the active slot
+            // Active start: use mathematicalActiveStartIso for the active slot.
+            // For isReconciledFlip, this is reconciledCycleStartIso (the backdated start).
             let activeStartFormatted: string | undefined;
             if (isActive && mathematicalActiveStartIso) {
               activeStartFormatted = new Date(mathematicalActiveStartIso).toLocaleString('en-US', {
@@ -609,8 +638,9 @@ export default function ScheduleScreen() {
             if (!stableStartMapRef.current[slotKey] && currentFormatted) {
               stableStartMapRef.current[slotKey] = currentFormatted;
             }
-            // For active POSITIVE_OFFSET_PENDING slot always show fresh anchor time
-            const stableStart = (isActive && isPositiveOffsetPending && activeStartFormatted)
+            // For active POSITIVE_OFFSET_PENDING or reconciledFlip slot — always use the
+            // live anchor time so it doesn't drift or get stale from the ref cache.
+            const stableStart = (isActive && (isPositiveOffsetPending || isReconciledFlip) && activeStartFormatted)
               ? activeStartFormatted
               : (stableStartMapRef.current[slotKey] ?? currentFormatted);
 
