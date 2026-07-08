@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
-  View, Text, ScrollView, StyleSheet, Animated,
+  View, Text, ScrollView, StyleSheet, Animated, ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
