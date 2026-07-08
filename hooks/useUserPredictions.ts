@@ -101,6 +101,14 @@ export type UserPrediction = _EngineUserPrediction & {
 
 export const applyOffsetToPrediction = _applyOffsetToPrediction;
 
+// ── Accuracy write-guard ─────────────────────────────────────────────────
+// Persisted Set of already-logged (predictedEventTime|actualEventTime) pairs
+// at minute precision. Prevents the ~88% duplicate rows that occur when the
+// 30-second heartbeat tick causes useMemo to re-call handleAccuracyEvent
+// with the same event multiple times before utility_predictions refreshes.
+const ACCURACY_LOGGED_KEY = 'tmms_accuracy_logged_pairs';
+const ACCURACY_LOG_MAX_SIZE = 300; // cap to avoid unbounded AsyncStorage growth
+
 // ── Frozen community-offset cache keys ────────────────────────────────────
 function frozenOffsetStorageKey(syncedAtIso: string): string {
   return `tmms_frozen_community_offset_${syncedAtIso}`;
@@ -362,6 +370,25 @@ export function useUserPredictions(
     return () => clearInterval(id);
   }, []);
 
+  // ── Accuracy write-guard: in-memory + persisted Set ────────────────────
+  const loggedPairsRef = useRef<Set<string>>(new Set());
+  const loggedPairsLoadedRef = useRef(false);
+
+  // Load persisted pairs once on mount
+  useEffect(() => {
+    AsyncStorage.getItem(ACCURACY_LOGGED_KEY)
+      .then(raw => {
+        if (raw) {
+          try {
+            const arr: string[] = JSON.parse(raw);
+            loggedPairsRef.current = new Set(arr);
+          } catch { /* ignore corrupt data */ }
+        }
+        loggedPairsLoadedRef.current = true;
+      })
+      .catch(() => { loggedPairsLoadedRef.current = true; });
+  }, []);
+
   // ── Frozen community offset (Rule Q2-A) ──────────────────────────────────
   const frozenOffsetRef = useRef<number | null>(null);
   const frozenOffsetStateRef = useRef<OffsetState | null>(null);
@@ -511,20 +538,51 @@ export function useUserPredictions(
       };
 
       const handleAccuracyEvent = (event: AccuracyLogEvent) => {
+        // ── Write-guard: deduplicate using minute-precision composite key ──────
+        // Truncate both timestamps to the minute so that sub-second retiming
+        // differences between successive 30-second ticks don't produce a
+        // different key for the same logical event.
+        const predKey = event.predictedTransitionIso.slice(0, 16); // YYYY-MM-DDTHH:MM
+        const actKey  = event.actualTransitionIso.slice(0, 16);
+        const pairKey = `${predKey}|${actKey}`;
+
+        if (loggedPairsRef.current.has(pairKey)) {
+          // Already persisted — skip silently
+          return;
+        }
+
+        // Optimistically mark as logged BEFORE the async insert so that any
+        // re-render triggered by the insert response doesn't fire a second insert.
+        loggedPairsRef.current.add(pairKey);
+
+        // Persist the updated set (fire-and-forget, capped at MAX_SIZE)
+        const pairsArray = Array.from(loggedPairsRef.current);
+        const trimmed = pairsArray.length > ACCURACY_LOG_MAX_SIZE
+          ? pairsArray.slice(pairsArray.length - ACCURACY_LOG_MAX_SIZE)
+          : pairsArray;
+        if (trimmed.length !== pairsArray.length) {
+          loggedPairsRef.current = new Set(trimmed);
+        }
+        AsyncStorage.setItem(ACCURACY_LOGGED_KEY, JSON.stringify(trimmed)).catch(() => {});
+
         supabase
-          .from('accuracy_events')
+          .from('prediction_accuracy_logs')
           .insert({
-            predicted_transition_at: event.predictedTransitionIso,
-            actual_transition_at: event.actualTransitionIso,
-            target_state: event.targetState,
-            offset_minutes: event.offsetMinutes,
-            exit_mode: event.exitMode,
-            error_minutes: event.errorMinutes,
-            accuracy_score: event.accuracyScore,
+            predicted_event_time: event.predictedTransitionIso,
+            actual_event_time: event.actualTransitionIso,
+            predicted_state: event.targetState,
+            actual_state: event.targetState,
+            error_minutes: Math.round(Math.abs(event.errorMinutes) * 100) / 100,
+            accuracy_score: Math.round(Math.max(0, Math.min(100, event.accuracyScore)) * 100) / 100,
+            slot_id: `client_hook_${event.targetState === 'UTILITY_ON' ? 'ON' : 'OFF'}`,
             created_at: new Date().toISOString(),
           })
           .then(({ error }) => {
-            if (error) console.error('[useUserPredictions] accuracy event persist error:', error.message);
+            if (error) {
+              // Roll back the optimistic mark so it can be retried next cycle
+              loggedPairsRef.current.delete(pairKey);
+              console.error('[useUserPredictions] accuracy log insert error:', error.message);
+            }
           });
       };
 
