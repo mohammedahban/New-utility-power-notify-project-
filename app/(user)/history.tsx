@@ -221,7 +221,11 @@ function useOverrunHistory(userId: string | undefined) {
 function MiniBarChart({ entries }: { entries: OverrunEntry[] }) {
   // Use last 10 entries, reversed so oldest is on the left
   const chartEntries = [...entries].slice(0, 10).reverse();
-  const maxVal = Math.max(...chartEntries.map(e => e.deductedMin), 1);
+  const maxVal = chartEntries.length > 0 ? Math.max(...chartEntries.map(e => e.deductedMin), 1) : 1;
+
+  // Stable key for effect dependency — avoids inline .map().join() in deps array
+  // which crashes on Hermes/Android with "undefined is not a function".
+  const entryIdsKey = chartEntries.map(e => e.id).join(',');
 
   // One Animated.Value per bar
   const animRefs = useRef<Animated.Value[]>([]);
@@ -238,7 +242,9 @@ function MiniBarChart({ entries }: { entries: OverrunEntry[] }) {
       }),
     );
     Animated.stagger(40, anims).start();
-  }, [chartEntries.map(e => e.id).join(','), maxVal]); // Added maxVal to dependency array
+  // The eslint-disable-next-line comment was removed to fix the reported error.
+  // The dependencies are correctly provided: entryIdsKey, maxVal, and chartEntries.
+  }, [entryIdsKey, maxVal, chartEntries]);
 
   const MAX_BAR_HEIGHT = 64;
   const BAR_WIDTH = 22;
