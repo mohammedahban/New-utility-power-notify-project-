@@ -326,6 +326,14 @@ function applyUncertainZoneDeduction(
   if (entryMs >= oldStartMs) return pred;                       // nothing exceeded
   if (oldStartMs - entryMs > UNCERTAIN_DEDUCTION_CAP_MS) return pred; // stale anchor
 
+  // V2.3 (Issue 1A): the wait time (oldStartMs − entryMs) is DEDUCTED from
+  // the predicted ON duration. The ON cycle:
+  //   - STARTS at `entryMs` (the moment the predicted OFF ended — this is
+  //     the moment the user's "since" timer shows, including the wait)
+  //   - ENDS at `entryMs + predictedOnDuration` (so the remaining time
+  //     after Growatt turns ON is `predictedOnDuration − wait`)
+  //   - The ON state ends AUTOMATICALLY when the remaining budget is
+  //     consumed — no manual transition is needed.
   const spanMs = oldEndMs - oldStartMs; // predicted ON duration (preserved)
   const newStartMs = entryMs;
   const newEndMs = newStartMs + spanMs;
@@ -349,7 +357,10 @@ function applyUncertainZoneDeduction(
   });
 
   // Re-derive the current state from the adjusted slots — the deducted ON
-  // may already be over when the wait consumed most of its budget.
+  // may already be over when the wait consumed most of its budget. In that
+  // case the user has already transitioned to the next OFF state
+  // automatically (the engine's slot-finder will pick the OFF slot that
+  // follows the deducted ON).
   const active = newSlots.find(s => {
     const st = new Date(s.startIso).getTime();
     const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
@@ -493,6 +504,13 @@ export function useUserPredictions(
       frozenOffsetRef.current = null;
       frozenOffsetStateRef.current = null;
       frozenAlignmentRef.current = null;
+      // V2.3 (Issue 2): also clear the UNCERTAIN_ZONE entry anchor when the
+      // resync point is cleared. This happens when the user presses "return
+      // to previous state" — without this, the backdated ON cycle from the
+      // reverted report would persist and the schedule / today timeline
+      // would keep showing the deducted ON slot.
+      uncertainEntryRef.current = null;
+      AsyncStorage.removeItem(UNCERTAIN_ZONE_ENTRY_KEY).catch(() => {});
       setFrozenOffsetLoaded(true);
       return;
     }
@@ -523,6 +541,9 @@ export function useUserPredictions(
   // ── V2.1: Read Generated ON + Offset State from resync_history ──────────
   // The user's "current" Generated ON + Offset State lives in the most
   // recent resync_history row. We poll it alongside the 30s tick.
+  // V2.3 (Issue 2): exclude reverted rows (reverted_at IS NOT NULL) so the
+  // Generated ON slot disappears from the schedule / today timeline after
+  // the user presses "return to previous state".
   const [v21Meta, setV21Meta] = useState<{
     offsetState: OffsetState | null;
     offsetValue: OffsetValue | null;
@@ -534,13 +555,38 @@ export function useUserPredictions(
     let cancelled = false;
     (async () => {
       try {
-        const { data } = await supabase
+        // V2.3: try with the reverted_at filter first. If the column
+        // doesn't exist (pre-migration), retry without it.
+        const { data: primaryData, error: primaryError } = await supabase
           .from('resync_history')
-          .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind')
+          .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind, reverted_at')
           .order('confirmed_at', { ascending: false })
           .limit(1)
           .maybeSingle();
-        if (cancelled || !data) return;
+        let data: any = primaryData;
+        let error = primaryError;
+        if (error && (error.message.includes('reverted_at') || error.message.includes('column'))) {
+          // Fallback: query without the reverted_at column
+          const fallback = await supabase
+            .from('resync_history')
+            .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind')
+            .order('confirmed_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          data = fallback.data;
+          error = fallback.error;
+        }
+        if (cancelled || error || !data) return;
+        // V2.3: skip reverted rows
+        if (data.reverted_at) {
+          setV21Meta({
+            offsetState: null,
+            offsetValue: null,
+            timelineAlignment: null,
+            generatedOn: null,
+          });
+          return;
+        }
         let genOn: GeneratedOnInfo | null = null;
         if (data.generated_on_start_iso && data.generated_on_duration_min) {
           genOn = {
@@ -696,14 +742,24 @@ export function useUserPredictions(
         isGeneratedOnCurrent,
       };
 
-      // ── V2.2 layer (#4): UNCERTAIN_ZONE exceeded-time accounting ────────
+      // ── V2.3 (Issue 1A): UNCERTAIN_ZONE exceeded-time accounting ──────────
       // 1. Record when the user's predicted OFF ended (entry into the
       //    UNCERTAIN family). The anchor survives restarts (AsyncStorage).
       // 2. When Growatt confirms ON, backdate the new ON cycle to that
       //    anchor and deduct the exceeded wait from the predicted ON
       //    duration: "منذ" = exceeded time, remaining = predicted − exceeded.
+      //    The ON state ends automatically after the remaining predicted ON
+      //    duration completes — no manual intervention needed.
       // 3. Clear the anchor when superseded by a community sync, when the
       //    cycle completes (back to a normal OFF), or when stale.
+      //
+      // V2.3 fix: the deduction trigger previously required
+      // `prediction.currentState === 'ON'` (the RAW server prediction's
+      // current state). When Growatt just flipped ON, the server prediction
+      // could lag by up to 30 seconds, leaving the deduction stuck. Now we
+      // trigger off `v21Result.currentState === 'ON'` — the engine's
+      // post-offset current state — which flips the moment the active ON
+      // slot is detected in the shifted schedule.
       const nowV22 = Date.now();
       const modeV22 = v21Result.atc.mode;
       const inUncertainFamily =
@@ -711,6 +767,10 @@ export function useUserPredictions(
         (modeV22 === 'UNCERTAIN_ZONE' || modeV22 === 'GRACE_MODE' || modeV22 === 'WAITING_FOR_GROWATT');
 
       if (inUncertainFamily && !uncertainEntryRef.current) {
+        // V2.3: anchor the entry at the moment the predicted OFF slot
+        // ENDED — i.e., nowMs minus the overrun. This is the exact moment
+        // the user entered UNCERTAIN_ZONE, and it becomes the backdated
+        // start of the next ON cycle when Growatt confirms.
         const entryIso = new Date(
           nowV22 - Math.max(0, v21Result.atc.overrunMinutes) * 60_000,
         ).toISOString();
@@ -724,16 +784,23 @@ export function useUserPredictions(
         const isStale = !Number.isFinite(entryAgeMs) || entryAgeMs >= 12 * 3600_000;
         if (
           !isStale &&
-          prediction.currentState === 'ON' &&
           v21Result.currentState === 'ON' &&
           modeV22 !== 'COMMUNITY_SYNCED'
         ) {
+          // V2.3 (Issue 1A): Growatt has flipped ON (or the active slot is
+          // now ON). Backdate the ON cycle to the UNCERTAIN_ZONE entry so
+          // the elapsed timer shows the wait time, and the ON ends after
+          // the remaining (predicted ON duration − wait).
           finalResult = applyUncertainZoneDeduction(v21Result, uncertainEntryRef.current, nowV22);
         } else if (
           isStale ||
           modeV22 === 'COMMUNITY_SYNCED' ||
-          (!inUncertainFamily && v21Result.currentState === 'OFF')
+          (!inUncertainFamily && v21Result.currentState === 'OFF' &&
+            // V2.3: only clear if we're in a NORMAL OFF (post-ON-cycle),
+            // NOT while still in any held-state mode that might re-trigger.
+            modeV22 === 'NORMAL')
         ) {
+          // The ON cycle has completed normally — clear the anchor.
           uncertainEntryRef.current = null;
           AsyncStorage.removeItem(UNCERTAIN_ZONE_ENTRY_KEY).catch(() => {});
         }
