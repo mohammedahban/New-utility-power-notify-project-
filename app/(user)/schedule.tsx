@@ -650,17 +650,36 @@ export default function ScheduleScreen() {
             }
             const stableEnd = stableEndMapRef.current[slotKey] ?? currentEndFormatted;
 
+            // Deduction row: shown below the active ON slot when the immediate-ON
+            // flip is active (reconciledCycleStartIso set, NORMAL mode, state ON).
+            // Tells the user exactly how many minutes of wait time were deducted
+            // from the current ON cycle so they understand why remaining time is shorter.
+            const deductMinutes = isActive && isReconciledFlip && slot.state === 'ON'
+              ? Math.abs(currentOffset)
+              : 0;
+
             return (
-              <ScheduleBlock
-                key={i} slot={slot} index={i}
-                resyncEvents={resyncHistory}
-                isActive={isActive}
-                atcMode={atcMode}
-                isHolding={userPrediction?.isHoldingState}
-                stableStartFormatted={stableStart}
-                stableEndFormatted={stableEnd}
-                isPendingNegative={(userPrediction as any)?.isPendingNegative ?? false}
-              />
+              <React.Fragment key={i}>
+                <ScheduleBlock
+                  slot={slot} index={i}
+                  resyncEvents={resyncHistory}
+                  isActive={isActive}
+                  atcMode={atcMode}
+                  isHolding={userPrediction?.isHoldingState}
+                  stableStartFormatted={stableStart}
+                  stableEndFormatted={stableEnd}
+                  isPendingNegative={(userPrediction as any)?.isPendingNegative ?? false}
+                />
+                {deductMinutes > 0 && (
+                  <View style={styles.deductionRow}>
+                    <Text style={styles.deductionText}>
+                      {'⏱ خُصم من هذه الدورة: '}
+                      <Text style={styles.deductionBold}>{deductMinutes} دقيقة</Text>
+                      {' انتظار — سيُخصم من مدة التشغيل القادمة'}
+                    </Text>
+                  </View>
+                )}
+              </React.Fragment>
             );
           })}
           <View style={styles.endDot} />
@@ -757,4 +776,10 @@ const styles = StyleSheet.create({
   statText: { color: T.textSecondary, fontSize: 13 },
   statSlash: { color: T.border, fontSize: 14, fontWeight: '300' },
   statLabel: { color: T.textMuted, fontSize: 11, marginRight: 2 },
+  deductionRow: {
+    backgroundColor: '#1a0e00', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 14,
+    marginBottom: 8, marginLeft: 32, borderWidth: 1, borderColor: '#f59e0b66',
+  },
+  deductionText: { color: '#f59e0b', fontSize: 12, fontWeight: '600', textAlign: 'right', lineHeight: 20 },
+  deductionBold: { fontWeight: '900' },
 });

@@ -141,6 +141,43 @@ const gtStyles = StyleSheet.create({
   text: { color: T.success, fontSize: 14, fontWeight: '800', textAlign: 'center' },
 });
 
+// ── Live overrun seconds clock ──────────────────────────────────────────────
+// Ticks every second to show exact HH:MM:SS elapsed since the predicted OFF
+// ended. Anchors the entry timestamp from `overrunMinutes` on first render
+// (when uncertain state begins) so subsequent 30s heartbeat re-derivations
+// of overrunMinutes don't reset or drift the clock.
+function useOverrunLiveClock(overrunMinutes: number, isUncertain: boolean): string {
+  const entryMsRef = useRef<number | null>(null);
+  const [display, setDisplay] = useState('00:00:00');
+  useEffect(() => {
+    if (!isUncertain || overrunMinutes <= 0) {
+      entryMsRef.current = null;
+      setDisplay('00:00:00');
+      return;
+    }
+    // Anchor on first activation — derive from overrunMinutes once
+    if (entryMsRef.current === null) {
+      entryMsRef.current = Date.now() - overrunMinutes * 60_000;
+    }
+    const update = () => {
+      const elapsed = Math.max(0, Date.now() - entryMsRef.current!);
+      const totalSec = Math.floor(elapsed / 1000);
+      const h = Math.floor(totalSec / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      setDisplay(
+        `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`,
+      );
+    };
+    update();
+    const id = setInterval(update, 1000);
+    return () => clearInterval(id);
+  // Only re-anchor when the uncertain state flips or overrunMinutes crosses zero
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isUncertain, overrunMinutes > 0]);
+  return display;
+}
+
 // ── Countdown hook ────────────────────────────────────────────────────────────
 function useCountdownSec(targetMinutes: number | null) {
   const [tick, setTick] = useState(0);
@@ -454,6 +491,10 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     if (Platform.OS === 'web') { setRevertConfirmVisible(true); } else { onRevertToGrowatt?.(); }
   }, [onRevertToGrowatt]);
 
+  const isUncertain = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT';
+  const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
+  const overrunLiveClock = useOverrunLiveClock(overrunMin, isUncertain);
+
   const animColor = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     Animated.loop(Animated.sequence([
@@ -538,7 +579,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const icon = isOn ? '⚡' : '🔴';
   const statusText = isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية';
   const showATCBadge = atcMode !== 'NORMAL';
-  const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
   const tMode = prediction?.atc?.transitionMode ?? 'AUTO';
 
   return (
@@ -575,10 +615,15 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
               <View style={psStyles.exceededBadge}>
                 <View style={psStyles.exceededRow}>
                   <Text style={psStyles.exceededIcon}>⏱</Text>
-                  <View>
+                  <View style={{ flex: 1 }}>
                     <Text style={psStyles.exceededLabel}>تجاوز المدة المتوقعة</Text>
                     <Text style={psStyles.exceededValue}>{fmtOverrunAr(overrunMin)}</Text>
                   </View>
+                </View>
+                {/* Live HH:MM:SS ticking clock — updates every second */}
+                <View style={psStyles.liveClockRow}>
+                  <Text style={psStyles.liveClockLabel}>وقت الانتظار الفعلي</Text>
+                  <Text style={psStyles.liveClockValue}>{overrunLiveClock}</Text>
                 </View>
                 <Text style={psStyles.deductionNote}>سيُخصم من مدة التشغيل القادمة</Text>
               </View>
@@ -634,10 +679,13 @@ const psStyles = StyleSheet.create({
   atcBodyLine: { fontSize: 11, textAlign: 'right', marginBottom: 4, lineHeight: 16 },
   atcSubLine: { color: T.accent, fontSize: 11, textAlign: 'right' },
   exceededBadge: { backgroundColor: '#2d1a00', borderRadius: 10, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: T.warning + '66' },
-  exceededRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 5 },
-  exceededIcon: { fontSize: 22 },
+  exceededRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 8 },
+  exceededIcon: { fontSize: 22, flexShrink: 0 },
   exceededLabel: { color: T.warning, fontSize: 10, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
   exceededValue: { color: T.warning, fontSize: 20, fontWeight: '900', textAlign: 'right' },
+  liveClockRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1a0a00', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8 },
+  liveClockLabel: { color: T.warning + '99', fontSize: 10, fontWeight: '600' },
+  liveClockValue: { color: T.warning, fontSize: 22, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 2 },
   deductionNote: { color: T.warning + 'cc', fontSize: 11, fontWeight: '600', textAlign: 'right', fontStyle: 'italic' },
   reasoningBox: { backgroundColor: T.elevated, borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.border },
   reasoningText: { color: T.textMuted, fontSize: 11, lineHeight: 17, textAlign: 'right' },
