@@ -247,6 +247,14 @@ export default function UserLayout() {
           }}
         />
         <Tabs.Screen
+          name="history"
+          options={{
+            title: 'السجل',
+            headerTitle: 'السجل',
+            tabBarIcon: ({ color, size }) => <Ionicons name="time-outline" size={size} color={color} />,
+          }}
+        />
+        <Tabs.Screen
           name="settings"
           options={{
             title: 'إعداداتي',

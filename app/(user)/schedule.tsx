@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
-  View, Text, ScrollView, StyleSheet, ActivityIndicator, Animated,
+  View, Text, ScrollView, StyleSheet, Animated,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
@@ -212,143 +212,6 @@ const sbStyles = StyleSheet.create({
   resyncInfoText: { color: '#38bdf8', fontSize: 11, lineHeight: 16, textAlign: 'right' },
   atcBadge: { borderRadius: 8, paddingHorizontal: 9, paddingVertical: 4, borderWidth: 1, marginTop: 2 },
   atcBadgeText: { fontSize: 10, fontWeight: '700' },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POWER EVENTS HISTORY — with duration badges
-// Shows past real power transition events from power_events table.
-// The "مدة" badge on each event shows how long the PREVIOUS state lasted
-// (= time from this event back to the one before it).
-// ─────────────────────────────────────────────────────────────────────────────
-interface PowerEvent {
-  id: number;
-  event_type: 'UTILITY_ON' | 'UTILITY_OFF';
-  occurred_at: string;
-  durationLabel?: string;
-}
-
-function usePowerEventsHistory(limit = 20) {
-  const [events, setEvents] = useState<PowerEvent[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    supabase
-      .from('power_events')
-      .select('id, event_type, occurred_at')
-      .order('occurred_at', { ascending: false })
-      .limit(limit + 1)
-      .then(({ data }) => {
-        if (cancelled || !data) return;
-        const withDuration: PowerEvent[] = data.slice(0, limit).map((ev: any, i: number) => {
-          // data is sorted newest-first.
-          // data[i-1] is the event that occurred AFTER ev (more recent),
-          // meaning it marks when THIS state ended — so the duration is:
-          //   data[i-1].occurred_at − ev.occurred_at
-          // This shows "how long did THIS state last" on the badge.
-          const endEv = data[i - 1];
-          let durationLabel: string | undefined;
-          if (endEv) {
-            const endMs  = new Date(endEv.occurred_at).getTime();
-            const startMs = new Date(ev.occurred_at).getTime();
-            const durMin = Math.round(Math.abs(endMs - startMs) / 60_000);
-            const h = Math.floor(durMin / 60);
-            const m = durMin % 60;
-            if (h === 0) durationLabel = `${m} دقيقة`;
-            else if (m === 0) durationLabel = h === 1 ? 'ساعة' : h === 2 ? 'ساعتان' : `${h} ساعات`;
-            else durationLabel = `${h}س ${m}د`;
-          }
-          return { ...ev, durationLabel };
-        });
-        setEvents(withDuration);
-        setLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [limit]);
-
-  return { events, loading };
-}
-
-function fmtEventTime(iso: string): string {
-  return new Date(iso).toLocaleString('en-US', {
-    timeZone: 'Asia/Aden',
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  }).replace('AM', ' ص').replace('PM', ' م');
-}
-
-function EventsHistorySection() {
-  const { events, loading } = usePowerEventsHistory(20);
-
-  return (
-    <View style={ehStyles.container}>
-      <Text style={ehStyles.sectionTitle}>📋 سجل الأحداث الفعلية</Text>
-      <Text style={ehStyles.sectionSub}>الأحداث الحقيقية المسجَّلة من الحساس الرئيسي</Text>
-
-      {loading ? (
-        <ActivityIndicator color={T.accent} size="small" style={{ marginVertical: 16 }} />
-      ) : events.length === 0 ? (
-        <Text style={ehStyles.emptyText}>لا توجد أحداث مسجَّلة بعد</Text>
-      ) : (
-        events.map((ev, i) => {
-          const isOn = ev.event_type === 'UTILITY_ON';
-          const color = isOn ? T.success : T.danger;
-          const icon  = isOn ? '⚡' : '🔴';
-          const label = isOn ? 'اشتغلت الكهرباء' : 'طفت الكهرباء';
-          return (
-            <View key={ev.id} style={[ehStyles.row, i < events.length - 1 && ehStyles.rowBorder]}>
-              {/* Duration badge */}
-              <View style={ehStyles.badgeCol}>
-                {ev.durationLabel ? (
-                  <View style={[ehStyles.durBadge, { borderColor: color + '44', backgroundColor: color + '10' }]}>
-                    <Text style={[ehStyles.durBadgeText, { color }]}>{ev.durationLabel}</Text>
-                    <Text style={ehStyles.durBadgeSub}>مدة</Text>
-                  </View>
-                ) : (
-                  <View style={[ehStyles.durBadge, { borderColor: T.border, backgroundColor: T.elevated }]}>
-                    <Text style={[ehStyles.durBadgeText, { color: T.textMuted }]}>—</Text>
-                  </View>
-                )}
-              </View>
-
-              {/* Event info */}
-              <View style={ehStyles.details}>
-                <Text style={[ehStyles.eventLabel, { color }]}>{icon} {label}</Text>
-                <Text style={ehStyles.eventTime}>{fmtEventTime(ev.occurred_at)}</Text>
-              </View>
-
-              {/* Color stripe */}
-              <View style={[ehStyles.colorBar, { backgroundColor: color }]} />
-            </View>
-          );
-        })
-      )}
-    </View>
-  );
-}
-
-const ehStyles = StyleSheet.create({
-  container: {
-    backgroundColor: T.surface, borderRadius: 20, padding: 18,
-    marginTop: 8, marginBottom: 16, borderWidth: 1, borderColor: T.border,
-  },
-  sectionTitle: { color: T.textPrimary, fontSize: 14, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  sectionSub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginBottom: 16, letterSpacing: 0.3 },
-  emptyText: { color: T.textMuted, fontSize: 12, textAlign: 'center', paddingVertical: 16 },
-  row: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, paddingVertical: 12 },
-  rowBorder: { borderBottomWidth: 1, borderBottomColor: T.elevated },
-  colorBar: { width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 36, flexShrink: 0 },
-  details: { flex: 1 },
-  eventLabel: { fontSize: 14, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  eventTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
-  badgeCol: { alignItems: 'center', width: 64, flexShrink: 0 },
-  durBadge: { borderRadius: 10, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, alignItems: 'center', minWidth: 58 },
-  durBadgeText: { fontSize: 13, fontWeight: '800', textAlign: 'center' },
-  durBadgeSub: { color: T.textMuted, fontSize: 8, fontWeight: '600', marginTop: 2, letterSpacing: 1 },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -725,9 +588,6 @@ export default function ScheduleScreen() {
           </View>
         );
       })()}
-
-      {/* ── Power Events History ── */}
-      <EventsHistorySection />
 
       {userPrediction?.computedAt && (
         <Text style={styles.computedAt}>
