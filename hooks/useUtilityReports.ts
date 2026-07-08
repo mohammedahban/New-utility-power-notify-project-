@@ -106,10 +106,23 @@ const TIME_OFFSETS_MIN: Record<TimeOption, number> = {
   '6h': 360,
 };
 
-const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const COOLDOWN_MS = 0; // V2.3 (Issue 3): cooldown removed — users can submit reports back-to-back.
+//                  The previous 30-minute cooldown was a UX throttle, not a
+//                  correctness safeguard. Removing it eliminates the "allow
+//                  period after every new submitted report" the user
+//                  complained about in Issue 3. The database RLS policy
+//                  (see supabase/migrations/20260708000000_drop_report_cooldown.sql)
+//                  has been updated to match — no 20-minute throttle either.
 const LAST_REPORT_KEY = 'utility_report_last_submitted_at';
 
-// ── V2.2: Schedule slot interface ──────────────────────────────────────────
+// ── V2.3 (Issue 1C): Schedule slot interface ──────────────────────────────
+// V2.3: the schedule helpers now use ABSOLUTE MILLISECOND timestamps
+// instead of minutes-of-day. The previous minutes-of-day approach broke
+// across midnight (e.g. an ON slot that started at 22:00 yesterday and a
+// report submitted at 11:15 today produced offset = 675 − 1320 = −645
+// minutes instead of +795 minutes), and it also confused "previous ON"
+// vs "next ON" lookups when slots wrapped midnight. Absolute ms makes the
+// math unambiguous and matches the engine's ISO-based math exactly.
 interface ScheduleSlot {
   state: 'ON' | 'OFF';
   start: string;  // ISO timestamp or 'HH:MM'
@@ -117,158 +130,183 @@ interface ScheduleSlot {
   durationMin: number;
 }
 
-// ── V2.2: Time helpers ─────────────────────────────────────────────────────
-function timeToMin(hhmm: string): number {
-  if (typeof hhmm !== 'string') return hhmm;
-  // Handle both 'HH:MM' and ISO timestamps
-  if (hhmm.includes('T')) {
-    const d = new Date(hhmm);
-    return d.getHours() * 60 + d.getMinutes();
+// ── V2.3: Time helpers (absolute ms based) ──────────────────────────────────
+// Convert any slot start/end value to an absolute epoch-ms timestamp.
+// - ISO strings (the modern format from utility_predictions) parse directly.
+// - 'HH:MM' strings (legacy) are interpreted as TODAY at that time; if the
+//   resulting timestamp is more than 12h in the future, we roll it back a
+//   day so a slot that ends e.g. at 02:00 is correctly placed in the past.
+function toMs(value: string | number, nowMs: number = Date.now()): number | null {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return null;
+  if (value.includes('T')) {
+    const ms = new Date(value).getTime();
+    return Number.isFinite(ms) ? ms : null;
   }
-  const [h, m] = hhmm.split(':').map(Number);
-  return h * 60 + m;
+  // 'HH:MM' legacy format
+  const m = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const today = new Date(nowMs);
+  today.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+  let ms = today.getTime();
+  // If the slot time is > 12h in the future, assume it actually belongs to yesterday
+  if (ms - nowMs > 12 * 3600_000) ms -= 24 * 3600_000;
+  return ms;
+}
+
+// Backwards-compat: keep timeToMin for any code that still uses it, but it
+// now delegates to toMs and returns minutes-since-epoch (number, can be huge).
+// Callers that compare two values returned by timeToMin still get correct
+// ordering because both are on the same absolute scale.
+function timeToMin(hhmm: string): number {
+  const ms = toMs(hhmm);
+  if (ms === null) return NaN;
+  return ms / 60_000;
 }
 
 function minToTime(min: number): string {
-  min = ((min % 1440) + 1440) % 1440;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  // V2.3: `min` is now absolute minutes since epoch — convert to ISO and
+  // format as HH:MM in Asia/Aden for display.
+  try {
+    const d = new Date(min * 60_000);
+    return d.toLocaleTimeString('en-GB', {
+      timeZone: 'Asia/Aden', hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+  } catch {
+    const m = ((min % 1440) + 1440) % 1440;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  }
 }
 
-// ── V2.2: Find the current Growatt OFF slot ────────────────────────────────
-function findCurrentOffSlot(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
+// ── V2.3: Find the current Growatt OFF slot (absolute ms) ────────────────
+function findCurrentOffSlot(schedule: ScheduleSlot[], tMs: number): ScheduleSlot | null {
   for (const slot of schedule) {
     if (slot.state !== 'OFF') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    if (start < end) {
-      if (t >= start && t < end) return slot;
-    } else {
-      // wraps midnight
-      if (t >= start || t < end) return slot;
-    }
+    const start = toMs(slot.start, tMs);
+    const end = toMs(slot.end, tMs);
+    if (start === null || end === null) continue;
+    if (tMs >= start && tMs < end) return slot;
   }
   return null;
 }
 
-// ── V2.2: Find the current Growatt ON slot ─────────────────────────────────
-function findCurrentOnSlot(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
+// ── V2.3: Find the current Growatt ON slot (absolute ms) ───────────────────
+function findCurrentOnSlot(schedule: ScheduleSlot[], tMs: number): ScheduleSlot | null {
   for (const slot of schedule) {
     if (slot.state !== 'ON') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    if (start < end) {
-      if (t >= start && t < end) return slot;
-    } else {
-      if (t >= start || t < end) return slot;
-    }
+    const start = toMs(slot.start, tMs);
+    const end = toMs(slot.end, tMs);
+    if (start === null || end === null) continue;
+    if (tMs >= start && tMs < end) return slot;
   }
   return null;
 }
 
-// ── V2.2: Find the previous Growatt ON (most recently ended) ───────────────
-function findPreviousGrowattOn(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
+// ── V2.3: Find the previous Growatt ON (most recently ended) (absolute ms) ──
+// V2.3 fix: the previous minutes-of-day version picked the wrong slot when
+// ON slots crossed midnight (e.g. yesterday's 22:00-23:00 ON would beat
+// today's 06:00-07:00 ON because 1380 > 420). Using absolute ms makes the
+// "most recently ended" comparison unambiguous.
+function findPreviousGrowattOn(schedule: ScheduleSlot[], tMs: number): ScheduleSlot | null {
   let prev: ScheduleSlot | null = null;
-  let prevEndMin = -1;
+  let prevEndMs = -Infinity;
   for (const slot of schedule) {
     if (slot.state !== 'ON') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    let hasEnded: boolean;
-    let endedAt: number;
-    if (end > start) {
-      hasEnded = end <= t;
-      endedAt = end;
-    } else {
-      // Wraps midnight
-      const isActive = t >= start || t < end;
-      hasEnded = !isActive;
-      endedAt = end;
-    }
-    if (hasEnded && endedAt > prevEndMin) {
+    const start = toMs(slot.start, tMs);
+    const end = toMs(slot.end, tMs);
+    if (start === null || end === null) continue;
+    // Has ended before tMs
+    if (end <= tMs && end > prevEndMs) {
       prev = slot;
-      prevEndMin = endedAt;
+      prevEndMs = end;
     }
   }
   return prev;
 }
 
-// ── V2.2: Find the next Growatt ON (upcoming) ──────────────────────────────
-function findNextGrowattOn(schedule: ScheduleSlot[], t: number): ScheduleSlot | null {
+// ── V2.3: Find the next Growatt ON (upcoming) (absolute ms) ──────────────────
+function findNextGrowattOn(schedule: ScheduleSlot[], tMs: number): ScheduleSlot | null {
   let next: ScheduleSlot | null = null;
-  let nextStartMin = Infinity;
-
-  // First pass: look for ON slots that start after t
+  let nextStartMs = Infinity;
   for (const slot of schedule) {
     if (slot.state !== 'ON') continue;
-    const start = timeToMin(slot.start);
-    const end = timeToMin(slot.end);
-    let startsAfter: boolean;
-    if (end > start) {
-      startsAfter = start > t;
-    } else {
-      const isActive = t >= start || t < end;
-      startsAfter = !isActive;
-    }
-    if (startsAfter && start < nextStartMin) {
+    const start = toMs(slot.start, tMs);
+    const end = toMs(slot.end, tMs);
+    if (start === null || end === null) continue;
+    // Not currently active and starts after tMs
+    const isActive = tMs >= start && tMs < end;
+    if (!isActive && start > tMs && start < nextStartMs) {
       next = slot;
-      nextStartMin = start;
+      nextStartMs = start;
     }
   }
-
-  // If no ON found after t, wrap around (tomorrow's earliest ON)
+  // If no future ON found, pick the earliest ON slot in the schedule
+  // (will be yesterday's ON in absolute ms terms — caller should handle).
   if (!next) {
     for (const slot of schedule) {
       if (slot.state !== 'ON') continue;
-      const start = timeToMin(slot.start);
-      if (start < nextStartMin) {
+      const start = toMs(slot.start, tMs);
+      if (start === null) continue;
+      if (start < nextStartMs) {
         next = slot;
-        nextStartMin = start;
+        nextStartMs = start;
       }
     }
   }
-
   return next;
 }
 
-// ── V2.2: Calculate OFF Progress ───────────────────────────────────────────
+// ── V2.3: Calculate OFF Progress (absolute ms) ──────────────────────────────
 // Formula: OFF Progress = (Elapsed OFF Time / Expected OFF Duration) x 100
-function calculateOffProgress(offSlot: ScheduleSlot, t: number) {
-  const start = timeToMin(offSlot.start);
-  const end = timeToMin(offSlot.end);
-  const expectedDuration = end > start ? end - start : (1440 - start) + end;
-  let elapsed: number;
-  if (end > start) {
-    elapsed = t >= start && t < end ? t - start : 0;
-  } else {
-    if (t >= start) elapsed = t - start;
-    else if (t < end) elapsed = (1440 - start) + t;
-    else elapsed = 0;
+function calculateOffProgress(offSlot: ScheduleSlot, tMs: number) {
+  const start = toMs(offSlot.start, tMs);
+  const end = toMs(offSlot.end, tMs);
+  if (start === null || end === null) {
+    return { elapsed: 0, expectedDuration: 0, progress: 0, isLessThan50: true, isGreaterThan50: false };
   }
+  const expectedDuration = Math.max(1, (end - start) / 60_000);
+  const elapsed = Math.max(0, Math.min(expectedDuration, (tMs - start) / 60_000));
+  const progress = (elapsed / expectedDuration) * 100;
   return {
     elapsed,
     expectedDuration,
-    progress: expectedDuration > 0 ? (elapsed / expectedDuration) * 100 : 0,
-    isLessThan50: (elapsed / expectedDuration) * 100 < 50,
-    isGreaterThan50: (elapsed / expectedDuration) * 100 >= 50,
+    progress,
+    isLessThan50: progress < 50,
+    isGreaterThan50: progress >= 50,
   };
 }
 
-// ── V2.2: Calculate Reporter Offset (Period 1 / Period 2 / Period 3) ───────
+// ── V2.3 (Issue 1C): Calculate Reporter Offset ───────────────────────────────
 //
-// This is the CORE V2.2 function implementing the Personal Timeline
-// Replacement Model period rules.
+// V2.3 changes:
+//   - The function now takes an ABSOLUTE MS timestamp instead of
+//     minutes-of-day. This fixes Issue 1C: the previous minutes-of-day
+//     math produced wrong offset signs whenever a Growatt ON slot
+//     wrapped midnight.
+//   - For Period 1 (<50% OFF), the offset is calculated from the START
+//     time of the previous Growatt ON slot (which is the Growatt ON
+//     STATE START TIME — exactly what the user requested in Issue 1C).
+//     Previously, the math happened to compute the same value when the
+//     ON slot didn't cross midnight, but produced nonsense otherwise.
+//   - `timelineAlignment` is now returned as an ISO timestamp string
+//     (the START of the reference Growatt ON). The engine and Home
+//     Screen already accept ISO strings for this field, so no downstream
+//     changes are needed.
 //
 // Period 1 = During Growatt ON (after start) + first half of following OFF
 //   → POSITIVE offset (or NEUTRAL if exactly at ON start = Period 3)
 //   → Generated ON replaces the current/previous Growatt ON
 //   → Full duration of replaced ON
+//   → Offset Value = GeneratedONstart - ReplacedONstart   (Issue 1C)
 //
 // Period 2 = Second half of OFF (>50%) through before next ON starts
 //   → PENDING_NEGATIVE (numeric value unknown until Growatt ON starts)
 //   → Generated ON replaces the NEXT upcoming Growatt ON
 //   → Full duration of next ON
+//   → Offset auto-resolves to NEGATIVE when Growatt ON begins:
+//     offsetValue = GeneratedONstart - ActualGrowattONstart
 //
 // Period 3 = Exact instant Growatt ON begins
 //   → NEUTRAL, offset = 0
@@ -277,7 +315,7 @@ function calculateOffProgress(offSlot: ScheduleSlot, t: number) {
 interface ReporterOffsetResult {
   offsetState: OffsetState;
   offsetValue: OffsetValue;
-  timelineAlignment: string;
+  timelineAlignment: string;          // ISO timestamp of the reference ON start
   referenceKind: 'previous_on' | 'next_on' | 'current_on';
   referenceSlot: ScheduleSlot | null;
   generatedOnDurationMin: number;
@@ -288,50 +326,51 @@ interface ReporterOffsetResult {
 
 function calculateReporterOffset(
   schedule: ScheduleSlot[],
-  transitionTimeMin: number,
+  transitionMs: number,
 ): ReporterOffsetResult | { error: string } {
   // Find what Growatt state the submission falls in
-  const offSlot = findCurrentOffSlot(schedule, transitionTimeMin);
-  const onSlot = findCurrentOnSlot(schedule, transitionTimeMin);
+  const offSlot = findCurrentOffSlot(schedule, transitionMs);
+  const onSlot = findCurrentOnSlot(schedule, transitionMs);
 
-  // ── Case A: Report during Growatt ON → Period 1 ─────────────────────────
-  // V2.2: Period 1 includes the entire Growatt ON duration (after it starts).
-  // The Generated ON replaces the current Growatt ON.
+  // ── Case A: Report during Growatt ON → Period 1 (or Period 3) ────────────
   if (onSlot && !offSlot) {
-    const onStart = timeToMin(onSlot.start);
-    const onEnd = timeToMin(onSlot.end);
-    const onDuration = onSlot.durationMin;
+    const onStartMs = toMs(onSlot.start, transitionMs)!;
+    const onEndMs = toMs(onSlot.end, transitionMs)!;
+    const onDuration = onSlot.durationMin || Math.round((onEndMs - onStartMs) / 60_000);
+    const onStartIso = new Date(onStartMs).toISOString();
 
-    // Check for Period 3: exact instant the Growatt ON state begins
-    if (transitionTimeMin === onStart) {
+    // Period 3: exact instant the Growatt ON state begins (within 1 minute tolerance)
+    if (Math.abs(transitionMs - onStartMs) < 60_000) {
       return {
         offsetState: 'NEUTRAL',
         offsetValue: 0,
-        timelineAlignment: minToTime(onStart),
+        timelineAlignment: onStartIso,
         referenceKind: 'current_on',
         referenceSlot: onSlot,
         generatedOnDurationMin: onDuration,
         generatedOnReferenceKind: 'active',
         period: 'Period 3 (exact ON start)',
-        ruleReason: `Period 3 — exact instant Growatt ON begins at ${minToTime(onStart)}. Offset = 0 → NEUTRAL. Personal Timeline = exact clone of Growatt. Generated ON replaces current ON. Duration = ${onDuration} min.`,
+        ruleReason: `Period 3 — exact instant Growatt ON begins at ${onStartIso}. Offset = 0 → NEUTRAL. Personal Timeline = exact clone of Growatt. Generated ON replaces current ON. Duration = ${onDuration} min.`,
       };
     }
 
-    // Period 1: during Growatt ON (after start)
-    const offsetMin = transitionTimeMin - onStart;
-    // Offset is always positive when T > onStart (during ON)
+    // Period 1: during Growatt ON (after start).
+    // V2.3 (Issue 1C): offset is computed from the Growatt ON START TIME,
+    // i.e. `transitionMs - onStartMs`. This is always positive when the
+    // report happens during an active ON slot (T > onStart).
+    const offsetMin = Math.round((transitionMs - onStartMs) / 60_000);
     const offsetState: OffsetState = offsetMin > 0 ? 'POSITIVE' : offsetMin < 0 ? 'NEGATIVE' : 'NEUTRAL';
 
     return {
       offsetState,
       offsetValue: offsetMin,
-      timelineAlignment: minToTime(onStart),
+      timelineAlignment: onStartIso,
       referenceKind: 'current_on',
       referenceSlot: onSlot,
       generatedOnDurationMin: onDuration,
       generatedOnReferenceKind: 'active',
       period: 'Period 1 (during Growatt ON)',
-      ruleReason: `Period 1 — report during Growatt ON (${minToTime(onStart)}→${minToTime(onEnd)}). Offset = T - currentOnStart = ${minToTime(transitionTimeMin)} - ${onSlot.start} = ${offsetMin > 0 ? '+' : ''}${offsetMin} min → ${offsetState}. Generated ON replaces current ON. Duration = ${onDuration} min.`,
+      ruleReason: `Period 1 — report during Growatt ON (${onStartIso} → ${new Date(onEndMs).toISOString()}). Offset = T - currentOnStart = ${offsetMin > 0 ? '+' : ''}${offsetMin} min → ${offsetState}. Generated ON replaces current ON. Duration = ${onDuration} min.`,
     };
   }
 
@@ -340,51 +379,68 @@ function calculateReporterOffset(
     return { error: 'No active Growatt state (ON or OFF) found at submission time.' };
   }
 
-  const offProg = calculateOffProgress(offSlot, transitionTimeMin);
+  const offProg = calculateOffProgress(offSlot, transitionMs);
 
   if (offProg.isLessThan50) {
     // ── Period 1: first half of OFF → POSITIVE ───────────────────────────
-    // V2.2: Period 1 continues through the first half of the following OFF.
-    // The Generated ON replaces the previous Growatt ON.
-    const prevOn = findPreviousGrowattOn(schedule, transitionTimeMin);
+    // V2.3 (Issue 1C): the offset is calculated FROM THE GROWATT ON STATE
+    // START TIME (the START of the previous Growatt ON, not its END).
+    // The user explicitly requested this in Issue 1C: "OFFSET VALUE
+    // CALCULATED FROM THE GROWATT ON STATE START TIME NOT FROM END GROWATT
+    // ON STATE DURATION".
+    const prevOn = findPreviousGrowattOn(schedule, transitionMs);
     if (!prevOn) {
       return { error: 'No previous Growatt ON found for Period 1 reference.' };
     }
-    const prevOnStart = timeToMin(prevOn.start);
-    const offsetMin = transitionTimeMin - prevOnStart;
+    const prevOnStartMs = toMs(prevOn.start, transitionMs)!;
+    const prevOnEndMs = toMs(prevOn.end, transitionMs)!;
+    const prevOnStartIso = new Date(prevOnStartMs).toISOString();
+    const prevOnDuration = prevOn.durationMin || Math.round((prevOnEndMs - prevOnStartMs) / 60_000);
+
+    // Offset = T - prevOnStart  (always positive: T is during the OFF that follows)
+    const offsetMin = Math.round((transitionMs - prevOnStartMs) / 60_000);
 
     return {
       offsetState: 'POSITIVE',
       offsetValue: offsetMin,
-      timelineAlignment: minToTime(prevOnStart),
+      timelineAlignment: prevOnStartIso,
       referenceKind: 'previous_on',
       referenceSlot: prevOn,
-      generatedOnDurationMin: prevOn.durationMin,
+      generatedOnDurationMin: prevOnDuration,
       generatedOnReferenceKind: 'completed',
       period: 'Period 1 (<50% of OFF)',
-      ruleReason: `Period 1 (<50% of OFF consumed, progress=${Math.round(offProg.progress)}%). Offset = T - prevOnStart = ${minToTime(transitionTimeMin)} - ${prevOn.start} = +${offsetMin} min → POSITIVE. Generated ON replaces prev ON (${prevOn.start}→${prevOn.end}). Duration = ${prevOn.durationMin} min. Following OFF = ${offSlot.start}→${offSlot.end}.`,
+      ruleReason: `Period 1 (<50% of OFF consumed, progress=${Math.round(offProg.progress)}%). Offset = T - prevOnStart = ${offsetMin > 0 ? '+' : ''}${offsetMin} min → POSITIVE. Generated ON replaces prev ON (${prevOnStartIso} → ${new Date(prevOnEndMs).toISOString()}). Duration = ${prevOnDuration} min.`,
     };
   } else {
     // ── Period 2: second half of OFF → PENDING_NEGATIVE ──────────────────
-    // V2.2: Period 2 is the second half of OFF. The Generated ON replaces
-    // the NEXT upcoming Growatt ON. The exact offset value is initially
-    // unknown (PENDING) because the referenced Growatt ON hasn't started yet.
-    const nextOn = findNextGrowattOn(schedule, transitionTimeMin);
+    // The Generated ON replaces the NEXT upcoming Growatt ON. The exact
+    // offset value is initially unknown (PENDING) because the referenced
+    // Growatt ON hasn't started yet.
+    //
+    // V2.3 (Issue 1A, part 2): if Growatt is ALREADY ON at submission
+    // time (e.g. the schedule was stale, or the user submitted just after
+    // Growatt flipped), we resolve the pending value IMMEDIATELY using
+    // the most recent UTILITY_ON power_event — see resolvePendingOffsetNow
+    // in submitReport below.
+    const nextOn = findNextGrowattOn(schedule, transitionMs);
     if (!nextOn) {
       return { error: 'No next Growatt ON found for Period 2 reference.' };
     }
-    const nextOnStart = timeToMin(nextOn.start);
+    const nextOnStartMs = toMs(nextOn.start, transitionMs)!;
+    const nextOnEndMs = toMs(nextOn.end, transitionMs)!;
+    const nextOnStartIso = new Date(nextOnStartMs).toISOString();
+    const nextOnDuration = nextOn.durationMin || Math.round((nextOnEndMs - nextOnStartMs) / 60_000);
 
     return {
       offsetState: 'PENDING_NEGATIVE',
       offsetValue: 'PENDING',
-      timelineAlignment: minToTime(transitionTimeMin),
+      timelineAlignment: new Date(transitionMs).toISOString(),
       referenceKind: 'next_on',
       referenceSlot: nextOn,
-      generatedOnDurationMin: nextOn.durationMin,
+      generatedOnDurationMin: nextOnDuration,
       generatedOnReferenceKind: 'active',
       period: 'Period 2 (>50% of OFF)',
-      ruleReason: `Period 2 (>50% of OFF consumed, progress=${Math.round(offProg.progress)}%). Generated ON replaces NEXT ON (${nextOn.start}→${nextOn.end}). Duration = ${nextOn.durationMin} min. PENDING_NEGATIVE — waiting for Growatt ON at ${nextOn.start} to resolve offset value. Following OFF = ${nextOn.end}→next. UNCERTAIN_ZONE when predicted OFF ends before Growatt ON.`,
+      ruleReason: `Period 2 (>50% of OFF consumed, progress=${Math.round(offProg.progress)}%). Generated ON replaces NEXT ON (${nextOnStartIso} → ${new Date(nextOnEndMs).toISOString()}). Duration = ${nextOnDuration} min. PENDING_NEGATIVE — will resolve immediately if Growatt is already ON, otherwise waits for Growatt ON.`,
     };
   }
 }
@@ -487,6 +543,9 @@ export function useUtilityReports() {
     }
 
     if (cooldownRemainingMs > 0) {
+      // V2.3 (Issue 3): cooldown is now always 0 — this branch is kept for
+      // backwards compatibility with any in-flight state from before the
+      // upgrade, but it should never fire under V2.3.
       const mins = Math.ceil(cooldownRemainingMs / 60000);
       return {
         reportId: null,
@@ -535,13 +594,14 @@ export function useUtilityReports() {
       console.warn('[useUtilityReports] Failed to fetch schedule for offset calculation:', e);
     }
 
-    // ── V2.2: Calculate the Period 1/2/3 offset ─────────────────────────────
-    const transitionDate = new Date(estimatedTransitionAt);
-    const transitionTimeMin = transitionDate.getHours() * 60 + transitionDate.getMinutes();
+    // ── V2.3 (Issue 1C): Calculate the Period 1/2/3 offset using ABSOLUTE MS ──
+    // The previous minutes-of-day math was buggy across midnight and produced
+    // wrong offset signs. Now we pass the absolute epoch-ms timestamp.
+    const transitionMs = new Date(estimatedTransitionAt).getTime();
 
     let v22Offset: ReporterOffsetResult | { error: string } | null = null;
     if (schedule.length > 0) {
-      v22Offset = calculateReporterOffset(schedule, transitionTimeMin);
+      v22Offset = calculateReporterOffset(schedule, transitionMs);
       if ('error' in v22Offset) {
         console.warn('[useUtilityReports] Offset calculation error:', v22Offset.error);
         v22Offset = null;
@@ -549,20 +609,74 @@ export function useUtilityReports() {
     }
 
     // V2.2: Extract offset fields (or use defaults if schedule wasn't available)
-    const offsetState: OffsetState = v22Offset && !('error' in v22Offset) ? v22Offset.offsetState : 'NEUTRAL';
-    const offsetValue: OffsetValue = v22Offset && !('error' in v22Offset) ? v22Offset.offsetValue : 0;
-    const timelineAlignment: string = v22Offset && !('error' in v22Offset)
+    let offsetState: OffsetState = v22Offset && !('error' in v22Offset) ? v22Offset.offsetState : 'NEUTRAL';
+    let offsetValue: OffsetValue = v22Offset && !('error' in v22Offset) ? v22Offset.offsetValue : 0;
+    let timelineAlignment: string = v22Offset && !('error' in v22Offset)
       ? v22Offset.timelineAlignment
       : estimatedTransitionAt;
     const generatedOnDurationMin: number | null = v22Offset && !('error' in v22Offset)
       ? v22Offset.generatedOnDurationMin
       : null;
-    const generatedOnReferenceIso: string | null = v22Offset && !('error' in v22Offset) && v22Offset.referenceSlot
+    let generatedOnReferenceIso: string | null = v22Offset && !('error' in v22Offset) && v22Offset.referenceSlot
       ? v22Offset.referenceSlot.start
       : null;
     const generatedOnReferenceKind: 'completed' | 'active' | null = v22Offset && !('error' in v22Offset)
       ? v22Offset.generatedOnReferenceKind
       : null;
+
+    // ── V2.3 (Issue 1A, part 2): Resolve PENDING_NEGATIVE immediately ────────
+    // If the report was classified as PENDING_NEGATIVE (Period 2), the
+    // numeric offset value is normally resolved later when a NEW
+    // UTILITY_ON power_event arrives. But if Growatt is ALREADY ON at
+    // submission time — e.g. because the schedule was stale, or the user
+    // submitted just after Growatt flipped — no new event will arrive, and
+    // the offset would stay PENDING forever (the bug the user reported).
+    //
+    // Fix: query `inverter_state` for the current Growatt state. If it's ON,
+    // query the most recent UTILITY_ON power_event and compute the offset
+    // as `transitionMs - growattOnMs`. This makes the offset resolve
+    // immediately, matching the user's expectation that "when a user
+    // reports changing state while the Growatt state is ON the logic can
+    // detect it".
+    if (offsetState === 'PENDING_NEGATIVE') {
+      try {
+        const { data: invRow } = await supabase
+          .from('inverter_state')
+          .select('utility_on, last_polled')
+          .eq('id', 1)
+          .maybeSingle();
+        if (invRow?.utility_on === true) {
+          // Growatt is ON — find the most recent UTILITY_ON event timestamp
+          const { data: onEvent } = await supabase
+            .from('power_events')
+            .select('occurred_at')
+            .eq('event_type', 'UTILITY_ON')
+            .order('occurred_at', { ascending: false })
+            .limit(1);
+          const growattOnIso = onEvent?.[0]?.occurred_at;
+          if (growattOnIso) {
+            const growattOnMs = new Date(growattOnIso).getTime();
+            if (Number.isFinite(growattOnMs)) {
+              const resolvedOffsetMin = Math.round((transitionMs - growattOnMs) / 60_000);
+              offsetState = 'NEGATIVE';
+              offsetValue = resolvedOffsetMin;
+              timelineAlignment = growattOnIso;
+              generatedOnReferenceIso = growattOnIso;
+              console.info(
+                '[useUtilityReports] PENDING_NEGATIVE resolved immediately: ' +
+                `T=${estimatedTransitionAt}, GrowattON=${growattOnIso}, ` +
+                `offset=${resolvedOffsetMin} min`,
+              );
+            }
+          }
+        }
+      } catch (e) {
+        // Non-fatal — the PENDING_NEGATIVE state will be resolved later by
+        // the useGrowattOnWatcher in useResyncNotifications when the next
+        // UTILITY_ON event arrives.
+        console.warn('[useUtilityReports] Failed to check current Growatt state for immediate resolution:', e);
+      }
+    }
 
     // ── Insert the report with V2.2 fields ───────────────────────────────────
     const { data, error } = await supabase
