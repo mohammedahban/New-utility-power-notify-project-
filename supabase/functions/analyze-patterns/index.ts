@@ -11,10 +11,16 @@
  *   4. Phase 4 Bias Engine: correct duration predictions using accuracy logs
  *   5. Generate day schedule slots
  *   6. Write result to utility_predictions (id = 1, upsert)
+ *   7. Log prediction_accuracy_logs for any new power_events (server-side,
+ *      with full slot context: duration_type, predicted_duration_min,
+ *      actual_duration_min from the freshly-generated bias-corrected schedule)
  *
  * IMPORTANT: This function must remain deployed at all times.
  * poll-growatt calls it automatically after every state change detection.
  * Without it, utility_predictions never updates and all user app states freeze.
+ *
+ * NOTE: poll-growatt no longer writes to prediction_accuracy_logs.
+ * All accuracy logging now happens here where we have the full slot context.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -489,6 +495,162 @@ function computeNextTransition(
   };
 }
 
+// ── Server-side accuracy logging ────────────────────────────────────────────
+//
+// Runs AFTER the day schedule is generated so we have bias-corrected slot
+// durations available. For each power_event in the last 48 hours that has
+// not yet been logged, we:
+//   1. Find the matching slot (same state, closest time-of-day in schedule)
+//   2. Compute timing error and accuracy score
+//   3. Read actual_duration_min from the NEXT power_event
+//   4. Read predicted_duration_min from the matched slot's endIso − startIso
+//   5. Insert a fully-populated row into prediction_accuracy_logs
+//
+// Dedup guard: skips any event whose actual_event_time (minute precision)
+// already exists in the table — safe to call on every analyze-patterns run.
+async function logAccuracyForRecentEvents(
+  supabase: ReturnType<typeof getSupabase>,
+  daySchedule: Array<{
+    state: "ON" | "OFF";
+    startIso: string;
+    endIso: string | null;
+    durationLabel: string | null;
+    zone: string;
+    isEstimated: boolean;
+  }>,
+  computedAt: string,
+  confidence: number,
+): Promise<{ inserted: number; skipped: number }> {
+  const MAX_ALLOWED_ERROR_MIN = 150;
+  const LOOKBACK_MS = 48 * 3600_000; // 48 h — covers the full analysis window
+  const since = new Date(Date.now() - LOOKBACK_MS).toISOString();
+
+  // Load recent power_events sorted ascending (need next-event for actual_duration_min)
+  const { data: evData, error: evErr } = await supabase
+    .from("power_events")
+    .select("id, event_type, occurred_at")
+    .gte("occurred_at", since)
+    .order("occurred_at", { ascending: true });
+
+  if (evErr || !evData || evData.length === 0) return { inserted: 0, skipped: 0 };
+
+  const events = evData as Array<{ id: number; event_type: string; occurred_at: string }>;
+
+  // Load already-logged actual_event_times at minute precision for dedup
+  const { data: existing } = await supabase
+    .from("prediction_accuracy_logs")
+    .select("actual_event_time")
+    .gte("created_at", since);
+
+  const loggedMinutes = new Set<string>(
+    (existing ?? []).map((r: any) => new Date(r.actual_event_time).toISOString().slice(0, 16)),
+  );
+
+  const toInsert: object[] = [];
+
+  for (let j = 0; j < events.length; j++) {
+    const ev = events[j];
+    const evMs = new Date(ev.occurred_at).getTime();
+    const evMinKey = new Date(ev.occurred_at).toISOString().slice(0, 16);
+
+    // Skip already-logged events (dedup guard)
+    if (loggedMinutes.has(evMinKey)) continue;
+
+    const targetState: "ON" | "OFF" = ev.event_type === "UTILITY_ON" ? "ON" : "OFF";
+
+    // ── Find the matching schedule slot ──────────────────────────────────────
+    // Strategy: find the slot with matching state whose start time-of-day
+    // (minutes since midnight Yemen time) is closest to the event's time-of-day.
+    // This is the same slot-matching logic used by the backfill script, but now
+    // operating on the freshly-generated bias-corrected daySchedule.
+    let matchingSlot: typeof daySchedule[0] | null = null;
+    let minDist = Infinity;
+
+    for (const slot of daySchedule) {
+      if (slot.state !== targetState) continue;
+      const slotMs = new Date(slot.startIso).getTime();
+      if (!slotMs) continue;
+
+      // Compare time-of-day distance (wrapping at midnight) in milliseconds
+      const evTod  = evMs   % 86_400_000;
+      const slotTod = slotMs % 86_400_000;
+      let dist = Math.abs(evTod - slotTod);
+      if (dist > 43_200_000) dist = 86_400_000 - dist; // wrap
+      if (dist < minDist) { minDist = dist; matchingSlot = slot; }
+    }
+
+    if (!matchingSlot) continue;
+
+    const slotStartMs = new Date(matchingSlot.startIso).getTime();
+    const slotEndMs   = matchingSlot.endIso ? new Date(matchingSlot.endIso).getTime() : null;
+
+    // ── Timing error ─────────────────────────────────────────────────────────
+    // Align predicted time to the same calendar date as the actual event
+    const evDate   = new Date(ev.occurred_at);
+    const slotDate = new Date(matchingSlot.startIso);
+    const predictedIso = new Date(Date.UTC(
+      evDate.getUTCFullYear(), evDate.getUTCMonth(), evDate.getUTCDate(),
+      slotDate.getUTCHours(), slotDate.getUTCMinutes(), 0, 0,
+    )).toISOString();
+
+    const predictedMs = new Date(predictedIso).getTime();
+    let errorMs = Math.abs((evMs % 86_400_000) - (predictedMs % 86_400_000));
+    if (errorMs > 43_200_000) errorMs = 86_400_000 - errorMs;
+    const errorMin    = errorMs / 60_000;
+    const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
+
+    // ── duration_type & predicted_duration_min (from bias-corrected slot) ────
+    const durationType: "ON" | "OFF" = targetState;
+    let predictedDurationMin: number | null = null;
+    if (slotStartMs && slotEndMs && slotEndMs > slotStartMs) {
+      predictedDurationMin = (slotEndMs - slotStartMs) / 60_000;
+    }
+
+    // ── actual_duration_min (from the next power_event) ──────────────────────
+    let actualDurationMin: number | null = null;
+    if (j + 1 < events.length) {
+      const nextMs = new Date(events[j + 1].occurred_at).getTime();
+      if (nextMs > evMs) {
+        actualDurationMin = (nextMs - evMs) / 60_000;
+        // Sanity cap: >24 h almost certainly means a data gap
+        if (actualDurationMin > 1440) actualDurationMin = null;
+      }
+    }
+
+    toInsert.push({
+      predicted_event_time:  predictedIso,
+      actual_event_time:     ev.occurred_at,
+      predicted_state:       ev.event_type,
+      actual_state:          ev.event_type,
+      error_minutes:         Math.round(errorMin * 100) / 100,
+      accuracy_score:        Math.round(accuracyScore * 100) / 100,
+      confidence_score:      confidence,
+      prediction_generated_at: computedAt,
+      slot_id:               `server_resolved_${durationType}`,
+      duration_type:         durationType,
+      predicted_duration_min:
+        predictedDurationMin !== null ? Math.round(predictedDurationMin * 100) / 100 : null,
+      actual_duration_min:
+        actualDurationMin !== null ? Math.round(actualDurationMin * 100) / 100 : null,
+    });
+  }
+
+  if (toInsert.length === 0) return { inserted: 0, skipped: events.length };
+
+  // Chunked insert (50 rows per batch)
+  let inserted = 0;
+  const CHUNK = 50;
+  for (let i = 0; i < toInsert.length; i += CHUNK) {
+    const { error: insErr } = await supabase
+      .from("prediction_accuracy_logs")
+      .insert(toInsert.slice(i, i + CHUNK));
+    if (!insErr) inserted += Math.min(CHUNK, toInsert.length - i);
+    else console.error("[analyze-patterns] accuracy insert error:", insErr.message);
+  }
+
+  return { inserted, skipped: events.length - toInsert.length };
+}
+
 // ── Load accuracy history ─────────────────────────────────────────────────────
 async function loadHistory(supabase: ReturnType<typeof getSupabase>): Promise<AccuracyLogRow[]> {
   const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
@@ -821,6 +983,27 @@ Deno.serve(async (req) => {
       );
     }
 
+    // ── 22. Server-side accuracy logging ──────────────────────────────────────
+    // Must run AFTER the upsert so the schedule is fully committed. Failures
+    // are non-fatal — they must never block the main prediction response.
+    let accInserted = 0;
+    let accSkipped = 0;
+    try {
+      const accResult = await logAccuracyForRecentEvents(
+        supabase,
+        daySchedule,
+        prediction.computedAt,
+        confidence,
+      );
+      accInserted = accResult.inserted;
+      accSkipped  = accResult.skipped;
+      console.log(
+        `[analyze-patterns] Accuracy logging: inserted=${accInserted} skipped=${accSkipped}`,
+      );
+    } catch (accErr) {
+      console.error("[analyze-patterns] Accuracy logging failed (non-fatal):", accErr);
+    }
+
     console.log(
       `[analyze-patterns] Done. state=${currentState} confidence=${confidence}% ` +
       `slots=${daySchedule.length} drift=${driftOffset}min crisis=${crisisActive}`
@@ -839,6 +1022,8 @@ Deno.serve(async (req) => {
         biasRatioOff: biasResult.biasRatioOff,
         biasSampleCount: biasResult.sampleCount,
         computedAt: prediction.computedAt,
+        accuracyInserted: accInserted,
+        accuracySkipped:  accSkipped,
       }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );

@@ -237,68 +237,9 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ── Log prediction accuracy (read-only analytics — never affects predictions) ──
-    try {
-      const MAX_ALLOWED_ERROR_MIN = 150; // 100% error at 150 min
-      const { data: latestPred } = await supabase
-        .from("utility_predictions")
-        .select("prediction, computed_at")
-        .eq("id", 1)
-        .maybeSingle();
-
-      if (latestPred?.prediction) {
-        const pred = latestPred.prediction as any;
-        // The schedule is stored under `daySchedule` by analyze-patterns (APPPE v3).
-        // Fallback to legacy field names for forward-compatibility.
-        const slots: any[] = pred.daySchedule ?? pred.slots ?? pred.schedule ?? [];
-        const eventType = utilityIsOn ? "UTILITY_ON" : "UTILITY_OFF";
-        const targetState = utilityIsOn ? "ON" : "OFF";
-
-        // Find the slot that was predicted to start closest to the actual event time.
-        // We look for the upcoming transition slot (state === targetState) whose
-        // startIso is nearest to `now` — this is the slot that was "about to become
-        // the current state" from the prediction's point of view.
-        const nowMs = new Date(now).getTime();
-        let matchingSlot: any = null;
-        let minDist = Infinity;
-        for (const s of slots) {
-          if (s.state !== targetState) continue;
-          const predictedMs = new Date(s.startIso ?? s.start_iso ?? "").getTime();
-          if (!predictedMs) continue;
-          const dist = Math.abs(predictedMs - nowMs);
-          if (dist < minDist) { minDist = dist; matchingSlot = s; }
-        }
-
-        if (matchingSlot) {
-          const predictedIso: string = matchingSlot.startIso ?? matchingSlot.start_iso ?? matchingSlot.shiftedStartIso;
-          if (predictedIso) {
-            const predictedMs = new Date(predictedIso).getTime();
-            const actualMs = new Date(now).getTime();
-            const errorMin = Math.abs((actualMs - predictedMs) / 60_000);
-            const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
-            const confidence = typeof matchingSlot.confidence === "number" ? matchingSlot.confidence : null;
-
-            await supabase.from("prediction_accuracy_logs").insert({
-              predicted_event_time: predictedIso,
-              actual_event_time: now,
-              predicted_state: eventType,
-              actual_state: eventType,
-              error_minutes: Math.round(errorMin * 100) / 100,
-              accuracy_score: Math.round(accuracyScore * 100) / 100,
-              confidence_score: confidence,
-              prediction_generated_at: latestPred.computed_at ?? null,
-              slot_id: matchingSlot.slotId ?? matchingSlot.slot_id ?? null,
-            });
-            console.log(`[poll-growatt] Accuracy logged: error=${errorMin.toFixed(1)}min score=${accuracyScore.toFixed(1)}% slot=${targetState}`);
-          }
-        } else {
-          console.log(`[poll-growatt] No matching slot found for ${targetState} in ${slots.length} daySchedule slots — skipping accuracy log`);
-        }
-      }
-    } catch (accErr) {
-      // Analytics failure must never break the main polling loop
-      console.error("[poll-growatt] Accuracy log failed (non-fatal):", accErr);
-    }
+    // NOTE: prediction_accuracy_logs is now written by analyze-patterns (step 22)
+    // after the day schedule is generated, giving it access to bias-corrected
+    // slot durations. No accuracy logging here.
   }
 
   // ── 6. Upsert live state ───────────────────────────────────────────────────
