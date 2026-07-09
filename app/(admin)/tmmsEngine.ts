@@ -729,16 +729,59 @@ function computeATCMode(
   // growattCurrentState when there is no active slot (brief gap) is correct.
   //
   // For POSITIVE offset: this branch is only reached when there ARE no future
-  // slots in the shifted schedule (schedule exhausted). In that case fall back
-  // to the held state logic above; we should not reach here for positive users.
+  // slots in the shifted schedule (schedule exhausted). In that case the last
+  // known slot state is preserved — NEVER flip to growattCurrentState, because
+  // positive-offset users only transition at their SCHEDULED time, not at
+  // Growatt's transition time.
   //
   // For NEGATIVE offset: this branch should NEVER be reached when there is no
-  // active slot (the negative-offset no-slot case is handled above). It is only
-  // reached when an active slot IS present (user is inside a slot boundary).
+  // active slot (that case is handled in the UNCERTAIN_ZONE block above). It is
+  // only reached when an active slot IS present (user is inside a slot boundary).
+  if (!activeSlot) {
+    // No active slot and we fell through all the offset-specific handlers.
+    // For NEUTRAL: mirror Growatt exactly.
+    if (offsetMinutes === 0) {
+      return {
+        mode: 'NORMAL',
+        currentState: growattCurrentState,
+        currentStateStartIso: null,
+        isHoldingState: false,
+        overrunMinutes: 0,
+        communityElevated: false,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso: null,
+        statusLine: '',
+      };
+    }
+    // For POSITIVE or NEGATIVE with no active slot — hold the last known
+    // slot state. The positive-offset case should have been caught above;
+    // if we somehow fall through, hold the last ended slot's state to
+    // prevent an accidental auto-flip to growattCurrentState.
+    const lastEndedSlot = shiftedSlots
+      .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
+      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
+    const heldState: 'ON' | 'OFF' = lastEndedSlot ? lastEndedSlot.state : 'OFF';
+    return {
+      mode: 'WAITING_FOR_GROWATT',
+      currentState: heldState,
+      currentStateStartIso: lastEndedSlot?.startIso ?? null,
+      isHoldingState: true,
+      overrunMinutes: lastEndedSlot?.endIso
+        ? Math.max(0, Math.round((nowMs - new Date(lastEndedSlot.endIso).getTime()) / 60_000))
+        : 0,
+      communityElevated: true,
+      inValidationWindow: false,
+      validationWindowRemainingMin: 0,
+      scheduledAutoTransitionIso: null,
+      statusLine: 'بانتظار تأكيد Growatt أو تقرير مجتمعي',
+    };
+  }
+
   return {
     mode: 'NORMAL',
-    currentState: activeSlot ? activeSlot.state : (offsetMinutes === 0 ? growattCurrentState : 'OFF'),
-    currentStateStartIso: activeSlot ? activeSlot.startIso : null,
+    currentState: activeSlot.state,
+    currentStateStartIso: activeSlot.startIso,
     isHoldingState: false,
     overrunMinutes: 0,
     communityElevated: false,

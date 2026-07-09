@@ -49,7 +49,7 @@
  *   B. Offset State — POSITIVE/NEGATIVE/NEUTRAL (never PendingNegative from engine).
  *   C. Approver Cloning — YES response clones reporter's offset triple.
  */
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePredictions } from './usePredictions';
 import { supabase } from '../lib/supabase';
@@ -270,34 +270,34 @@ function applyUncertainZoneDeduction(
 
 // ── V2.3 FIX: Unified Growatt-ON watcher ──────────────────────────────────
 //
-// PROBLEM: the previous `useGrowattOnResolution` only subscribed when the
-// user was in PENDING_NEGATIVE state. A regular NEGATIVE-offset user had no
-// watcher — they waited for utility_predictions to refresh via
-// analyze-patterns (~10-30 s latency). During that gap the Home screen kept
-// showing OFF even though Growatt was already ON.
+// Subscribes to power_events for UTILITY_ON inserts whenever the user has
+// a negative offset. Records growattOnIso + bumps tick to trigger useMemo.
 //
-// SOLUTION: subscribe whenever the user has a negative offset OR is in
-// PENDING_NEGATIVE state. On every UTILITY_ON power_event:
-//   1. Record growattOnIso (the exact Growatt ON timestamp).
-//   2. Bump growattOnTick to force useMemo re-derivation.
-//
-// The useMemo then uses growattOnIso to synthesise an immediate ON state
-// (userOnStart = growattOnIso + offsetMinutes) so the Home screen flips to
-// ON with elapsed = |offsetMinutes| without waiting for analyze-patterns.
-//
-// Additionally, inverter_state real-time subscription provides a secondary
-// signal for edge cases where power_events is slow (rare but defensive).
+// CRITICAL GUARDS (V2.3.1 patch):
+//   1. growattOnIso is cleared to null when:
+//        a) A UTILITY_OFF power_event arrives (new OFF cycle started)
+//        b) Growatt subscription detects an OFF transition from inverter_state
+//      This prevents a stale growattOnIso from the previous ON cycle from
+//      triggering a synthetic flip in the NEXT OFF cycle.
+//   2. The useMemo guards shouldImmediateFlip with a timestamp check:
+//        growattOnMs >= uncertainEntryMs (Growatt ON happened AFTER the
+//        uncertain zone entry). If growattOnIso predates the uncertain zone
+//        entry it means it's from a previous ON cycle and must be ignored.
 function useGrowattOnWatcher(
   resyncPoint: ResyncPoint | null,
   isPendingNegative: boolean,
   isNegativeOffset: boolean,
-): { growattOnTick: number; growattOnIso: string | null } {
+): { growattOnTick: number; growattOnIso: string | null; clearGrowattOn: () => void } {
   const [tick, setTick] = useState(0);
   const [growattOnIso, setGrowattOnIso] = useState<string | null>(null);
 
   const shouldSubscribe = isPendingNegative || isNegativeOffset;
 
-  // Subscribe to power_events for new UTILITY_ON rows
+  const clearGrowattOn = useCallback(() => {
+    setGrowattOnIso(null);
+  }, []);
+
+  // Subscribe to power_events for new UTILITY_ON / UTILITY_OFF rows
   useEffect(() => {
     if (!shouldSubscribe) return;
     const channel = supabase
@@ -307,11 +307,15 @@ function useGrowattOnWatcher(
         { event: 'INSERT', schema: 'public', table: 'power_events' },
         (payload: any) => {
           const newRow = payload.new as { event_type?: string; occurred_at?: string };
-          if (newRow.event_type !== 'UTILITY_ON') return;
-          if (newRow.occurred_at) {
-            setGrowattOnIso(newRow.occurred_at);
+          if (newRow.event_type === 'UTILITY_ON') {
+            if (newRow.occurred_at) setGrowattOnIso(newRow.occurred_at);
+            setTick(t => t + 1);
+          } else if (newRow.event_type === 'UTILITY_OFF') {
+            // New OFF cycle started — clear any previous ON iso so it
+            // doesn't bleed into the next UNCERTAIN_ZONE check.
+            setGrowattOnIso(null);
+            setTick(t => t + 1);
           }
-          setTick(t => t + 1);
         },
       )
       .subscribe();
@@ -329,27 +333,24 @@ function useGrowattOnWatcher(
         async (payload: any) => {
           const row = payload.new as { utility_on?: boolean; last_polled?: string };
           const old = payload.old as { utility_on?: boolean };
-          // Only act on ON transitions (not repetitive ON→ON polls)
-          if (row.utility_on !== true || old.utility_on === true) return;
-          // Use last_polled as approximate ON time; power_events has the precise time
-          const approxOnIso = row.last_polled ?? new Date().toISOString();
-          setGrowattOnIso(prev => prev ?? approxOnIso); // don't override if already set
-          setTick(t => t + 1);
+          if (row.utility_on === true && old.utility_on !== true) {
+            // ON transition: record approximate time (power_events has precise time)
+            const approxOnIso = row.last_polled ?? new Date().toISOString();
+            setGrowattOnIso(prev => prev ?? approxOnIso);
+            setTick(t => t + 1);
+          } else if (row.utility_on === false && old.utility_on === true) {
+            // OFF transition: clear growattOnIso so next UNCERTAIN_ZONE doesn't
+            // inherit the previous cycle's Growatt ON timestamp.
+            setGrowattOnIso(null);
+            setTick(t => t + 1);
+          }
         },
       )
       .subscribe();
     return () => { supabase.removeChannel(channel); };
   }, [shouldSubscribe]);
 
-  // Clear growattOnIso when user is no longer in the uncertain family
-  // (i.e., utility_predictions has caught up and the engine runs normally).
-  // We don't clear it inside useMemo because that would cause React state
-  // updates during render. Instead, we track this via a ref and clear
-  // it with a micro-effect after the memo settles.
-  // Note: growattOnIso is intentionally NOT cleared on resyncPoint change
-  // because a community sync may happen AFTER Growatt turned ON.
-
-  return { growattOnTick: tick, growattOnIso };
+  return { growattOnTick: tick, growattOnIso, clearGrowattOn };
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────────
@@ -494,7 +495,7 @@ export function useUserPredictions(
   // isNegativeOffset: must immediately flip UI to ON without waiting for analyze-patterns
   const isPendingNegativeV21 = v21Meta.offsetState === 'PENDING_NEGATIVE';
   const isNegativeOffset = offsetMinutes < 0;
-  const { growattOnTick, growattOnIso } = useGrowattOnWatcher(
+  const { growattOnTick, growattOnIso, clearGrowattOn } = useGrowattOnWatcher(
     resyncPoint,
     isPendingNegativeV21,
     isNegativeOffset,
@@ -504,6 +505,8 @@ export function useUserPredictions(
   // Track whether the "immediate ON" synthetic state is active so we can
   // clear growattOnIso once utility_predictions catches up.
   const immediateOnActiveRef = useRef(false);
+  // Ref to drive post-memo growattOnIso cleanup without rendering side-effects.
+  const shouldClearGrowattOnRef = useRef(false);
 
   const userPrediction = useMemo((): UserPrediction | null => {
     if (!prediction) return null;
@@ -658,29 +661,31 @@ export function useUserPredictions(
 
       // ── V2.3 FIX: Immediate ON flip for negative-offset users ─────────────
       //
-      // When Growatt turns ON (growattOnIso is freshly set by the watcher)
-      // and utility_predictions hasn't refreshed yet, the engine still shows
-      // OFF (UNCERTAIN_ZONE / WAITING_FOR_GROWATT). We synthesise an
-      // immediate ON state using the formula:
-      //
-      //   userOnStart = growattOnIso + offsetMinutes
-      //               = G − |offset|   (for negative offset)
-      //
-      // This gives elapsed = now − userOnStart ≈ |offset| minutes immediately
-      // after Growatt turns ON, which is exactly what the user expects.
-      //
-      // Activation conditions:
-      //   1. growattOnIso is set (watcher fired with a UTILITY_ON event)
+      // Activation conditions (ALL must be true):
+      //   1. growattOnIso is set AND is from the CURRENT uncertain zone cycle
+      //      (growattOnMs >= uncertainEntryMs — prevents stale Growatt ON from
+      //       a previous cycle triggering a spurious flip in the next OFF cycle)
       //   2. Engine still shows OFF with isHoldingState=true (in uncertain family)
       //   3. Not community-synced (community sync takes priority)
       //   4. User has a negative offset
       //
-      // Deactivation: once utility_predictions refreshes and the engine
-      // derives the real ON slot (v21Result.currentState === 'ON'), the
-      // UNCERTAIN_ZONE deduction logic takes over and the synthetic state
-      // is naturally superseded.
-      const shouldImmediateFlip =
+      // Guard against stale growattOnIso: if the uncertain zone entry hasn't
+      // been set yet, the flip cannot be valid — we don't know when the
+      // UNCERTAIN_ZONE started so we can't verify the Growatt ON is from
+      // the correct cycle.
+      const growattOnMs = growattOnIso ? new Date(growattOnIso).getTime() : 0;
+      const uncertainEntryMs = uncertainEntryRef.current
+        ? new Date(uncertainEntryRef.current).getTime()
+        : Infinity; // no entry set → never flip
+
+      // Growatt ON must have happened AFTER the uncertain zone began.
+      // This rejects any stale growattOnIso from a previous ON cycle.
+      const growattOnIsCurrentCycle =
         growattOnIso !== null &&
+        growattOnMs >= uncertainEntryMs - 60_000; // 1-min tolerance for sub-second ordering
+
+      const shouldImmediateFlip =
+        growattOnIsCurrentCycle &&
         inUncertainFamily &&
         modeV22 !== 'COMMUNITY_SYNCED' &&
         offsetMinutes < 0;
@@ -742,6 +747,7 @@ export function useUserPredictions(
         };
 
         immediateOnActiveRef.current = true;
+        shouldClearGrowattOnRef.current = false; // keep active while holding
 
         // Save the UNCERTAIN_ZONE entry as userOnStartIso so that when
         // utility_predictions eventually updates, applyUncertainZoneDeduction
@@ -772,6 +778,13 @@ export function useUserPredictions(
         };
       } else {
         immediateOnActiveRef.current = false;
+        // If the engine has caught up (v21Result shows ON), schedule growattOnIso
+        // cleanup so the next OFF cycle starts clean. We use a ref flag rather
+        // than calling clearGrowattOn() inside useMemo to avoid state updates
+        // during render.
+        if (v21Result.currentState === 'ON' && growattOnIso !== null) {
+          shouldClearGrowattOnRef.current = true;
+        }
 
         // ── Standard UNCERTAIN_ZONE deduction (utility_predictions updated) ──
         if (uncertainEntryRef.current) {
@@ -805,7 +818,18 @@ export function useUserPredictions(
   // frozenOffsetRef, frozenOffsetStateRef, frozenAlignmentRef intentionally
   // excluded from deps (Rule Q2-A freeze). growattOnIso and resolutionTick
   // are included so the memo re-runs immediately when the watcher fires.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick, growattOnIso, onCommunityOffsetComputed]);
+
+  // ── Clear stale growattOnIso after engine catches up ─────────────────────
+  // Runs after the memo settles. Prevents the previous ON cycle's growattOnIso
+  // from triggering a synthetic flip in the next OFF/UNCERTAIN_ZONE cycle.
+  useEffect(() => {
+    if (shouldClearGrowattOnRef.current) {
+      shouldClearGrowattOnRef.current = false;
+      clearGrowattOn();
+    }
+  });
 
   // ── Precise auto-transition timer ─────────────────────────────────────────
   const scheduledFlipIso = userPrediction?.atc?.scheduledAutoTransitionIso ?? null;
