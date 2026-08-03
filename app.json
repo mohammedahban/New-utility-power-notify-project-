@@ -7,8 +7,7 @@
     "icon": "./assets/images/logo.png",
     "scheme": "onspaceapp",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": false,
-    "jsEngine": "jsc",
+    "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
