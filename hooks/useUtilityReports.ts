@@ -269,12 +269,15 @@ function calculateOffProgress(offSlot: ScheduleSlot, tMs: number) {
   const expectedDuration = Math.max(1, (end - start) / 60_000);
   const elapsed = Math.max(0, Math.min(expectedDuration, (tMs - start) / 60_000));
   const progress = (elapsed / expectedDuration) * 100;
+  // SPEC-FIX (2026-08-01): Period 2 starts strictly AFTER 50% consumed —
+  // the exact-50% instant belongs to Period 1 (spec example: OFF 12:00→16:00
+  // → Period 1 ends 13:59:59, Period 2 starts 14:00:01).
   return {
     elapsed,
     expectedDuration,
     progress,
-    isLessThan50: progress < 50,
-    isGreaterThan50: progress >= 50,
+    isLessThan50: progress <= 50,
+    isGreaterThan50: progress > 50,
   };
 }
 
@@ -327,20 +330,29 @@ interface ReporterOffsetResult {
 function calculateReporterOffset(
   schedule: ScheduleSlot[],
   transitionMs: number,
+  // SPEC-FIX (2026-08-01): PERIOD CLASSIFICATION uses the submission time
+  // (nowMs), while the OFFSET VALUE is computed from the reported transition
+  // time (transitionMs = now − selectedTimeOption). The previous code
+  // classified at transitionMs against a schedule generated from the CURRENT
+  // Growatt state — for old selected times T fell outside every slot (→
+  // silent NEUTRAL fallback) and contradicted the immediate-resolution check
+  // which runs at nowMs. (Spec "Selected Time Option Logic": the selected
+  // time consumes durations; it does not redefine the current period.)
+  classifyMs: number = transitionMs,
 ): ReporterOffsetResult | { error: string } {
   // Find what Growatt state the submission falls in
-  const offSlot = findCurrentOffSlot(schedule, transitionMs);
-  const onSlot = findCurrentOnSlot(schedule, transitionMs);
+  const offSlot = findCurrentOffSlot(schedule, classifyMs);
+  const onSlot = findCurrentOnSlot(schedule, classifyMs);
 
   // ── Case A: Report during Growatt ON → Period 1 (or Period 3) ────────────
   if (onSlot && !offSlot) {
-    const onStartMs = toMs(onSlot.start, transitionMs)!;
-    const onEndMs = toMs(onSlot.end, transitionMs)!;
+    const onStartMs = toMs(onSlot.start, classifyMs)!;
+    const onEndMs = toMs(onSlot.end, classifyMs)!;
     const onDuration = onSlot.durationMin || Math.round((onEndMs - onStartMs) / 60_000);
     const onStartIso = new Date(onStartMs).toISOString();
 
     // Period 3: exact instant the Growatt ON state begins (within 1 minute tolerance)
-    if (Math.abs(transitionMs - onStartMs) < 60_000) {
+    if (Math.abs(classifyMs - onStartMs) < 60_000) {
       return {
         offsetState: 'NEUTRAL',
         offsetValue: 0,
@@ -379,7 +391,7 @@ function calculateReporterOffset(
     return { error: 'No active Growatt state (ON or OFF) found at submission time.' };
   }
 
-  const offProg = calculateOffProgress(offSlot, transitionMs);
+  const offProg = calculateOffProgress(offSlot, classifyMs);
 
   if (offProg.isLessThan50) {
     // ── Period 1: first half of OFF → POSITIVE ───────────────────────────
@@ -388,20 +400,24 @@ function calculateReporterOffset(
     // The user explicitly requested this in Issue 1C: "OFFSET VALUE
     // CALCULATED FROM THE GROWATT ON STATE START TIME NOT FROM END GROWATT
     // ON STATE DURATION".
-    const prevOn = findPreviousGrowattOn(schedule, transitionMs);
+    const prevOn = findPreviousGrowattOn(schedule, classifyMs);
     if (!prevOn) {
       return { error: 'No previous Growatt ON found for Period 1 reference.' };
     }
-    const prevOnStartMs = toMs(prevOn.start, transitionMs)!;
-    const prevOnEndMs = toMs(prevOn.end, transitionMs)!;
+    const prevOnStartMs = toMs(prevOn.start, classifyMs)!;
+    const prevOnEndMs = toMs(prevOn.end, classifyMs)!;
     const prevOnStartIso = new Date(prevOnStartMs).toISOString();
     const prevOnDuration = prevOn.durationMin || Math.round((prevOnEndMs - prevOnStartMs) / 60_000);
 
-    // Offset = T - prevOnStart  (always positive: T is during the OFF that follows)
+    // Offset = T - prevOnStart  (positive when T is after the replaced ON's
+    // start; may be ≤ 0 for selected-time reports whose T predates it — in
+    // that case the state follows the value's sign, exactly like the
+    // during-ON branch above, so the timeline stays physically coherent).
     const offsetMin = Math.round((transitionMs - prevOnStartMs) / 60_000);
+    const offsetStateP1: OffsetState = offsetMin > 0 ? 'POSITIVE' : offsetMin < 0 ? 'NEGATIVE' : 'NEUTRAL';
 
     return {
-      offsetState: 'POSITIVE',
+      offsetState: offsetStateP1,
       offsetValue: offsetMin,
       timelineAlignment: prevOnStartIso,
       referenceKind: 'previous_on',
@@ -412,6 +428,31 @@ function calculateReporterOffset(
       ruleReason: `Period 1 (<50% of OFF consumed, progress=${Math.round(offProg.progress)}%). Offset = T - prevOnStart = ${offsetMin > 0 ? '+' : ''}${offsetMin} min → POSITIVE. Generated ON replaces prev ON (${prevOnStartIso} → ${new Date(prevOnEndMs).toISOString()}). Duration = ${prevOnDuration} min.`,
     };
   } else {
+    // ── Period 3 (pre-ON minute) — SPEC-FIX 2026-08-01 ────────────────────
+    // Period 3 spans [onStart − 60s, onStart + 60s]. The "before" side falls
+    // inside the OFF slot (progress ≈ 100%) and was previously swallowed by
+    // Period 2, producing a bogus PENDING_NEGATIVE instead of NEUTRAL.
+    const nextOnP3 = findNextGrowattOn(schedule, classifyMs);
+    if (nextOnP3) {
+      const nextOnStartMsP3 = toMs(nextOnP3.start, classifyMs)!;
+      const untilOnMs = nextOnStartMsP3 - classifyMs;
+      if (untilOnMs > 0 && untilOnMs <= 60_000) {
+        const nextOnEndMsP3 = toMs(nextOnP3.end, classifyMs)!;
+        const nextOnDurationP3 = nextOnP3.durationMin || Math.round((nextOnEndMsP3 - nextOnStartMsP3) / 60_000);
+        return {
+          offsetState: 'NEUTRAL',
+          offsetValue: 0,
+          timelineAlignment: new Date(nextOnStartMsP3).toISOString(),
+          referenceKind: 'next_on',
+          referenceSlot: nextOnP3,
+          generatedOnDurationMin: nextOnDurationP3,
+          generatedOnReferenceKind: 'active',
+          period: 'Period 3 (pre-ON minute)',
+          ruleReason: `Period 3 — submission within 60s before Growatt ON at ${new Date(nextOnStartMsP3).toISOString()}. Offset = 0 → NEUTRAL. Personal Timeline = exact clone of Growatt.`,
+        };
+      }
+    }
+
     // ── Period 2: second half of OFF → PENDING_NEGATIVE ──────────────────
     // The Generated ON replaces the NEXT upcoming Growatt ON. The exact
     // offset value is initially unknown (PENDING) because the referenced
@@ -422,12 +463,12 @@ function calculateReporterOffset(
     // Growatt flipped), we resolve the pending value IMMEDIATELY using
     // the most recent UTILITY_ON power_event — see resolvePendingOffsetNow
     // in submitReport below.
-    const nextOn = findNextGrowattOn(schedule, transitionMs);
+    const nextOn = findNextGrowattOn(schedule, classifyMs);
     if (!nextOn) {
       return { error: 'No next Growatt ON found for Period 2 reference.' };
     }
-    const nextOnStartMs = toMs(nextOn.start, transitionMs)!;
-    const nextOnEndMs = toMs(nextOn.end, transitionMs)!;
+    const nextOnStartMs = toMs(nextOn.start, classifyMs)!;
+    const nextOnEndMs = toMs(nextOn.end, classifyMs)!;
     const nextOnStartIso = new Date(nextOnStartMs).toISOString();
     const nextOnDuration = nextOn.durationMin || Math.round((nextOnEndMs - nextOnStartMs) / 60_000);
 
@@ -601,7 +642,9 @@ export function useUtilityReports() {
 
     let v22Offset: ReporterOffsetResult | { error: string } | null = null;
     if (schedule.length > 0) {
-      v22Offset = calculateReporterOffset(schedule, transitionMs);
+      // SPEC-FIX (F9): classify the period at the SUBMISSION time (nowMs);
+      // the offset VALUE is still computed from the reported transition time.
+      v22Offset = calculateReporterOffset(schedule, transitionMs, nowMs);
       if ('error' in v22Offset) {
         console.warn('[useUtilityReports] Offset calculation error:', v22Offset.error);
         v22Offset = null;
@@ -812,6 +855,21 @@ export function useUtilityReports() {
             });
           }
         }
+      });
+
+      // SPEC-FIX (F10, 2026-08-01): write the reporter's offset to
+      // user_offsets AT REPORT TIME — the single authoritative writer.
+      // Previously the value only arrived indirectly (engine Q2-A callback
+      // or the Growatt resolver), which raced and could persist garbage.
+      // PENDING_NEGATIVE keeps numeric 0 — the resolver fills it at Growatt ON.
+      supabase.from('user_offsets').upsert({
+        user_id: user!.id,
+        offset_minutes: typeof offsetValue === 'number' ? offsetValue : 0,
+        offset_state: offsetState,
+        offset_value: offsetValue,
+        updated_at: new Date(nowMs).toISOString(),
+      }, { onConflict: 'user_id' }).then(({ error: offErr }) => {
+        if (offErr) console.warn('[useUtilityReports] user_offsets write error:', offErr.message);
       });
 
       // Distribute push notifications to followers (non-blocking)

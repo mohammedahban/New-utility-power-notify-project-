@@ -4,8 +4,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { useUserPredictions, ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
+import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
+import { ShiftedScheduleSlot, ScheduleStateMode } from '../../hooks/useUserPredictions';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
@@ -293,12 +293,11 @@ export default function ScheduleScreen() {
   const insets = useSafeAreaInsets();
   const { offset, pendingDSD } = useUserOffset();
   const { resyncPoint } = useResync();
-  const { mode: transitionMode } = useTransitionMode();
-  // FIX: useStateAnchor() must be declared BEFORE it is consumed by
-  // useUserPredictions — previously `anchor` was referenced in its
-  // temporal dead zone, crashing/nullifying the anchor on this screen.
+  // useStateAnchor stays local (used for the mathematical active-start
+  // fallback below); the ENGINE result is the single shared instance.
   const { anchor } = useStateAnchor();
-  const { userPrediction, loading } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode, anchor?.startIso ?? null);
+  // SPEC-FIX (F13): shared engine instance (provider in (user)/_layout.tsx)
+  const { userPrediction, loading } = useSharedUserPrediction();
   const { history: resyncHistory } = useResyncNotifications();
 
   const stableStartMapRef   = useRef<Record<string, string>>({});

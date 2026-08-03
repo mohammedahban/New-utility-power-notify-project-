@@ -14,6 +14,20 @@ import {
 import { useActivityLog } from '../hooks/useActivityLog';
 import { ONBOARDING_KEY } from './onboarding';
 
+// Polyfills required for Supabase JS SDK in React Native / Hermes
+if (typeof global.Buffer === 'undefined') {
+  global.Buffer = require('buffer').Buffer;
+}
+if (typeof global.process === 'undefined') {
+  global.process = { env: {} };
+}
+global.process.env = {
+  ...global.process.env,
+  NODE_ENV: 'production',
+  EXPO_PUBLIC_SUPABASE_URL: 'https://kwlifmjwsasywjoriggn.supabase.co',
+  EXPO_PUBLIC_SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt3bGlmbWp3c2FzeXdqb3JpZ2duIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDY3MTczODMsImV4cCI6MjA2MjI5MzM4M30.gK3vXTmgK9WHalOuAWKz0sg7x9MjU6HSLsEy8P5X55M',
+};
+
 function AuthGate() {
   const { session, profile, loading } = useAuth();
   const router = useRouter();

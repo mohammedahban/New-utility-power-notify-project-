@@ -10,6 +10,7 @@ import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useUtilityReports, TimeOption } from '../../hooks/useUtilityReports';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useResync } from '../../contexts/ResyncContext';
+import { UserPredictionProvider } from '../../contexts/UserPredictionContext';
 import { AR } from '../../constants/arabic';
 
 const TIME_OPTS: { key: TimeOption; label: string }[] = [
@@ -182,6 +183,10 @@ export default function UserLayout() {
   const fabBottom = insets.bottom + 80;
 
   return (
+    // SPEC-FIX (F13): one shared TMMS engine instance for all user screens —
+    // Home / Schedule / Community read the same prediction (spec: "No
+    // independent calculations are allowed").
+    <UserPredictionProvider>
     <View style={{ flex: 1 }}>
       <GlobalReportModal
         visible={reportModalVisible}
@@ -276,6 +281,7 @@ export default function UserLayout() {
         />
       </Tabs>
     </View>
+    </UserPredictionProvider>
   );
 }
 

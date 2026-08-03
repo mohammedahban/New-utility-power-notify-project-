@@ -20,8 +20,7 @@ import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
-import { useUserPredictions } from '../../hooks/useUserPredictions';
+import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { AR } from '../../constants/arabic';
 
 const T = {
@@ -818,8 +817,8 @@ export default function CommunityScreen() {
   const [myOffsetMinutes, setMyOffsetMinutes] = React.useState(0);
   const { applyResync, resyncPoint } = useResync();
   const { offset } = useUserOffset();
-  const { mode: transitionMode } = useTransitionMode();
-  const { userPrediction } = useUserPredictions(offset?.offset_minutes ?? 0, resyncPoint, transitionMode, null);
+  // SPEC-FIX (F13): shared engine instance — same prediction as Home/Schedule
+  const { userPrediction } = useSharedUserPrediction();
   const { captureSnapshot } = useStatusSnapshot();
 
   useEffect(() => { registerPushToken(); }, []);

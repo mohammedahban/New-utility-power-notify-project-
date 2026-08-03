@@ -19,12 +19,17 @@
  *   - NO automatic changes, NO UNCERTAIN_ZONE, NO verification window.
  *   - The personal timeline is identical to Growatt's timeline.
  *
- * NEGATIVE offset (Issue 1A):
+ * NEGATIVE offset (Issue 1A — SPEC-CORRECTED 2026-08-01):
  *   - Offset is DECLINED (pull) from start/end of EACH state (ON and OFF).
- *   - When predicted OFF ends, the OFF state HELDS in UNCERTAIN_ZONE
- *     until Growatt turns ON. The wait time is DEDUCTED from the next ON
- *     cycle: ON starts at the predicted-OFF-end moment (elapsed shows the
- *     wait), ON ends after the remaining (predicted ON duration − wait).
+ *   - When the user's predicted OFF ends (shifted earlier), the OFF state
+ *     HELDS in UNCERTAIN_ZONE until Growatt turns ON — NEVER an automatic flip.
+ *   - When Growatt turns ON, the ON cycle is anchored at G + offset with the
+ *     FULL predicted duration: elapsed = |stored offset| and remaining =
+ *     predicted ON − |stored offset|. The spec rule is: decline the STORED
+ *     Negative Offset value — NEVER the elapsed waiting time. If |offset|
+ *     exceeds the ON duration, the ON is fully consumed (duration 0) and the
+ *     remainder keeps declining the following OFF/future states — this falls
+ *     out naturally from the shifted schedule (OFF start = G + offset).
  *   - WAITING_FOR_GROWATT still holds the OFF state — it does NOT flip to
  *     `growattCurrentState` until Growatt actually turns ON. This is the
  *     fix for the bug where after 30 minutes of overrun the held state
@@ -289,23 +294,47 @@ function applyOffsetToSlotsInternal(
   offsetMs: number,
   resyncPoint: ResyncPoint | null,
 ): ShiftedScheduleSlot[] {
+  const syncedMs = resyncPoint ? new Date(resyncPoint.syncedAtIso).getTime() : 0;
   return schedule.map(slot => {
-    // V2.1: Don't shift the Generated ON slot
+    const startMs = new Date(slot.startIso).getTime();
+    const shiftedStartMs = startMs + offsetMs;
+
+    // SPEC-FIX (2026-08-01, Part 1 "Generated ON Duration" + Part 2 Step 5):
+    // the Generated ON REPLACES the Growatt ON it was derived from. Detection
+    // must compare the SHIFTED slot start against the Generated ON start
+    // (the reporter's offset is exactly T − refONstart, so the shifted
+    // reference ON lands on T). The old code compared the RAW start against
+    // syncedAtIso — it could never match, so the original Growatt ON survived
+    // and a duplicate synthetic ON was prepended downstream.
     const isGeneratedOn = resyncPoint &&
       resyncPoint.syncedState === 'ON' &&
-      slot.startIso === resyncPoint.syncedAtIso;
+      Number.isFinite(syncedMs) &&
+      Math.abs(shiftedStartMs - syncedMs) < 60_000;
 
     if (isGeneratedOn) {
+      // Snap the slot to the Generated ON's authoritative times (start = T,
+      // duration = stored Generated ON duration, falling back to the slot's
+      // own duration). The following OFF slot shifts by the same offset and
+      // therefore starts exactly at the Generated ON's end with its full
+      // original duration (contiguity) — the spec's "Next OFF" rule.
+      const slotDurMin = slot.endIso
+        ? Math.round((new Date(slot.endIso).getTime() - startMs) / 60_000)
+        : 0;
+      const genDurMin = resyncPoint!.generatedOnDurationMin ?? slotDurMin;
+      const genEndIso = new Date(syncedMs + genDurMin * 60_000).toISOString();
       return {
         ...slot,
-        shiftedStartFormatted: slot.startFormatted,
-        shiftedEndFormatted: slot.endFormatted,
+        startIso: resyncPoint!.syncedAtIso,
+        endIso: genEndIso,
+        startFormatted: fmtYemenTime(resyncPoint!.syncedAtIso),
+        endFormatted: fmtYemenTime(genEndIso),
+        durationLabel: durationLabelFromMin(genDurMin),
+        shiftedStartFormatted: fmtYemenTime(resyncPoint!.syncedAtIso),
+        shiftedEndFormatted: fmtYemenTime(genEndIso),
         isResynced: true,
       };
     }
 
-    const startMs = new Date(slot.startIso).getTime();
-    const shiftedStartMs = startMs + offsetMs;
     const shiftedStartIso = new Date(shiftedStartMs).toISOString();
 
     let shiftedEndIso: string | null = null;
@@ -364,6 +393,11 @@ function computeATCMode(
   resyncPoint: ResyncPoint | null,
   transitionMode: TransitionMode,
   nowMs: number,
+  // SPEC-FIX (2026-08-01): the RAW (unshifted) Growatt slots, used by the
+  // positive-offset gate to distinguish "Growatt never confirmed this ON"
+  // (raw active slot is ON — prediction miss) from "user ON tail overlapping
+  // Growatt OFF" (raw active slot is OFF — ON→OFF must stay automatic).
+  rawSlots: ScheduleSlot[] = shiftedSlots,
 ): {
   mode: ScheduleStateMode;
   currentState: 'ON' | 'OFF';
@@ -628,6 +662,128 @@ function computeATCMode(
     // neutral users are a perfect mirror of the Growatt sensor.
   }
 
+  // ── CASE 2 GATE: schedule disagrees with Growatt ────────────────────────
+  // SPEC (Part 1): the OFF→ON direction must NEVER be automatic.
+  //   NEGATIVE → hold OFF in the UNCERTAIN_ZONE family until Growatt turns ON.
+  //   POSITIVE → hold OFF in a Verification Window until Growatt turns ON;
+  //              after Growatt confirms, the regenerated schedule places the
+  //              user's ON slot offset-minutes ahead and CASE 1 runs the
+  //              POSITIVE_OFFSET_PENDING countdown (= stored offset).
+  //   NEUTRAL  → mirror Growatt 1:1 in BOTH directions + waiting widget.
+  // ON→OFF stays AUTOMATIC for positive/negative ("never waits for Growatt").
+  //
+  // This gate lives in CASE 2 (active slot exists) because the server
+  // schedule is contiguous — CASE 1 (!activeSlot) only fires for gaps.
+  if (activeSlot && activeSlot.state === 'ON' && growattCurrentState === 'OFF') {
+    const slotStartMs = new Date(activeSlot.startIso).getTime();
+    const overrunMin = Math.max(0, Math.round((nowMs - slotStartMs) / 60_000));
+    // Held OFF start = the OFF slot immediately preceding this ON slot.
+    const prevOff = shiftedSlots
+      .filter(s => s.state === 'OFF' && s.endIso && new Date(s.endIso).getTime() <= slotStartMs + 60_000)
+      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
+    const heldStartIso = prevOff?.startIso ?? null;
+
+    if (offsetMinutes < 0) {
+      // ── NEGATIVE: UNCERTAIN_ZONE family (same thresholds as the gap path) ──
+      // The user's ON can never legitimately overlap Growatt OFF (both slot
+      // ends shift by the same negative offset, so user ON always ends before
+      // Growatt OFF) — ON-active + Growatt-OFF ALWAYS means "unconfirmed".
+      if (overrunMin <= GRACE_MODE_MAX_MIN) {
+        return {
+          mode: overrunMin <= 5 ? 'GRACE_MODE' : 'UNCERTAIN_ZONE',
+          currentState: 'OFF',
+          currentStateStartIso: heldStartIso,
+          isHoldingState: true,
+          overrunMinutes: overrunMin,
+          communityElevated: overrunMin >= PREDICTION_RANGE_MIN,
+          inValidationWindow: false,
+          validationWindowRemainingMin: 0,
+          scheduledAutoTransitionIso: null,
+          statusLine: overrunMin <= 5
+            ? `مهلة المزامنة — تجاوزنا الجدول بـ ${overrunMin} دقيقة`
+            : `غير مؤكد — تجاوزنا الجدول بـ ${overrunMin} دقيقة`,
+        };
+      }
+      return {
+        mode: 'WAITING_FOR_GROWATT',
+        currentState: 'OFF',
+        currentStateStartIso: heldStartIso,
+        isHoldingState: true,
+        overrunMinutes: overrunMin,
+        communityElevated: true,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso: null,
+        statusLine: `بانتظار تأكيد Growatt — تأخير ${overrunMin} دقيقة`,
+      };
+    }
+
+    // POSITIVE: only hold when the RAW schedule also says ON (prediction
+    // miss — Growatt never confirmed this ON). If the raw active slot is OFF,
+    // Growatt already came and went: the user's ON tail legitimately overlaps
+    // Growatt OFF and ON→OFF must stay automatic → fall through to NORMAL.
+    const rawActive = rawSlots.find(s => {
+      const st = new Date(s.startIso).getTime();
+      const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+      return nowMs >= st && nowMs < en;
+    }) ?? null;
+
+    if (offsetMinutes > 0 && rawActive?.state === 'ON') {
+      // ── POSITIVE: Verification Window — unbounded wait for Growatt ──────
+      return {
+        mode: 'WAITING_FOR_GROWATT',
+        currentState: 'OFF',
+        currentStateStartIso: heldStartIso,
+        isHoldingState: true,
+        overrunMinutes: overrunMin,
+        communityElevated: false,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso: null,
+        statusLine: `نافذة التحقق — بانتظار Growatt منذ ${overrunMin} دقيقة`,
+      };
+    }
+
+    if (offsetMinutes === 0) {
+      // ── NEUTRAL: mirror Growatt (still OFF) + waiting widget ────────────
+      return {
+        mode: 'WAITING_FOR_GROWATT',
+        currentState: 'OFF',
+        currentStateStartIso: heldStartIso,
+        isHoldingState: true,
+        overrunMinutes: overrunMin,
+        communityElevated: false,
+        inValidationWindow: false,
+        validationWindowRemainingMin: 0,
+        scheduledAutoTransitionIso: null,
+        statusLine: `بانتظار Growatt — ${overrunMin} دقيقة`,
+      };
+    }
+  }
+
+  // ── NEUTRAL mirror (reverse direction): slot OFF but Growatt still ON ────
+  // The predicted OFF started before Growatt actually turned OFF — do NOT
+  // auto-change; keep mirroring Growatt (ON) with a waiting widget.
+  if (activeSlot && activeSlot.state === 'OFF' && growattCurrentState === 'ON' && offsetMinutes === 0) {
+    const slotStartMs = new Date(activeSlot.startIso).getTime();
+    const overrunMin = Math.max(0, Math.round((nowMs - slotStartMs) / 60_000));
+    const prevOn = shiftedSlots
+      .filter(s => s.state === 'ON' && s.endIso && new Date(s.endIso).getTime() <= slotStartMs + 60_000)
+      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
+    return {
+      mode: 'WAITING_FOR_GROWATT',
+      currentState: 'ON',
+      currentStateStartIso: prevOn?.startIso ?? null,
+      isHoldingState: true,
+      overrunMinutes: overrunMin,
+      communityElevated: false,
+      inValidationWindow: false,
+      validationWindowRemainingMin: 0,
+      scheduledAutoTransitionIso: null,
+      statusLine: `بانتظار Growatt — ${overrunMin} دقيقة`,
+    };
+  }
+
   // ── CASE 2: Active slot exists — check end-of-slot behavior ──────────────
   // When the user is near the end of their current slot (within the
   // verification window), the behavior depends on the offset sign:
@@ -824,6 +980,7 @@ export function applyOffsetToPrediction(
     resyncPoint,
     transitionMode,
     nowMs,
+    rawSlots, // SPEC-FIX: raw Growatt slots for the positive-offset gate
   );
 
   // ── 3. Inject synthetic slot for POSITIVE_OFFSET_PENDING ───────────────────
@@ -875,8 +1032,18 @@ export function applyOffsetToPrediction(
     }
   }
 
-  // ── 5. Compute community offset (Rule Q2-A) ───────────────────────────────
-  if (resyncPoint && frozenCommunityOffset === null && onOffsetCalculated) {
+  // ── 5. Compute community offset (Rule Q2-A) ──────────────────────────────
+  // SPEC-FIX (F10, 2026-08-01): Q2-A is a LEGACY fallback only. When the
+  // resyncPoint already carries an authoritative numeric offsetValue
+  // (reporter's own report or an approver's clone), that value is FINAL —
+  // recomputing it from the raw schedule raced with the report-time
+  // user_offsets write. PENDING_NEGATIVE is also skipped (no offset may be
+  // computed until Growatt ON resolves it — spec Part 1).
+  const hasAuthoritativeOffset = typeof resyncPoint?.offsetValue === 'number';
+  const isPendingResync = resyncPoint?.offsetState === 'PENDING_NEGATIVE' ||
+    resyncPoint?.offsetValue === 'PENDING';
+  if (resyncPoint && frozenCommunityOffset === null && onOffsetCalculated &&
+      !hasAuthoritativeOffset && !isPendingResync) {
     const syncMs = new Date(resyncPoint.syncedAtIso).getTime();
     const referenceSlot = rawSlots.find(s => {
       const startMs = new Date(s.startIso).getTime();

@@ -9,7 +9,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useTransitionMode } from '../../hooks/useTransitionMode';
-import { useUserPredictions, UserPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
+import { UserPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
+import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { useResync } from '../../contexts/ResyncContext';
@@ -723,7 +724,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     const isCurrentOn = prediction.currentState === 'ON';
     const tMode = prediction.atc.transitionMode ?? 'AUTO';
     const modeConfigs: Record<string, { icon: string; title: string; body: string; borderColor: string; iconColor: string }> = {
-      UNCERTAIN_ZONE: { icon: '⚠️', title: 'استمرار غير معتاد', body: overrunMin > 0 ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — سيُخصم وقت الانتظار من مدة التشغيل القادمة` : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد', borderColor: T.warning + '44', iconColor: T.warning },
+      UNCERTAIN_ZONE: { icon: '⚠️', title: 'استمرار غير معتاد', body: overrunMin > 0 ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — عند تأكيد Growatt يبدأ التشغيل ويُحسب المتبقي من فارقك المخزّن. إذا وصلتك الكهرباء أرسل بلاغك الآن` : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد. إذا وصلتك الكهرباء أرسل بلاغك الآن', borderColor: T.warning + '44', iconColor: T.warning },
       WAITING_FOR_GROWATT: { icon: '⏳', title: 'بانتظار تأكيد الحساس', body: tMode === 'MANUAL' ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة' : 'تجاوزنا نطاق التوقع. بانتظار تأكيد مجتمعي أو Growatt', borderColor: T.accent + '44', iconColor: T.accent },
       PREDICTION_RANGE: { icon: '🔮', title: 'نطاق التوقع نشط', body: 'التغيير محتمل الآن — بانتظار تأكيد', borderColor: T.accent + '33', iconColor: T.accent },
       GRACE_MODE: { icon: '⏳', title: 'تأخر غير معتاد', body: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع — سيتم المزامنة فور تغيير الحالة', borderColor: T.warning + '44', iconColor: T.warning },
@@ -1099,13 +1100,9 @@ export default function Home() {
   const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
   const { anchor } = useStateAnchor();
 
-  const onCommunityOffsetComputed = useCallback((computedOffsetMinutes: number) => {
-    saveOffset(computedOffsetMinutes);
-  }, [saveOffset]);
-
-  const { userPrediction, loading: predLoading } = useUserPredictions(
-    offset?.offset_minutes ?? 0, resyncPoint, transitionMode, anchor?.startIso ?? null, onCommunityOffsetComputed,
-  );
+  // SPEC-FIX (F13): single shared engine instance — provider lives in
+  // (user)/_layout.tsx and also wires the community-offset save callback.
+  const { userPrediction, loading: predLoading } = useSharedUserPrediction();
   const { pendingCount } = useResyncNotifications();
   const { score: myScore } = useMyReliability(profile?.id);
   const [refreshing, setRefreshing] = useState(false);

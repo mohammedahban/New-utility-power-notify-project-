@@ -259,70 +259,80 @@ function useGrowattOnWatcher() {
  * stays POSITIVE (locked by the <50% rule). The IMPORTANT NOTICE highlights
  * the two cross-cases where the value sign confirms the state.
  */
+/**
+ * Resolve PENDING_NEGATIVE offsets when a Growatt UTILITY_ON arrives.
+ *
+ * SPEC-FIX (2026-08-01 — three corrections vs the previous version):
+ *   1. SCOPE: only rows with offset_state = 'PENDING_NEGATIVE' resolve here.
+ *      POSITIVE and NEUTRAL offsets are FINAL at report time (spec Part 1:
+ *      "The offset is FINAL at report time. No recomputation."). The old
+ *      version recomputed offset_value = T − G_latest for EVERY unresolved
+ *      row — a Period-1 report of +18 became −342 after the next Growatt ON
+ *      and user_offsets was overwritten with the sign-flipped value.
+ *   2. CORRECT CYCLE: each pending resolves against the FIRST UTILITY_ON
+ *      strictly after its own report time — not blindly against the event
+ *      that woke this watcher (stale pendings from a closed app must not
+ *      resolve against a later cycle's ON).
+ *   3. CLAMP/VALIDATE: Period-2 values must be ≤ 0 and within 12 h.
+ */
 async function resolveOffsetsWithGrowatt(growattOnIso: string): Promise<void> {
   const growattOnMs = new Date(growattOnIso).getTime();
   if (!Number.isFinite(growattOnMs)) return;
 
-  // V2.1 CORRECTED: resolve ALL recent rows, not just PENDING_NEGATIVE ones.
-  // The state is LOCKED — we only update the numeric offset_value.
-  // We look for rows that haven't been resolved yet (pending_resolved_at IS NULL).
-  // Also handle legacy PENDING_NEGATIVE rows that may still exist from the old logic.
-  const { data: unresolvedRows, error } = await supabase
+  const { data: pendingRows, error } = await supabase
     .from('resync_history')
     .select('id, user_id, effective_transition_at, offset_state')
-    .is('pending_resolved_at', null);
+    .is('pending_resolved_at', null)
+    .eq('offset_state', 'PENDING_NEGATIVE');
 
-  if (error || !unresolvedRows || unresolvedRows.length === 0) return;
+  if (error || !pendingRows || pendingRows.length === 0) return;
 
-  // Recompute the offset value for each row. The STATE stays as-is (locked).
-  for (const row of unresolvedRows) {
+  for (const row of pendingRows) {
     const reportMs = new Date(row.effective_transition_at).getTime();
     if (!Number.isFinite(reportMs)) continue;
 
-    // V2.1 CORRECTED: offsetValue = T − G (not G − T)
-    // This gives: negative when T < G (electricity came before Growatt confirmed),
-    //             positive when T > G (electricity came after Growatt confirmed).
-    const offsetMin = Math.round((reportMs - growattOnMs) / 60_000);
+    // First UTILITY_ON strictly after this report = the confirming Growatt ON
+    // for THIS cycle. The waking event is only a fallback (and only if it is
+    // itself after the report).
+    let refOnIso: string | null = null;
+    try {
+      const { data: onEvents } = await supabase
+        .from('power_events')
+        .select('occurred_at')
+        .eq('event_type', 'UTILITY_ON')
+        .gt('occurred_at', new Date(reportMs).toISOString())
+        .order('occurred_at', { ascending: true })
+        .limit(1);
+      refOnIso = onEvents?.[0]?.occurred_at ?? null;
+    } catch (_) { /* fall through to waking event */ }
+    if (!refOnIso && growattOnMs > reportMs) refOnIso = growattOnIso;
+    if (!refOnIso) continue; // no confirming ON yet — stays pending
 
-    // The state stays LOCKED — whatever it was (POSITIVE, NEGATIVE, or
-    // legacy PENDING_NEGATIVE). For legacy PENDING_NEGATIVE rows, update
-    // them to NEGATIVE (they should have been NEGATIVE from the start
-    // under the corrected logic).
-    const lockedState = row.offset_state === 'PENDING_NEGATIVE' ? 'NEGATIVE' : row.offset_state;
+    const refOnMs = new Date(refOnIso).getTime();
+    // offsetValue = T − G (negative: user got power BEFORE Growatt confirmed).
+    let resolved = Math.round((reportMs - refOnMs) / 60_000);
+    if (resolved > 0) resolved = 0;          // Period-2 values must be ≤ 0
+    if (resolved < -720) resolved = -720;    // sane bound: 12 h
 
     await supabase
       .from('resync_history')
       .update({
-        offset_state: lockedState, // LOCKED — never changes (except legacy PENDING_NEGATIVE → NEGATIVE)
-        offset_value: offsetMin, // recomputed as T − G
-        // Keep timeline_alignment as-is — per spec, the alignment anchor
-        // doesn't change when the value is resolved.
+        offset_state: 'NEGATIVE',       // pending resolved → normal negative behaviour
+        offset_value: resolved,
+        timeline_alignment: refOnIso,   // anchor = ACTUAL Growatt ON start
         pending_resolved_at: new Date().toISOString(),
       })
       .eq('id', row.id);
-  }
 
-  // Also update the latest user_offsets row for each affected user so the
-  // Home Screen reads the resolved value on next mount.
-  const userIds = [...new Set(unresolvedRows.map(r => r.user_id))];
-  for (const userId of userIds) {
-    const userRows = unresolvedRows.filter(r => r.user_id === userId);
-    if (userRows.length === 0) continue;
-    // Use the LATEST resolved report for this user (newest wins).
-    const latest = userRows.sort((a, b) =>
-      new Date(b.effective_transition_at).getTime() - new Date(a.effective_transition_at).getTime(),
-    )[0];
-    const reportMs = new Date(latest.effective_transition_at).getTime();
-    const offsetMin = Math.round((reportMs - growattOnMs) / 60_000);
-    const lockedState = latest.offset_state === 'PENDING_NEGATIVE' ? 'NEGATIVE' : latest.offset_state;
-
+    // Keep the user's engine offset in sync (resolver is the only writer
+    // allowed to touch a resolved pending; report-time write owns the rest).
     await supabase
       .from('user_offsets')
       .upsert({
-        user_id: userId,
-        offset_minutes: offsetMin,
-        offset_state: lockedState, // LOCKED
-        offset_value: offsetMin, // recomputed
+        user_id: row.user_id,
+        offset_minutes: resolved,
+        offset_state: 'NEGATIVE',
+        offset_value: resolved,
         updated_at: new Date().toISOString(),
       }, { onConflict: 'user_id' });
   }
@@ -345,6 +355,29 @@ export function useResyncNotifications() {
   // get recomputed using the actual Growatt ON time when it arrives.
   // The STATE stays locked (determined by >50%/<50% rule), only the VALUE updates.
   useGrowattOnWatcher();
+
+  // SPEC-FIX (F12, 2026-08-01): app-start fallback for missed resolutions.
+  // The realtime watcher only fires while this hook is mounted — pendings
+  // that matured while the app was closed (or the channel was dropped) are
+  // resolved now. The resolver is cycle-safe (first UTILITY_ON after each
+  // report) and idempotent (pending_resolved_at guard), so this is safe to
+  // run on every mount.
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data: latestOn } = await supabase
+          .from('power_events')
+          .select('occurred_at')
+          .eq('event_type', 'UTILITY_ON')
+          .order('occurred_at', { ascending: false })
+          .limit(1);
+        const latestOnIso = latestOn?.[0]?.occurred_at;
+        if (latestOnIso) await resolveOffsetsWithGrowatt(latestOnIso);
+      } catch (e) {
+        console.warn('[useResyncNotifications] startup pending-resolution pass failed:', e);
+      }
+    })();
+  }, []);
 
   const fetchNotifications = useCallback(async () => {
     if (!user) { setLoading(false); return; }

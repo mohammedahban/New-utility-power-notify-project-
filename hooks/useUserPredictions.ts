@@ -128,6 +128,18 @@ function deriveOffsetState(offsetMinutes: number): OffsetState {
 }
 
 // ── V2.1: Apply Generated ON on top of the engine's daySchedule ────────────
+// SPEC-FIX (2026-08-01, Part 1 "Generated ON" + "Next OFF" + Part 2 Step 5):
+//   1. The Generated ON REPLACES the Growatt ON it was derived from — any
+//      surviving ON slot that overlaps it (or starts within ±30 min — the
+//      post-regeneration descendant of the replaced ON) is removed, so no
+//      duplicated ON states can appear.
+//   2. The OFF immediately following the Generated ON keeps its FULL original
+//      duration and starts exactly at the Generated ON's end; subsequent
+//      slots are chain-shifted by the same delta (contiguity preserved).
+//   3. EXPIRED Generated ON (selected-time reports, e.g. "4 hours ago"): the
+//      elapsed remainder is CONSUMED from the following OFF — that OFF is
+//      re-anchored to the Generated ON's end (spec "Selected Time Option
+//      Logic": entire ON consumed → remainder consumed from following OFF).
 function applyGeneratedOnToSchedule(
   schedule: ShiftedScheduleSlot[],
   generatedOn: GeneratedOnInfo | null,
@@ -136,8 +148,11 @@ function applyGeneratedOnToSchedule(
   if (!generatedOn) return schedule;
   const startMs = new Date(generatedOn.startIso).getTime();
   const endMs = startMs + generatedOn.durationMin * 60_000;
-  if (endMs < nowMs) return schedule;
+  if (!Number.isFinite(startMs) || generatedOn.durationMin <= 0) return schedule;
+  // Stale guard: only apply surgery within the same day-cycle as the report.
+  if (nowMs - startMs > 12 * 3600_000) return schedule;
 
+  // ±60 s match — the engine already replaced this slot with the Generated ON.
   const existingIdx = schedule.findIndex(s =>
     Math.abs(new Date(s.startIso).getTime() - startMs) < 60_000,
   );
@@ -147,18 +162,60 @@ function applyGeneratedOnToSchedule(
     return updated;
   }
 
+  // Remove post-regen duplicates of the same physical ON (overlap / ±30 min).
+  const cleaned = schedule.filter(s => {
+    if (s.state !== 'ON') return true;
+    const st = new Date(s.startIso).getTime();
+    const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    const overlaps = st < endMs && en > startMs;
+    const near = Math.abs(st - startMs) < 30 * 60_000;
+    return !(overlaps || near);
+  });
+
+  // Re-anchor the following OFF (and the chain after it) to the Generated
+  // ON's end — full original OFF duration, delta applied to all later slots.
+  const anchorOff = (slots: ShiftedScheduleSlot[]): ShiftedScheduleSlot[] => {
+    const offIdx = slots.findIndex(s =>
+      s.state === 'OFF' && new Date(s.startIso).getTime() >= startMs - 60_000,
+    );
+    if (offIdx < 0) return slots;
+    const offStartMs = new Date(slots[offIdx].startIso).getTime();
+    const delta = endMs - offStartMs;
+    if (Math.abs(delta) < 60_000) return slots;
+    return slots.map((s, i) => {
+      if (i < offIdx) return s;
+      const stMs = new Date(s.startIso).getTime() + delta;
+      const enMs = s.endIso ? new Date(s.endIso).getTime() + delta : null;
+      const stIso = new Date(stMs).toISOString();
+      const enIso = enMs !== null ? new Date(enMs).toISOString() : null;
+      return {
+        ...s,
+        startIso: stIso,
+        endIso: enIso,
+        startFormatted: fmtYemenTime(stIso),
+        endFormatted: enIso ? fmtYemenTime(enIso) : null,
+        shiftedStartFormatted: fmtYemenTime(stIso),
+        shiftedEndFormatted: enIso ? fmtYemenTime(enIso) : null,
+      };
+    });
+  };
+
+  if (endMs <= nowMs) {
+    // EXPIRED Generated ON — consume the remainder from the following OFF.
+    // The Generated ON itself is history; it is not inserted into the schedule.
+    return anchorOff(cleaned);
+  }
+
+  // Current/future Generated ON — insert at the sorted position, then anchor.
   const refSlot = schedule[0];
-  const fmt = (iso: string) => new Date(iso).toLocaleString('en-US', {
-    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
-  }).replace('AM', ' ص').replace('PM', ' م');
   const synthetic: ShiftedScheduleSlot = {
     state: 'ON',
     startIso: generatedOn.startIso,
     endIso: new Date(endMs).toISOString(),
-    startFormatted: fmt(generatedOn.startIso),
-    endFormatted: fmt(new Date(endMs).toISOString()),
-    shiftedStartFormatted: fmt(generatedOn.startIso),
-    shiftedEndFormatted: fmt(new Date(endMs).toISOString()),
+    startFormatted: fmtYemenTime(generatedOn.startIso),
+    endFormatted: fmtYemenTime(new Date(endMs).toISOString()),
+    shiftedStartFormatted: fmtYemenTime(generatedOn.startIso),
+    shiftedEndFormatted: fmtYemenTime(new Date(endMs).toISOString()),
     durationLabel: generatedOn.durationMin >= 60
       ? `${Math.floor(generatedOn.durationMin / 60)}س ${generatedOn.durationMin % 60}د`
       : `${generatedOn.durationMin}د`,
@@ -166,7 +223,11 @@ function applyGeneratedOnToSchedule(
     isEstimated: false,
     isGeneratedOn: true,
   } as ShiftedScheduleSlot;
-  return [synthetic, ...schedule];
+  const insertIdx = cleaned.findIndex(s => new Date(s.startIso).getTime() > startMs);
+  const withGen = insertIdx < 0
+    ? [...cleaned, synthetic]
+    : [...cleaned.slice(0, insertIdx), synthetic, ...cleaned.slice(insertIdx)];
+  return anchorOff(withGen);
 }
 
 // ── V2.1 CORRECTED: no-op (PENDING_NEGATIVE never produced by engine) ──────
@@ -179,6 +240,12 @@ function markEstimatedPendingOffset(
 }
 
 // ── V2.2 (#4): UNCERTAIN_ZONE exceeded-time deduction ────────────────────
+// DEPRECATED (2026-08-01, spec Part 1 "Negative Offset Processing"):
+// This function declined the ELAPSED WAITING TIME from the ON duration —
+// the spec explicitly forbids that ("decline the stored Negative Offset
+// value, NOT the elapsed waiting time"). No longer called; kept for
+// reference only. The correct anchor (G + offset, full duration) is now
+// produced by the immediate-flip branch and the regenerated schedule.
 const UNCERTAIN_ZONE_ENTRY_KEY = 'tmms_uncertain_zone_entry_iso';
 const UNCERTAIN_DEDUCTION_CAP_MS = 6 * 3600_000;
 
@@ -617,7 +684,9 @@ export function useUserPredictions(
         && (new Date(v21Meta.generatedOn.startIso).getTime() + v21Meta.generatedOn.durationMin * 60_000) > nowV22;
 
       let v21Schedule = (engineResult.daySchedule ?? []) as ShiftedScheduleSlot[];
-      v21Schedule = applyGeneratedOnToSchedule(v21Schedule, isGeneratedOnCurrent ? v21Meta.generatedOn : null, nowV22);
+      // SPEC-FIX: pass the Generated ON even when expired — the function
+      // consumes the remainder from the following OFF (Selected Time rule).
+      v21Schedule = applyGeneratedOnToSchedule(v21Schedule, v21Meta.generatedOn, nowV22);
       v21Schedule = markEstimatedPendingOffset(v21Schedule, isPendingNegative, nowV22);
 
       const pendingNegativeResolutionIso =
@@ -749,9 +818,10 @@ export function useUserPredictions(
         immediateOnActiveRef.current = true;
         shouldClearGrowattOnRef.current = false; // keep active while holding
 
-        // Save the UNCERTAIN_ZONE entry as userOnStartIso so that when
-        // utility_predictions eventually updates, applyUncertainZoneDeduction
-        // uses the correct backdated start.
+        // Save the UNCERTAIN_ZONE entry as userOnStartIso — the immediate-flip
+        // guard (growattOnIsCurrentCycle) uses it to reject stale Growatt ON
+        // timestamps from previous cycles. (The old deduction consumer was
+        // removed 2026-08-01 — the anchor is now guard-only.)
         if (!uncertainEntryRef.current || new Date(uncertainEntryRef.current).getTime() > userOnStartMs) {
           uncertainEntryRef.current = userOnStartIso;
           AsyncStorage.setItem(UNCERTAIN_ZONE_ENTRY_KEY, userOnStartIso).catch(() => {});
@@ -786,16 +856,22 @@ export function useUserPredictions(
           shouldClearGrowattOnRef.current = true;
         }
 
-        // ── Standard UNCERTAIN_ZONE deduction (utility_predictions updated) ──
+        // ── UNCERTAIN_ZONE anchor housekeeping (SPEC-CORRECTED 2026-08-01) ──
+        // The old applyUncertainZoneDeduction call was REMOVED: it backdated
+        // the ON cycle to the predicted-OFF-end moment, i.e. it declined the
+        // ELAPSED WAITING TIME from the ON duration — exactly what the spec
+        // forbids ("decline the stored Negative Offset value, NOT the elapsed
+        // waiting time"). After the CASE 2 Growatt-gate fix, the correct ON
+        // anchor (G + offset, full predicted duration) already comes from:
+        //   a) the immediate-flip branch above (watcher path), and
+        //   b) the regenerated shifted schedule once analyze-patterns runs.
+        // The entry anchor is now only kept for the immediate-flip guard and
+        // cleared once the user completes a normal ON→OFF cycle.
         if (uncertainEntryRef.current) {
           const entryAgeMs = nowV22 - new Date(uncertainEntryRef.current).getTime();
           const isStale = !Number.isFinite(entryAgeMs) || entryAgeMs >= 12 * 3600_000;
 
-          if (!isStale && v21Result.currentState === 'ON' && modeV22 !== 'COMMUNITY_SYNCED') {
-            // utility_predictions has updated → backdate ON cycle to entry anchor
-            // so elapsed shows the full wait time and remaining = predicted − wait.
-            finalResult = applyUncertainZoneDeduction(v21Result, uncertainEntryRef.current, nowV22);
-          } else if (
+          if (
             isStale ||
             modeV22 === 'COMMUNITY_SYNCED' ||
             // Only clear the anchor when the user is genuinely back to NORMAL OFF
