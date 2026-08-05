@@ -212,6 +212,9 @@ export interface ATCInfo {
   inValidationWindow: boolean;
   validationWindowRemainingMin: number;
   scheduledAutoTransitionIso: string | null;
+  // SPEC-FIX D1: synthesized ATC states (e.g. POSITIVE_OFFSET_PENDING) carry a
+  // holding flag; declared here so object literals type-check.
+  isHoldingState?: boolean;
 }
 
 export interface AccuracyLogEvent {
@@ -439,7 +442,12 @@ function computeATCMode(
     }
     const cycleEndMs = syncedMs + durationMin * 60_000;
     const inWindow = nowMs < cycleEndMs;
-    const validationWindowRemainingMin = inWindow
+    // SPEC-FIX C5: the Verification Window is only the LAST VERIFICATION_WINDOW_MIN
+    // minutes of the synced cycle (spec), not the whole cycle. Previously
+    // inValidationWindow was true for the entire cycle, so UI prompts/countdowns
+    // tied to it ran for hours.
+    const inValidationWindow = inWindow && (cycleEndMs - nowMs) <= VERIFICATION_WINDOW_MIN * 60_000;
+    const validationWindowRemainingMin = inValidationWindow
       ? Math.max(0, (cycleEndMs - nowMs) / 60_000) : 0;
 
     if (inWindow) {
@@ -450,7 +458,7 @@ function computeATCMode(
         isHoldingState: true,
         overrunMinutes: 0,
         communityElevated: true,
-        inValidationWindow: inWindow,
+        inValidationWindow,
         validationWindowRemainingMin,
         scheduledAutoTransitionIso: new Date(cycleEndMs).toISOString(),
         statusLine: 'الحالة مُزامَنة مجتمعياً',
