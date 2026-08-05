@@ -180,14 +180,20 @@ function useOverrunLiveClock(overrunMinutes: number, isUncertain: boolean): stri
 }
 
 // ── Countdown hook ────────────────────────────────────────────────────────────
-function useCountdownSec(targetMinutes: number | null) {
-  const [tick, setTick] = useState(0);
+// SPEC-FIX C1: anchor the countdown on the absolute target ISO instead of a
+// "minutes from now" snapshot. The old tick-based version drifted whenever the
+// component re-rendered with a stale midMin (countdown ran too fast/slow vs the
+// real target time). Now remaining = target − Date.now(), recomputed each tick.
+function useCountdownSec(targetIso: string | null) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 1000);
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
-  if (!targetMinutes || targetMinutes <= 0) return { h: 0, m: 0, s: 0, total: 0 };
-  const total = Math.max(0, Math.round(targetMinutes * 60) - tick);
+  if (!targetIso) return { h: 0, m: 0, s: 0, total: 0 };
+  const targetMs = new Date(targetIso).getTime();
+  if (!Number.isFinite(targetMs)) return { h: 0, m: 0, s: 0, total: 0 };
+  const total = Math.max(0, Math.round((targetMs - nowMs) / 1000));
   return { h: Math.floor(total / 3600), m: Math.floor((total % 3600) / 60), s: total % 60, total };
 }
 
@@ -345,6 +351,9 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
   const totalDurationMs = scheduledMs - growattTransitionMs;
   const elapsedMs = Math.max(0, nowMs - growattTransitionMs);
   const progressPct = totalDurationMs > 0 ? Math.min(1, elapsedMs / totalDurationMs) : 0;
+  // SPEC-FIX C6: show how long ago the sensor actually flipped (live, grows
+  // every minute) instead of the static stored offset value.
+  const sensorElapsedMin = Math.max(0, Math.floor(elapsedMs / 60_000));
   const isOn = prediction?.currentState === 'ON';
   const nextStateLabel = isOn ? 'طافية' : 'شغالة'; const nextStateEmoji = isOn ? '🔴' : '⚡';
   const scheduledTimeLabel = new Date(scheduledIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true }).replace('AM', 'ص').replace('PM', 'م');
@@ -366,7 +375,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
           <Text style={popStyles.progressPct}>{Math.round(progressPct * 100)}%</Text>
           <Text style={popStyles.progressLabelLeft}>وقتك المجدول</Text>
         </View>
-        <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {prediction?.offsetMinutes ?? 0} دقيقة</Text>
+        <Text style={popStyles.sub}>الحساس الرئيسي حوّل حالته منذ {sensorElapsedMin} دقيقة</Text>
       </View>
     </View>
   );
@@ -474,6 +483,17 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     const slots = prediction?.daySchedule ?? [];
     const nowMs = Date.now();
     if (atcMode === 'POSITIVE_OFFSET_PENDING' && slots.length > 0) return slots[0];
+    // SPEC-FIX B2: in COMMUNITY_SYNCED the engine's daySchedule is already the
+    // community-synced (resynced) timeline — the slot containing "now" is the
+    // authoritative current window. Fall back to slots[0] when "now" sits in a
+    // gap so the remaining-time label still reflects the synced window.
+    if (atcMode === 'COMMUNITY_SYNCED' && slots.length > 0) {
+      return slots.find(s => {
+        const start = new Date(s.startIso).getTime();
+        const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+        return nowMs >= start && nowMs < end;
+      }) ?? slots[0];
+    }
     if (isHolding) return null;
     return slots.find(s => {
       const start = new Date(s.startIso).getTime();
@@ -483,9 +503,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   })();
 
   const remainMinutes = currentSlot?.endIso ? Math.max(0, (new Date(currentSlot.endIso).getTime() - Date.now()) / 60000) : null;
-  const remainH = remainMinutes !== null ? Math.floor(remainMinutes / 60) : 0;
-  const remainM = remainMinutes !== null ? Math.round(remainMinutes % 60) : 0;
-  const remainLabel = remainMinutes === null ? null : remainMinutes < 1 ? 'قريباً' : remainH === 0 ? `${remainM} دقيقة` : remainM === 0 ? (remainH === 1 ? 'ساعة' : `${remainH} ساعات`) : `${remainH} س و ${remainM} د`;
+  // SPEC-FIX C2: round total minutes ONCE, then split — the old floor/round
+  // mix could show e.g. "1 س و 60 د" when remainMinutes was 119.6.
+  const remainTotalMin = remainMinutes !== null ? Math.round(remainMinutes) : null;
+  const remainH = remainTotalMin !== null ? Math.floor(remainTotalMin / 60) : 0;
+  const remainM = remainTotalMin !== null ? remainTotalMin % 60 : 0;
+  const remainLabel = remainTotalMin === null ? null : remainTotalMin < 1 ? 'قريباً' : remainH === 0 ? `${remainM} دقيقة` : remainM === 0 ? (remainH === 1 ? 'ساعة' : remainH === 2 ? 'ساعتان' : `${remainH} ساعات`) : `${remainH} س و ${remainM} د`;
 
   const [revertConfirmVisible, setRevertConfirmVisible] = useState(false);
   const handleRevertPress = useCallback(() => {
@@ -626,7 +649,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
                   <Text style={psStyles.liveClockLabel}>وقت الانتظار الفعلي</Text>
                   <Text style={psStyles.liveClockValue}>{overrunLiveClock}</Text>
                 </View>
-                <Text style={psStyles.deductionNote}>سيُخصم من مدة التشغيل القادمة</Text>
+                {/* SPEC-FIX C3: the deduction note only makes sense for a negative
+                    offset (user ON started before Growatt ON). For neutral/positive
+                    offsets nothing is deducted, so the note is hidden. */}
+                {(prediction?.offsetMinutes ?? 0) < 0 && (
+                  <Text style={psStyles.deductionNote}>سيُخصم من مدة التشغيل القادمة</Text>
+                )}
               </View>
             )}
             {isUncertain && tMode === 'MANUAL' && (
@@ -700,10 +728,16 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
   const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
-  const midMin = nt ? (nt.minFromNowMin + nt.maxFromNowMin) / 2 : null;
-  const { h, m, s, total } = useCountdownSec(midMin);
-  const maxSec = midMin ? midMin * 60 : 1;
-  const progress = Math.max(0, Math.min(1, total / Math.max(maxSec, 1)));
+  // SPEC-FIX C1: countdown targets the transition's rangeStart ISO directly.
+  const countdownTargetIso = nt?.rangeStartIso ?? null;
+  const { h, m, s, total } = useCountdownSec(countdownTargetIso);
+  // Progress bar baseline: capture the initial total when the target changes so
+  // the bar drains smoothly 1 → 0 against the real remaining time.
+  const countdownBaseRef = useRef<{ iso: string | null; total: number }>({ iso: null, total: 0 });
+  if (countdownTargetIso !== countdownBaseRef.current.iso) {
+    countdownBaseRef.current = { iso: countdownTargetIso, total };
+  }
+  const progress = countdownBaseRef.current.total > 0 ? Math.max(0, Math.min(1, total / countdownBaseRef.current.total)) : 0;
   const animProg = useRef(new Animated.Value(progress)).current;
   useEffect(() => {
     Animated.timing(animProg, { toValue: progress, duration: 600, useNativeDriver: false }).start();
@@ -717,6 +751,11 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
       const minFromNow = Math.max(0, (scheduledMs - Date.now()) / 60_000);
       return { type: (prediction.currentState === 'ON' ? 'UTILITY_OFF' : 'UTILITY_ON') as 'UTILITY_ON' | 'UTILITY_OFF', rangeStartIso: scheduledIso, rangeEndIso: scheduledIso, rangeLabel: fmtTimeAr(scheduledIso), minFromNowMin: minFromNow, maxFromNowMin: minFromNow, waitLabel: '', inRangeWindow: minFromNow <= 0 };
     }
+    // SPEC-FIX B5: while holding (UNCERTAIN_ZONE / WAITING_FOR_GROWATT /
+    // GRACE_MODE) the engine's stale "next transition" range belongs to a cycle
+    // whose timing is no longer trustworthy — suppress it so the card shows
+    // only the hold status instead of a misleading start/end range.
+    if (isHolding) return null;
     return nt;
   })();
 
@@ -1171,7 +1210,12 @@ export default function Home() {
   const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
   const anchorStartIso = (() => {
     if ((userPrediction as any)?.reconciledCycleStartIso) return (userPrediction as any).reconciledCycleStartIso as string;
-    if (userPrediction?.isResynced && userPrediction.resyncedAtIso) return userPrediction.resyncedAtIso;
+    // SPEC-FIX B1: only anchor "منذ" on the resync timestamp when the resync
+    // actually established the CURRENT ON state (COMMUNITY_SYNCED + ON).
+    // Otherwise resyncedAtIso (the moment the community confirmed) is not the
+    // user's real state start and the elapsed counter reads wrong.
+    const isSyncedOnCurrent = userPrediction?.atc?.mode === 'COMMUNITY_SYNCED' && userPrediction?.currentState === 'ON';
+    if (isSyncedOnCurrent && userPrediction?.isResynced && userPrediction.resyncedAtIso) return userPrediction.resyncedAtIso;
     const atcMode = userPrediction?.atc?.mode;
     if (atcMode === 'POSITIVE_OFFSET_PENDING') return userPrediction?.currentStateStartIso ?? null;
     if (anchor && userPrediction && anchor.state === userPrediction.currentState) return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
