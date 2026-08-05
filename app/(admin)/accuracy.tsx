@@ -731,8 +731,15 @@ export default function AccuracyScreen() {
   }, [fetchLogs]);
 
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
-  const stats = computeStats(logs);
-  const todayLogs = logs.filter(l => Date.now() - new Date(l.created_at).getTime() < 86400000);
+  // v5: summary metrics prefer truthful snapshot-resolved rows (slot_id
+  // 'snap_%' — one row per real event, prediction pre-registered). Legacy rows
+  // (client 15-min remaining-time snapshots + circular server matches) made
+  // these metrics meaningless; fall back to all rows only while fewer than 10
+  // clean rows exist.
+  const cleanLogs = logs.filter(l => l.slot_id?.startsWith('snap_'));
+  const statsLogs = cleanLogs.length >= 10 ? cleanLogs : logs;
+  const stats = computeStats(statsLogs);
+  const todayLogs = statsLogs.filter(l => Date.now() - new Date(l.created_at).getTime() < 86400000);
   const todayStats = computeStats(todayLogs);
 
   const ranges: { key: Range; label: string }[] = [
@@ -892,8 +899,8 @@ export default function AccuracyScreen() {
             })}
           </View>
 
-          <AccuracySparkline logs={logs} />
-          <InsightWidget logs={logs} />
+          <AccuracySparkline logs={statsLogs} />
+          <InsightWidget logs={statsLogs} />
 
           {/* Paginated log list */}
           <View style={styles.card}>
