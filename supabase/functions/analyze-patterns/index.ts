@@ -791,6 +791,7 @@ async function resolveAccuracyRows(
   const alreadySet = new Set((alreadyRows ?? []).map((r: { actual_event_time: string }) => r.actual_event_time));
 
   const rows: Record<string, unknown>[] = [];
+  const matchedSnapIds: string[] = [];
   for (let i = 0; i < asc.length; i++) {
     const ev = asc[i];
     const evMs = new Date(ev.occurred_at).getTime();
@@ -824,23 +825,32 @@ async function resolveAccuracyRows(
     rows.push({
       predicted_event_time: best.predictedIso,
       actual_event_time: ev.occurred_at,
+      // predicted_state / actual_state are NOT NULL in the schema — omitting
+      // them silently rejected every v5 insert.
+      predicted_state: ev.event_type,
+      actual_state: ev.event_type,
       error_minutes: Math.round(absErrMin),
       accuracy_score: score,
       duration_type: ev.event_type === "UTILITY_ON" ? "ON" : "OFF",
       predicted_duration_min: best.slotDurationMin,
       actual_duration_min: actualDur,
       confidence_score: best.confidence,
+      prediction_generated_at: best.generatedAt,
       slot_id: best.id,
     });
-    outcome.resolvedSnapIds.add(best.id);
+    matchedSnapIds.push(best.id);
   }
 
   if (rows.length > 0) {
     const { error } = await supabase.from("prediction_accuracy_logs").insert(rows);
     if (error) {
+      // CRITICAL: snapshots are NOT consumed on failure — they stay in the
+      // payload so the next run retries the insert. (v5.0 consumed them even
+      // when the insert failed, orphaning events with no accuracy row.)
       console.error("[analyze-patterns] resolve insert error:", error.message);
     } else {
       outcome.inserted = rows.length;
+      for (const id of matchedSnapIds) outcome.resolvedSnapIds.add(id);
     }
   }
   return outcome;
@@ -1109,10 +1119,17 @@ Deno.serve(async (req) => {
           targetState === "ON" ? model.onDurAt(nowMs) : model.offDurAt(nowMs)
         );
       }
+      // Round the predicted time to the minute for the snapshot id/ISO:
+      // recency weights shift the computed ISO by sub-second amounts each
+      // run, which would otherwise mint a NEW snapshot id every invocation
+      // (26 near-identical snapshots accumulated in one day).
+      const predIsoMin = new Date(
+        Math.round(new Date(nextTransition.earliestTime).getTime() / 60_000) * 60_000
+      ).toISOString();
       newSnap = {
-        id: `snap_${nextTransition.type}_${nextTransition.rangeStartIso}`,
+        id: `snap_${nextTransition.type}_${predIsoMin}`,
         type: nextTransition.type,
-        predictedIso: nextTransition.earliestTime,
+        predictedIso: predIsoMin,
         slotDurationMin: slotDurMin,
         generatedAt: new Date(nowMs).toISOString(),
         confidence,
