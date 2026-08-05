@@ -23,9 +23,12 @@ function useLatestAccuracy() {
 
   const fetch = useCallback(async () => {
     try {
+      // v5: only snapshot-resolved rows are truthful (pre-registered prediction
+      // vs real event). Legacy rows were remaining-time noise.
       const { data } = await supabase
         .from('prediction_accuracy_logs')
         .select('accuracy_score, error_minutes, predicted_state, created_at')
+        .like('slot_id', 'snap_%')
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -100,7 +103,10 @@ function useCoverageStats() {
       const since = new Date(Date.now() - 7 * 86400000).toISOString();
       const [evRes, logRes] = await Promise.all([
         supabase.from('power_events').select('id', { count: 'exact', head: true }).gte('occurred_at', since),
-        supabase.from('prediction_accuracy_logs').select('id', { count: 'exact', head: true }).gte('created_at', since),
+        // Only v5 snapshot-resolved rows are truthful one-row-per-event records;
+        // legacy rows (client 15-min remaining-time snapshots + circular server
+        // matches) inflated this count into the tens of thousands.
+        supabase.from('prediction_accuracy_logs').select('id', { count: 'exact', head: true }).gte('created_at', since).like('slot_id', 'snap_%'),
       ]);
       setStats({ events: evRes.count ?? 0, logged: logRes.count ?? 0 });
     } catch { /* non-fatal */ }
@@ -112,7 +118,7 @@ function useCoverageStats() {
 function CoverageRow() {
   const stats = useCoverageStats();
   if (!stats) return null;
-  const pct = stats.events > 0 ? Math.round((stats.logged / stats.events) * 100) : 100;
+  const pct = stats.events > 0 ? Math.min(100, Math.round((stats.logged / stats.events) * 100)) : 100;
   const color = pct >= 90 ? '#22c55e' : pct >= 70 ? '#f59e0b' : '#ef4444';
   const bar = `${Math.min(100, pct)}%` as any;
   return (
@@ -589,9 +595,12 @@ function usePredictionQualityHistory() {
     (async () => {
       try {
         const since = new Date(Date.now() - 7 * 86400000).toISOString();
+        // v5: clean snapshot-resolved rows only — legacy rows made this chart
+        // display remaining-time noise instead of real prediction accuracy.
         const { data } = await supabase
           .from('prediction_accuracy_logs')
           .select('accuracy_score, error_minutes, predicted_state, created_at')
+          .like('slot_id', 'snap_%')
           .gte('created_at', since)
           .order('created_at', { ascending: true });
         if (cancelled || !data) return;
