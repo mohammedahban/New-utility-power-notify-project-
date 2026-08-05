@@ -1,26 +1,36 @@
 /**
- * analyze-patterns — APPPE v4 with Phase 4 Bias Engine
+ * analyze-patterns — APPPE v5 "Solar-Aware Duration Model"
  *
  * Triggered automatically by poll-growatt on every Growatt state change.
  * Also runs on schedule (cron) and manual invocation from admin dashboard.
  *
  * Pipeline:
- *   1. Load power_events (last 36 hours configurable window)
- *   2. Extract ON/OFF cycles with durations
- *   3. APPPE v4 quality factor computation
- *   4. Phase 4 Bias Engine: correct duration predictions using accuracy logs
- *   5. Generate day schedule slots
- *   6. Write result to utility_predictions (id = 1, upsert)
- *   7. Log prediction_accuracy_logs for any new power_events (server-side,
- *      with full slot context: duration_type, predicted_duration_min,
- *      actual_duration_min from the freshly-generated bias-corrected schedule)
+ *   1. Load power_events (36h state window + 7-day learning window)
+ *   2. Extract ON/OFF cycles (counter-state blips < 12 min merged for stats)
+ *   3. Recency-weighted duration statistics (half-life 60h — adapts to fuel
+ *      shortages / broken generators / seasonal solar changes within ~2 days)
+ *   4. OFF-duration model: 12 buckets × 2h of start time-of-day, shrunk toward
+ *      day/night period means. Captures the city's real behavior:
+ *        - midday OFF is SHORT (solar panel support during daylight)
+ *        - evening OFF is LONGEST (peak demand, no solar)
+ *        - night OFF is long but stable
+ *      ON-duration model: per-period (day/night) — historically very stable.
+ *   5. Drift & bias corrections learned ONLY from clean snapshot accuracy rows
+ *      (slot_id 'snap_%') — the legacy mixed rows (client remaining-time
+ *      snapshots + circular server time-of-day rows) are excluded.
+ *   6. Generate 24h schedule with PER-SLOT durations (no more single global
+ *      avg ON/OFF for every slot) and data-driven transition ranges.
+ *   7. Accuracy logging v2 (snapshot & resolve):
+ *      - Every run appends the live nextTransition prediction to
+ *        prediction.snapshots (what users actually saw, capped 40).
+ *      - When a real power_event arrives, it is matched against the LAST
+ *        snapshot issued BEFORE the event → one truthful accuracy row.
+ *      - Rows are only written when a genuine pre-event prediction existed.
+ *   8. Write result to utility_predictions (id = 1, upsert).
  *
  * IMPORTANT: This function must remain deployed at all times.
  * poll-growatt calls it automatically after every state change detection.
  * Without it, utility_predictions never updates and all user app states freeze.
- *
- * NOTE: poll-growatt no longer writes to prediction_accuracy_logs.
- * All accuracy logging now happens here where we have the full slot context.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -35,12 +45,34 @@ function getSupabase() {
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const ANALYSIS_WINDOW_HOURS = 36;
+const ANALYSIS_WINDOW_HOURS = 36;      // state-detection window (recent events)
+const LEARNING_WINDOW_DAYS = 7;        // duration-learning window
 const MIN_CYCLES_FOR_LEARNING = 3;
 const MAX_DRIFT_SAMPLES = 20;
 const VOLATILITY_EMA_ALPHA = 0.3;
-const CRISIS_THRESHOLD_PCT = 0.40; // 40% change triggers crisis mode
+const CRISIS_THRESHOLD_PCT = 0.40;     // 40% change triggers crisis mode
 const SCHEDULE_AHEAD_HOURS = 24;
+
+// v5 model constants
+const BLIP_MERGE_MIN = 12;             // counter-state runs shorter than this are noise
+const RECENCY_HALFLIFE_HOURS = 60;     // 2.5 days — fast regime adaptation
+const OFF_BUCKET_HOURS = 2;            // 12 time-of-day buckets
+const OFF_BUCKET_COUNT = 24 / OFF_BUCKET_HOURS;
+const BUCKET_SHRINK_K = 1.5;           // pseudo-samples pulling buckets toward period mean
+const PERIOD_SHRINK_K = 2;             // pseudo-samples pulling period mean toward global
+const DRIFT_MAX_ABS_MIN = 45;          // drift correction clamp
+const DRIFT_MIN_SAMPLES = 4;
+const BIAS_MIN_SAMPLES = 4;
+const BIAS_CLAMP_MIN = 0.5;
+const BIAS_CLAMP_MAX = 2.0;
+const OFF_DUR_MIN_CLAMP = 5;
+const OFF_DUR_MAX_CLAMP = 900;         // real night OFFs can exceed 8h (was 480 — too low)
+const ON_DUR_MIN_CLAMP = 10;
+const ON_DUR_MAX_CLAMP = 480;
+const MAX_ALLOWED_ERROR_MIN = 180;     // accuracy score scale (was 150)
+const SNAPSHOT_MAX_AGE_HOURS = 36;
+const SNAPSHOT_CAP = 40;
+const SNAPSHOT_MATCH_TOLERANCE_MS = 6 * 3600_000;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface PowerEvent {
@@ -58,6 +90,7 @@ interface Cycle {
   endMs: number;
   durationMin: number;
   period: "day" | "night";
+  censored: boolean; // still-active run (right-censored) — excluded from duration stats
 }
 
 interface AccuracyLogRow {
@@ -69,6 +102,7 @@ interface AccuracyLogRow {
   predicted_duration_min: number | null;
   actual_duration_min: number | null;
   confidence_score: number | null;
+  slot_id: string | null;
   created_at: string;
 }
 
@@ -84,13 +118,37 @@ interface PatternStats {
   maxOnMin: number | null;
 }
 
+interface PredictionSnapshot {
+  id: string;                 // snap_<TYPE>_<predictedIso>
+  type: "UTILITY_ON" | "UTILITY_OFF";
+  predictedIso: string;       // predicted transition time (slot start)
+  slotDurationMin: number;    // FULL predicted duration of the slot that STARTS at predictedIso
+  generatedAt: string;        // when this prediction was live
+  confidence: number;
+}
+
+interface ScheduleSlot {
+  state: "ON" | "OFF";
+  startIso: string;
+  endIso: string | null;
+  startFormatted: string;
+  endFormatted: string | null;
+  durationLabel: string | null;
+  zone: string;
+  isEstimated: boolean;
+}
+
 // ── Time helpers ──────────────────────────────────────────────────────────────
+function adenHourFloat(ms: number): number {
+  // Fractional hour (0–24) in Asia/Aden, computed arithmetically (UTC+3, no DST)
+  const adenMs = ms + 3 * 3600_000;
+  const dayMs = ((adenMs % 86_400_000) + 86_400_000) % 86_400_000;
+  return dayMs / 3600_000;
+}
+
 function getPeriod(ms: number): "day" | "night" {
-  const h = new Date(ms).toLocaleString("en-US", {
-    timeZone: "Asia/Aden", hour: "numeric", hour12: false,
-  });
-  const hour = parseInt(h, 10);
-  return hour >= 6 && hour < 20 ? "day" : "night";
+  const h = adenHourFloat(ms);
+  return h >= 6 && h < 20 ? "day" : "night";
 }
 
 function fmtYemenTime(ms: number): string {
@@ -132,10 +190,58 @@ function weightedMean(arr: number[], weights: number[]): number {
   return arr.reduce((s, v, i) => s + v * weights[i], 0) / totalW;
 }
 
+/** Weighted median — robust center estimate for regime data with outliers. */
+function weightedMedian(values: number[], weights: number[]): number {
+  if (values.length === 0) return 0;
+  const pairs = values.map((v, i) => ({ v, w: weights[i] }))
+    .sort((a, b) => a.v - b.v);
+  const totalW = pairs.reduce((s, p) => s + p.w, 0);
+  if (totalW === 0) return pairs[Math.floor(pairs.length / 2)].v;
+  let acc = 0;
+  for (const p of pairs) {
+    acc += p.w;
+    if (acc >= totalW / 2) return p.v;
+  }
+  return pairs[pairs.length - 1].v;
+}
+
+/** Weighted quantile (for outlier trimming). */
+function weightedQuantile(values: number[], weights: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const pairs = values.map((v, i) => ({ v, w: weights[i] }))
+    .sort((a, b) => a.v - b.v);
+  const totalW = pairs.reduce((s, p) => s + p.w, 0);
+  let acc = 0;
+  for (const p of pairs) {
+    acc += p.w;
+    if (acc >= totalW * q) return p.v;
+  }
+  return pairs[pairs.length - 1].v;
+}
+
+function weightedStdDev(values: number[], weights: number[]): number {
+  if (values.length < 2) return 0;
+  const wm = weightedMean(values, weights);
+  const totalW = weights.reduce((s, w) => s + w, 0);
+  if (totalW === 0) return 0;
+  const variance = values.reduce((s, v, i) => s + weights[i] * (v - wm) ** 2, 0) / totalW;
+  return Math.sqrt(variance);
+}
+
+/** Exponential recency weight — half-life RECENCY_HALFLIFE_HOURS. */
+function recencyWeight(startMs: number, nowMs: number): number {
+  const ageHours = Math.max(0, (nowMs - startMs) / 3600_000);
+  return Math.pow(0.5, ageHours / RECENCY_HALFLIFE_HOURS);
+}
+
 // ── Extract cycles from power events ─────────────────────────────────────────
+// v5: counter-state "blips" (< BLIP_MERGE_MIN) are merged into the surrounding
+// same-state runs. A 10-minute ON between two OFFs (generator stutter, sensor
+// flicker, brief grid return) is real for state tracking but must not distort
+// duration statistics. The still-active final run is kept but marked censored
+// so it never pollutes duration averages with an incomplete duration.
 function extractCycles(events: PowerEvent[], windowMs: number, nowMs: number): Cycle[] {
-  const cycles: Cycle[] = [];
-  // Sort ascending
+  const raw: Cycle[] = [];
   const sorted = [...events].sort(
     (a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime()
   );
@@ -148,41 +254,68 @@ function extractCycles(events: PowerEvent[], windowMs: number, nowMs: number): C
     const durationMin = (endMs - startMs) / 60_000;
     if (durationMin < 1) continue; // skip spurious sub-minute events
     const state: "ON" | "OFF" = ev.event_type === "UTILITY_ON" ? "ON" : "OFF";
-    cycles.push({
-      state,
-      startMs,
-      endMs,
-      durationMin,
-      period: getPeriod(startMs),
-    });
+    raw.push({ state, startMs, endMs, durationMin, period: getPeriod(startMs), censored: false });
   }
 
-  // Handle the last (still-active) state if within window
   if (sorted.length > 0) {
     const last = sorted[sorted.length - 1];
     const lastMs = new Date(last.occurred_at).getTime();
     if (nowMs - lastMs < windowMs) {
       const state: "ON" | "OFF" = last.event_type === "UTILITY_ON" ? "ON" : "OFF";
-      cycles.push({
+      raw.push({
         state,
         startMs: lastMs,
         endMs: nowMs,
         durationMin: (nowMs - lastMs) / 60_000,
         period: getPeriod(lastMs),
+        censored: true,
       });
     }
   }
 
-  return cycles;
+  // Merge blips: a short counter-state run flanked by two runs of the same
+  // state is folded into one continuous run of that state. Single forward
+  // pass; merged run re-checked against the following run.
+  const merged: Cycle[] = [];
+  for (const c of raw) {
+    const prev = merged.length > 0 ? merged[merged.length - 1] : null;
+    if (prev && prev.state === c.state) {
+      // Adjacent same-state runs (possible after a merge) — fuse them.
+      prev.endMs = c.endMs;
+      prev.durationMin = (prev.endMs - prev.startMs) / 60_000;
+      prev.censored = prev.censored && c.censored;
+      continue;
+    }
+    merged.push({ ...c });
+  }
+  const out: Cycle[] = [];
+  for (let i = 0; i < merged.length; i++) {
+    const c = merged[i];
+    const prev = out.length > 0 ? out[out.length - 1] : null;
+    const next = i + 1 < merged.length ? merged[i + 1] : null;
+    const isBlip = !c.censored && c.durationMin < BLIP_MERGE_MIN &&
+      prev && next && prev.state === next.state && prev.state !== c.state;
+    if (isBlip && prev && next) {
+      // Fold blip + next into prev (prev keeps its start, absorbs to next.end)
+      prev.endMs = next.endMs;
+      prev.durationMin = (prev.endMs - prev.startMs) / 60_000;
+      prev.censored = next.censored;
+      i++; // skip next — already absorbed
+      continue;
+    }
+    out.push(c);
+  }
+  return out;
 }
 
-// ── Pattern stats ─────────────────────────────────────────────────────────────
+// ── Pattern stats (descriptive, for display) ─────────────────────────────────
 function computePatternStats(cycles: Cycle[]): PatternStats {
-  const offDurations = cycles.filter(c => c.state === "OFF").map(c => c.durationMin);
-  const onDurations = cycles.filter(c => c.state === "ON").map(c => c.durationMin);
+  const completed = cycles.filter(c => !c.censored);
+  const offDurations = completed.filter(c => c.state === "OFF").map(c => c.durationMin);
+  const onDurations = completed.filter(c => c.state === "ON").map(c => c.durationMin);
 
   return {
-    cycles: cycles.length,
+    cycles: completed.length,
     avgOffMin: mean(offDurations),
     stdDevOffMin: stdDev(offDurations),
     avgOnMin: onDurations.length > 0 ? mean(onDurations) : null,
@@ -194,7 +327,7 @@ function computePatternStats(cycles: Cycle[]): PatternStats {
   };
 }
 
-// ── APPPE v4 quality factor computation ───────────────────────────────────────
+// ── APPPE quality factor computation ──────────────────────────────────────────
 function computeQualityFactors(
   cycles: Cycle[],
   driftSamples: number[],
@@ -209,31 +342,25 @@ function computeQualityFactors(
   volatilityFactor: number;
   crisisFactor: number;
 } {
-  // 1. Data Quantity Factor (0-100): based on effective weighted samples
   const effectiveSamples = Math.min(cycles.length, 25);
   const dataQuantityFactor = Math.min(100, Math.round((effectiveSamples / 25) * 100));
 
-  // 2. Stability Factor (0-100): based on relative MAD of OFF durations
-  const offDurs = cycles.filter(c => c.state === "OFF").map(c => c.durationMin);
+  const offDurs = cycles.filter(c => c.state === "OFF" && !c.censored).map(c => c.durationMin);
   const avgOff = mean(offDurs);
   const madOff = mad(offDurs);
   const relMad = avgOff > 0 ? madOff / avgOff : 1;
   const stabilityFactor = Math.max(0, Math.round(100 - relMad * 200));
 
-  // 3. Drift Stability Factor (0-100): how consistent is the timing drift
   const driftStabilityFactor = driftSamples.length < 2
     ? 50
     : Math.max(0, Math.round(100 - (stdDev(driftSamples) / 30) * 100));
 
-  // 4. Bias Stability Factor (0-100): how close bias ratio is to 1.0
   const avgBias = biasSamples.length > 0 ? mean(biasSamples) : 1.0;
   const biasDeviation = Math.abs(1 - avgBias);
   const biasStabilityFactor = Math.max(0, Math.round(100 - biasDeviation * 200));
 
-  // 5. Volatility Factor (0-100): low volatility = high factor
   const volatilityFactor = Math.max(0, Math.round(100 - (volatilityEMA / 60) * 100));
 
-  // 6. Crisis Factor (0-100): 100 if no crisis, penalized if crisis active
   const crisisFactor = crisisActive ? 30 : 100;
 
   return {
@@ -265,51 +392,174 @@ function computeConfidence(factors: ReturnType<typeof computeQualityFactors>): n
   return Math.min(97, Math.round(weighted));
 }
 
-// ── Phase 4 Bias Engine ───────────────────────────────────────────────────────
+// ── v5 Duration Model ─────────────────────────────────────────────────────────
+//
+// OFF duration depends strongly on the time of day the OFF STARTS:
+//   - late morning / midday OFFs are SHORT (solar support covers the gap)
+//   - evening OFFs are the LONGEST (peak demand + no solar)
+//   - night OFFs are long but stable
+// A single global average (v4) was therefore systematically wrong by ±1–2h.
+// The model: 12 buckets of 2h, recency-weighted trimmed means, each bucket
+// shrunk toward its day/night period mean (which is itself shrunk toward the
+// global mean) so thin buckets fall back gracefully. Prediction interpolates
+// between adjacent bucket centers for a smooth curve.
+interface DurationModel {
+  offDurAt: (startMs: number) => number;
+  onDurAt: (startMs: number) => number;
+  offCurve: Array<{ hour: number; durMin: number; samples: number }>;
+  offSdFor: (startMs: number) => number;
+  onSdFor: (startMs: number) => number;
+}
+
+function buildDurationModel(cycles: Cycle[], nowMs: number): DurationModel {
+  const completed = cycles.filter(c => !c.censored);
+  const offs = completed.filter(c => c.state === "OFF");
+  const ons = completed.filter(c => c.state === "ON");
+
+  const wOf = (c: Cycle) => recencyWeight(c.startMs, nowMs);
+
+  // ── Global trimmed stats per state (trim 2% tails to kill residual outliers)
+  const offVals = offs.map(c => c.durationMin);
+  const offW = offs.map(wOf);
+  let lo = 0, hi = Infinity;
+  if (offVals.length >= 8) {
+    lo = weightedQuantile(offVals, offW, 0.02);
+    hi = weightedQuantile(offVals, offW, 0.98);
+  }
+  const offsT = offs.filter(c => c.durationMin >= lo && c.durationMin <= hi);
+  const offTVals = offsT.map(c => c.durationMin);
+  const offTW = offsT.map(wOf);
+  const globalOffMean = offTVals.length > 0 ? weightedMean(offTVals, offTW) : 360;
+  const globalOffSd = offTVals.length > 1 ? weightedStdDev(offTVals, offTW) : 60;
+
+  const onVals = ons.map(c => c.durationMin);
+  const onW = ons.map(wOf);
+  let onLo = 0, onHi = Infinity;
+  if (onVals.length >= 8) {
+    onLo = weightedQuantile(onVals, onW, 0.02);
+    onHi = weightedQuantile(onVals, onW, 0.98);
+  }
+  const onsT = ons.filter(c => c.durationMin >= onLo && c.durationMin <= onHi);
+  const onTVals = onsT.map(c => c.durationMin);
+  const onTW = onsT.map(wOf);
+  const globalOnMean = onTVals.length > 0 ? weightedMean(onTVals, onTW) : 120;
+  const globalOnSd = onTVals.length > 1 ? weightedStdDev(onTVals, onTW) : 20;
+
+  // ── Period (day/night) means & sds, shrunk toward global ─────────────────
+  const periodStats = (state: "ON" | "OFF", period: "day" | "night") => {
+    const pool = (state === "OFF" ? offsT : onsT).filter(c => c.period === period);
+    const vals = pool.map(c => c.durationMin);
+    const ws = pool.map(wOf);
+    const wSum = ws.reduce((s, w) => s + w, 0);
+    const global = state === "OFF" ? globalOffMean : globalOnMean;
+    const globalSd = state === "OFF" ? globalOffSd : globalOnSd;
+    if (vals.length === 0 || wSum === 0) return { mean: global, sd: globalSd, wSum: 0 };
+    const m = weightedMean(vals, ws);
+    return {
+      mean: (wSum * m + PERIOD_SHRINK_K * global) / (wSum + PERIOD_SHRINK_K),
+      sd: vals.length > 1 ? weightedStdDev(vals, ws) : globalSd,
+      wSum,
+    };
+  };
+  const offDay = periodStats("OFF", "day");
+  const offNight = periodStats("OFF", "night");
+  const onDay = periodStats("ON", "day");
+  const onNight = periodStats("ON", "night");
+
+  // ── OFF time-of-day buckets ────────────────────────────────────────────────
+  const bucketDur: number[] = new Array(OFF_BUCKET_COUNT).fill(globalOffMean);
+  const bucketSamples: number[] = new Array(OFF_BUCKET_COUNT).fill(0);
+  for (let b = 0; b < OFF_BUCKET_COUNT; b++) {
+    const centerHour = b * OFF_BUCKET_HOURS + OFF_BUCKET_HOURS / 2;
+    const prior = (centerHour >= 6 && centerHour < 20 ? offDay : offNight).mean;
+    const inBucket = offsT.filter(c => {
+      const h = adenHourFloat(c.startMs);
+      return Math.floor(h / OFF_BUCKET_HOURS) % OFF_BUCKET_COUNT === b;
+    });
+    if (inBucket.length === 0) {
+      bucketDur[b] = prior;
+      continue;
+    }
+    const vals = inBucket.map(c => c.durationMin);
+    const ws = inBucket.map(wOf);
+    const wSum = ws.reduce((s, w) => s + w, 0);
+    const m = weightedMean(vals, ws);
+    bucketDur[b] = (wSum * m + BUCKET_SHRINK_K * prior) / (wSum + BUCKET_SHRINK_K);
+    bucketSamples[b] = wSum;
+  }
+
+  // Smooth circular interpolation between bucket centers
+  const offDurAt = (startMs: number): number => {
+    const h = adenHourFloat(startMs);
+    const pos = (h - OFF_BUCKET_HOURS / 2 + 24) % 24; // position on the center grid
+    const bIdx = Math.floor(pos / OFF_BUCKET_HOURS) % OFF_BUCKET_COUNT;
+    const nextIdx = (bIdx + 1) % OFF_BUCKET_COUNT;
+    const frac = (pos - bIdx * OFF_BUCKET_HOURS) / OFF_BUCKET_HOURS;
+    return bucketDur[bIdx] * (1 - frac) + bucketDur[nextIdx] * frac;
+  };
+
+  const onDurAt = (startMs: number): number => {
+    return getPeriod(startMs) === "day" ? onDay.mean : onNight.mean;
+  };
+
+  const offCurve = bucketDur.map((d, b) => ({
+    hour: b * OFF_BUCKET_HOURS + OFF_BUCKET_HOURS / 2,
+    durMin: Math.round(d),
+    samples: Math.round(bucketSamples[b] * 10) / 10,
+  }));
+
+  const offSdFor = (startMs: number) =>
+    getPeriod(startMs) === "day" ? offDay.sd : offNight.sd;
+  const onSdFor = (startMs: number) =>
+    getPeriod(startMs) === "day" ? onDay.sd : onNight.sd;
+
+  return { offDurAt, onDurAt, offCurve, offSdFor, onSdFor };
+}
+
+// ── Bias Engine (v5: clean snapshot rows only) ────────────────────────────────
 interface BiasResult {
-  biasRatioOn: number;  // actual/predicted for ON durations
-  biasRatioOff: number; // actual/predicted for OFF durations
+  biasRatioOn: number;
+  biasRatioOff: number;
   sampleCount: number;
 }
 
 function loadBiasFromHistory(history: AccuracyLogRow[]): BiasResult {
-  const onRows = history.filter(
-    r => r.duration_type === "ON" &&
-      r.predicted_duration_min !== null &&
-      r.actual_duration_min !== null &&
-      (r.predicted_duration_min ?? 0) > 0
-  );
-  const offRows = history.filter(
-    r => r.duration_type === "OFF" &&
-      r.predicted_duration_min !== null &&
-      r.actual_duration_min !== null &&
-      (r.predicted_duration_min ?? 0) > 0
-  );
+  // Only rows produced by the v5 snapshot logger carry FULL predicted
+  // durations. Legacy rows mixed remaining-time values and circular
+  // time-of-day matches — their ratios were noise.
+  const clean = history.filter(r => r.slot_id !== null && r.slot_id.startsWith("snap_"));
+  const ratiosFor = (type: "ON" | "OFF") =>
+    clean.filter(
+      r => r.duration_type === type &&
+        r.predicted_duration_min !== null &&
+        r.actual_duration_min !== null &&
+        (r.predicted_duration_min ?? 0) > 0 &&
+        (r.actual_duration_min ?? 0) > 0
+    ).map(r => r.actual_duration_min! / r.predicted_duration_min!);
 
-  const biasRatioOn = onRows.length >= 2
-    ? mean(onRows.map(r => r.actual_duration_min! / r.predicted_duration_min!))
-    : 1.0;
-  const biasRatioOff = offRows.length >= 2
-    ? mean(offRows.map(r => r.actual_duration_min! / r.predicted_duration_min!))
-    : 1.0;
+  const onRatios = ratiosFor("ON");
+  const offRatios = ratiosFor("OFF");
+  const clamp = (v: number) => Math.min(BIAS_CLAMP_MAX, Math.max(BIAS_CLAMP_MIN, v));
 
-  // Clamp bias ratios to reasonable range [0.3, 3.0] to prevent absurd corrections
   return {
-    biasRatioOn: Math.min(3.0, Math.max(0.3, biasRatioOn)),
-    biasRatioOff: Math.min(3.0, Math.max(0.3, biasRatioOff)),
-    sampleCount: onRows.length + offRows.length,
+    biasRatioOn: onRatios.length >= BIAS_MIN_SAMPLES ? clamp(mean(onRatios)) : 1.0,
+    biasRatioOff: offRatios.length >= BIAS_MIN_SAMPLES ? clamp(mean(offRatios)) : 1.0,
+    sampleCount: onRatios.length + offRatios.length,
   };
 }
 
-// ── Drift offset computation ───────────────────────────────────────────────────
+// ── Drift offset (v5: clean rows, robust median, clamped) ────────────────────
 function computeDriftOffset(history: AccuracyLogRow[]): {
   driftOffset: number;
   driftSamples: number[];
   sampleCount: number;
 } {
-  if (history.length < 2) return { driftOffset: 0, driftSamples: [], sampleCount: 0 };
+  const clean = history.filter(r => r.slot_id !== null && r.slot_id.startsWith("snap_"));
+  if (clean.length < DRIFT_MIN_SAMPLES) {
+    return { driftOffset: 0, driftSamples: [], sampleCount: clean.length };
+  }
 
-  const recent = history
+  const samples = clean
     .slice(-MAX_DRIFT_SAMPLES)
     .map(r => {
       const predicted = new Date(r.predicted_event_time).getTime();
@@ -318,13 +568,20 @@ function computeDriftOffset(history: AccuracyLogRow[]): {
     })
     .filter(v => Number.isFinite(v) && Math.abs(v) < 300);
 
-  if (recent.length < 2) return { driftOffset: 0, driftSamples: [], sampleCount: 0 };
+  if (samples.length < DRIFT_MIN_SAMPLES) {
+    return { driftOffset: 0, driftSamples: samples, sampleCount: samples.length };
+  }
 
-  // Exponential recency weighting
-  const weights = recent.map((_, i) => Math.exp(0.15 * (i - recent.length + 1)));
-  const driftOffset = Math.round(weightedMean(recent, weights));
+  // Median is robust against the occasional wildly-off prediction
+  const sorted = [...samples].sort((a, b) => a - b);
+  const median = sorted.length % 2 === 1
+    ? sorted[Math.floor(sorted.length / 2)]
+    : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  const driftOffset = Math.round(
+    Math.min(DRIFT_MAX_ABS_MIN, Math.max(-DRIFT_MAX_ABS_MIN, median))
+  );
 
-  return { driftOffset, driftSamples: recent, sampleCount: recent.length };
+  return { driftOffset, driftSamples: samples, sampleCount: samples.length };
 }
 
 // ── Volatility EMA ─────────────────────────────────────────────────────────────
@@ -339,52 +596,43 @@ function computeVolatilityEMA(history: AccuracyLogRow[], prevEMA: number): numbe
   return Math.round(ema);
 }
 
-// ── Generate day schedule ─────────────────────────────────────────────────────
+// ── Generate day schedule (v5: per-slot durations) ────────────────────────────
 function generateDaySchedule(
   currentState: "ON" | "OFF",
   currentStateStartMs: number,
-  avgOnMin: number,
-  avgOffMin: number,
+  model: DurationModel,
   driftOffsetMin: number,
   biasResult: BiasResult,
   nowMs: number,
   crisisActive: boolean,
   crisisShift: { on: number; off: number },
-): Array<{
-  state: "ON" | "OFF";
-  startIso: string;
-  endIso: string | null;
-  startFormatted: string;
-  endFormatted: string | null;
-  durationLabel: string | null;
-  zone: string;
-  isEstimated: boolean;
-}> {
-  const slots = [];
-  const aheadMs = SCHEDULE_AHEAD_HOURS * 3600_000;
-  const endMs = nowMs + aheadMs;
+): ScheduleSlot[] {
+  const slots: ScheduleSlot[] = [];
+  const endMs = nowMs + SCHEDULE_AHEAD_HOURS * 3600_000;
 
-  // Apply bias corrections
-  const correctedOnMin = avgOnMin * biasResult.biasRatioOn + (crisisActive ? crisisShift.on : 0);
-  const correctedOffMin = avgOffMin * biasResult.biasRatioOff + (crisisActive ? crisisShift.off : 0);
-
-  // Clamp to sane bounds
-  const onMin = Math.max(10, Math.min(480, correctedOnMin));
-  const offMin = Math.max(5, Math.min(480, correctedOffMin));
+  const durFor = (state: "ON" | "OFF", startMs: number): number => {
+    const base = state === "ON" ? model.onDurAt(startMs) : model.offDurAt(startMs);
+    const corrected = base * (state === "ON" ? biasResult.biasRatioOn : biasResult.biasRatioOff) +
+      (crisisActive ? (state === "ON" ? crisisShift.on : crisisShift.off) : 0);
+    return state === "ON"
+      ? Math.max(ON_DUR_MIN_CLAMP, Math.min(ON_DUR_MAX_CLAMP, corrected))
+      : Math.max(OFF_DUR_MIN_CLAMP, Math.min(OFF_DUR_MAX_CLAMP, corrected));
+  };
 
   let state = currentState;
-  let slotStartMs = currentStateStartMs + driftOffsetMin * 60_000;
-
-  // Backtrack if slotStartMs is before currentStateStartMs (drift went negative)
-  if (slotStartMs > nowMs) slotStartMs = currentStateStartMs;
+  let slotStartMs = currentStateStartMs; // known fact — never shifted by drift
 
   let iterCount = 0;
   const MAX_ITER = 48;
 
   while (slotStartMs < endMs && iterCount < MAX_ITER) {
     iterCount++;
-    const dur = state === "ON" ? onMin : offMin;
-    const slotEndMs = slotStartMs + dur * 60_000;
+    const dur = durFor(state, slotStartMs);
+    // Drift correction applies ONCE, to the end of the current (first) slot —
+    // it compensates the systematic phase error measured on past transitions.
+    // The chain then carries the correction forward naturally.
+    const driftMs = iterCount === 1 ? driftOffsetMin * 60_000 : 0;
+    const slotEndMs = slotStartMs + dur * 60_000 + driftMs;
 
     const zone = getPeriod(slotStartMs);
     const endIso = slotEndMs < endMs ? new Date(slotEndMs).toISOString() : null;
@@ -416,10 +664,13 @@ function detectCrisis(
     return { crisisActive: false, crisisReason: null, crisisShift: { on: 0, off: 0 } };
   }
 
-  const histOff = historicalCycles.filter(c => c.state === "OFF").map(c => c.durationMin);
-  const histOn = historicalCycles.filter(c => c.state === "ON").map(c => c.durationMin);
-  const currOff = currentCycles.filter(c => c.state === "OFF").map(c => c.durationMin);
-  const currOn = currentCycles.filter(c => c.state === "ON").map(c => c.durationMin);
+  const durs = (pool: Cycle[], state: "ON" | "OFF") =>
+    pool.filter(c => c.state === state && !c.censored).map(c => c.durationMin);
+
+  const histOff = durs(historicalCycles, "OFF");
+  const histOn = durs(historicalCycles, "ON");
+  const currOff = durs(currentCycles, "OFF");
+  const currOn = durs(currentCycles, "ON");
 
   if (histOff.length === 0 || currOff.length === 0) {
     return { crisisActive: false, crisisReason: null, crisisShift: { on: 0, off: 0 } };
@@ -464,10 +715,11 @@ function detectCrisis(
   return { crisisActive, crisisReason, crisisShift: { on: crisisShiftOn, off: crisisShiftOff } };
 }
 
-// ── Next transition computation ────────────────────────────────────────────────
+// ── Next transition computation (v5: data-driven range width) ─────────────────
 function computeNextTransition(
-  slots: ReturnType<typeof generateDaySchedule>,
+  slots: ScheduleSlot[],
   currentState: "ON" | "OFF",
+  model: DurationModel,
   nowMs: number,
 ): object | null {
   const targetState: "ON" | "OFF" = currentState === "ON" ? "OFF" : "ON";
@@ -476,16 +728,19 @@ function computeNextTransition(
 
   const startMs = new Date(nextSlot.startIso).getTime();
   const minFromNow = Math.max(0, (startMs - nowMs) / 60_000);
-  const rangeWidth = 30; // ±30 min range
-  const endMs = startMs + rangeWidth * 60_000;
-  const endIso = new Date(endMs).toISOString();
+  // Honest range: scaled to the observed dispersion of the CURRENT state's
+  // duration (the uncertainty of when it will end), bounded to [30, 120] min.
+  const sd = currentState === "OFF" ? model.offSdFor(nowMs) : model.onSdFor(nowMs);
+  const rangeWidth = Math.max(30, Math.min(120, Math.round(1.5 * sd)));
+  const endRangeMs = startMs + rangeWidth * 60_000;
+  const endIso = new Date(endRangeMs).toISOString();
 
   return {
     type: targetState === "ON" ? "UTILITY_ON" : "UTILITY_OFF",
     earliestTime: nextSlot.startIso,
     latestTime: endIso,
     earliestFormatted: nextSlot.startFormatted,
-    latestFormatted: fmtYemenTime(endMs),
+    latestFormatted: fmtYemenTime(endRangeMs),
     minFromNowMin: minFromNow,
     maxFromNowMin: minFromNow + rangeWidth,
     rangeLabel: nextSlot.startFormatted,
@@ -495,207 +750,169 @@ function computeNextTransition(
   };
 }
 
-// ── Server-side accuracy logging ────────────────────────────────────────────
+// ── Accuracy logging v2: snapshot & resolve ───────────────────────────────────
 //
-// Runs AFTER the day schedule is generated so we have bias-corrected slot
-// durations available. For each power_event in the last 48 hours that has
-// not yet been logged, we:
-//   1. Find the matching slot (same state, closest time-of-day in schedule)
-//   2. Compute timing error and accuracy score
-//   3. Read actual_duration_min from the NEXT power_event
-//   4. Read predicted_duration_min from the matched slot's endIso − startIso
-//   5. Insert a fully-populated row into prediction_accuracy_logs
+// v4 wrote rows in two broken ways:
+//   - client: every 15 min, predicted_duration_min = shrinking REMAINING time
+//   - server: matched events to schedule slots by circular time-of-day distance
+//     on a schedule generated AFTER the event existed
+// Both made the accuracy table pure noise (0% accuracy, ±230min avg error,
+// 20000% coverage on the admin dashboard).
 //
-// Dedup guard: skips any event whose actual_event_time (minute precision)
-// already exists in the table — safe to call on every analyze-patterns run.
-async function logAccuracyForRecentEvents(
-  supabase: ReturnType<typeof getSupabase>,
-  daySchedule: Array<{
-    state: "ON" | "OFF";
-    startIso: string;
-    endIso: string | null;
-    durationLabel: string | null;
-    zone: string;
-    isEstimated: boolean;
-  }>,
-  computedAt: string,
-  confidence: number,
-): Promise<{ inserted: number; skipped: number }> {
-  const MAX_ALLOWED_ERROR_MIN = 150;
-  const LOOKBACK_MS = 48 * 3600_000; // 48 h — covers the full analysis window
-  const since = new Date(Date.now() - LOOKBACK_MS).toISOString();
+// v5 approach: every analysis run appends the CURRENT nextTransition (what
+// users actually see) to prediction.snapshots. When a real power_event later
+// arrives, we resolve it against the LATEST snapshot of that type issued
+// BEFORE the event → one truthful row per event, pre-registered prediction.
 
-  // Load recent power_events sorted ascending (need next-event for actual_duration_min)
-  const { data: evData, error: evErr } = await supabase
-    .from("power_events")
-    .select("id, event_type, occurred_at")
-    .gte("occurred_at", since)
-    .order("occurred_at", { ascending: true });
-
-  if (evErr || !evData || evData.length === 0) return { inserted: 0, skipped: 0 };
-
-  const events = evData as Array<{ id: number; event_type: string; occurred_at: string }>;
-
-  // Load already-logged actual_event_times at minute precision for dedup
-  const { data: existing } = await supabase
-    .from("prediction_accuracy_logs")
-    .select("actual_event_time")
-    .gte("created_at", since);
-
-  const loggedMinutes = new Set<string>(
-    (existing ?? []).map((r: any) => new Date(r.actual_event_time).toISOString().slice(0, 16)),
-  );
-
-  const toInsert: object[] = [];
-
-  for (let j = 0; j < events.length; j++) {
-    const ev = events[j];
-    const evMs = new Date(ev.occurred_at).getTime();
-    const evMinKey = new Date(ev.occurred_at).toISOString().slice(0, 16);
-
-    // Skip already-logged events (dedup guard)
-    if (loggedMinutes.has(evMinKey)) continue;
-
-    const targetState: "ON" | "OFF" = ev.event_type === "UTILITY_ON" ? "ON" : "OFF";
-
-    // ── Find the matching schedule slot ──────────────────────────────────────
-    // Strategy: find the slot with matching state whose start time-of-day
-    // (minutes since midnight Yemen time) is closest to the event's time-of-day.
-    // This is the same slot-matching logic used by the backfill script, but now
-    // operating on the freshly-generated bias-corrected daySchedule.
-    let matchingSlot: typeof daySchedule[0] | null = null;
-    let minDist = Infinity;
-
-    for (const slot of daySchedule) {
-      if (slot.state !== targetState) continue;
-      const slotMs = new Date(slot.startIso).getTime();
-      if (!slotMs) continue;
-
-      // Compare time-of-day distance (wrapping at midnight) in milliseconds
-      const evTod  = evMs   % 86_400_000;
-      const slotTod = slotMs % 86_400_000;
-      let dist = Math.abs(evTod - slotTod);
-      if (dist > 43_200_000) dist = 86_400_000 - dist; // wrap
-      if (dist < minDist) { minDist = dist; matchingSlot = slot; }
-    }
-
-    if (!matchingSlot) continue;
-
-    const slotStartMs = new Date(matchingSlot.startIso).getTime();
-    const slotEndMs   = matchingSlot.endIso ? new Date(matchingSlot.endIso).getTime() : null;
-
-    // ── Timing error ─────────────────────────────────────────────────────────
-    // Align predicted time to the same calendar date as the actual event
-    const evDate   = new Date(ev.occurred_at);
-    const slotDate = new Date(matchingSlot.startIso);
-    const predictedIso = new Date(Date.UTC(
-      evDate.getUTCFullYear(), evDate.getUTCMonth(), evDate.getUTCDate(),
-      slotDate.getUTCHours(), slotDate.getUTCMinutes(), 0, 0,
-    )).toISOString();
-
-    const predictedMs = new Date(predictedIso).getTime();
-    let errorMs = Math.abs((evMs % 86_400_000) - (predictedMs % 86_400_000));
-    if (errorMs > 43_200_000) errorMs = 86_400_000 - errorMs;
-    const errorMin    = errorMs / 60_000;
-    const accuracyScore = Math.max(0, 100 - (errorMin / MAX_ALLOWED_ERROR_MIN) * 100);
-
-    // ── duration_type & predicted_duration_min (from bias-corrected slot) ────
-    const durationType: "ON" | "OFF" = targetState;
-    let predictedDurationMin: number | null = null;
-    if (slotStartMs && slotEndMs && slotEndMs > slotStartMs) {
-      predictedDurationMin = (slotEndMs - slotStartMs) / 60_000;
-    }
-
-    // ── actual_duration_min (from the next power_event) ──────────────────────
-    let actualDurationMin: number | null = null;
-    if (j + 1 < events.length) {
-      const nextMs = new Date(events[j + 1].occurred_at).getTime();
-      if (nextMs > evMs) {
-        actualDurationMin = (nextMs - evMs) / 60_000;
-        // Sanity cap: >24 h almost certainly means a data gap
-        if (actualDurationMin > 1440) actualDurationMin = null;
-      }
-    }
-
-    toInsert.push({
-      predicted_event_time:  predictedIso,
-      actual_event_time:     ev.occurred_at,
-      predicted_state:       ev.event_type,
-      actual_state:          ev.event_type,
-      error_minutes:         Math.round(errorMin * 100) / 100,
-      accuracy_score:        Math.round(accuracyScore * 100) / 100,
-      confidence_score:      confidence,
-      prediction_generated_at: computedAt,
-      slot_id:               `server_resolved_${durationType}`,
-      duration_type:         durationType,
-      predicted_duration_min:
-        predictedDurationMin !== null ? Math.round(predictedDurationMin * 100) / 100 : null,
-      actual_duration_min:
-        actualDurationMin !== null ? Math.round(actualDurationMin * 100) / 100 : null,
-    });
-  }
-
-  if (toInsert.length === 0) return { inserted: 0, skipped: events.length };
-
-  // Chunked insert (50 rows per batch)
-  let inserted = 0;
-  const CHUNK = 50;
-  for (let i = 0; i < toInsert.length; i += CHUNK) {
-    const { error: insErr } = await supabase
-      .from("prediction_accuracy_logs")
-      .insert(toInsert.slice(i, i + CHUNK));
-    if (!insErr) inserted += Math.min(CHUNK, toInsert.length - i);
-    else console.error("[analyze-patterns] accuracy insert error:", insErr.message);
-  }
-
-  return { inserted, skipped: events.length - toInsert.length };
+interface ResolveOutcome {
+  inserted: number;
+  resolvedSnapIds: Set<string>;
 }
 
-// ── Load accuracy history ─────────────────────────────────────────────────────
+async function resolveAccuracyRows(
+  supabase: ReturnType<typeof getSupabase>,
+  events: PowerEvent[],          // 36h window, any order
+  prevSnapshots: PredictionSnapshot[],
+): Promise<ResolveOutcome> {
+  const outcome: ResolveOutcome = { inserted: 0, resolvedSnapIds: new Set() };
+  if (prevSnapshots.length === 0 || events.length === 0) return outcome;
+
+  const asc = [...events].sort(
+    (a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime()
+  );
+
+  // Events already resolved by a previous run (dedupe)
+  const windowStart = asc[0].occurred_at;
+  const { data: alreadyRows } = await supabase
+    .from("prediction_accuracy_logs")
+    .select("actual_event_time")
+    .like("slot_id", "snap_%")
+    .gte("actual_event_time", windowStart);
+  const alreadySet = new Set((alreadyRows ?? []).map((r: { actual_event_time: string }) => r.actual_event_time));
+
+  const rows: Record<string, unknown>[] = [];
+  for (let i = 0; i < asc.length; i++) {
+    const ev = asc[i];
+    const evMs = new Date(ev.occurred_at).getTime();
+    if (alreadySet.has(ev.occurred_at)) continue;
+
+    // Latest snapshot of this type issued strictly BEFORE the event
+    let best: PredictionSnapshot | null = null;
+    let bestGen = -1;
+    for (const snap of prevSnapshots) {
+      if (snap.type !== ev.event_type) continue;
+      const genMs = new Date(snap.generatedAt).getTime();
+      const predMs = new Date(snap.predictedIso).getTime();
+      if (!Number.isFinite(genMs) || !Number.isFinite(predMs)) continue;
+      if (genMs >= evMs) continue;                                   // must pre-date the event
+      if (Math.abs(predMs - evMs) > SNAPSHOT_MATCH_TOLERANCE_MS) continue;
+      if (genMs > bestGen) { bestGen = genMs; best = snap; }
+    }
+    if (!best) continue;
+
+    // Actual duration of the run STARTED by this event (time to next event)
+    let actualDur: number | null = null;
+    if (i + 1 < asc.length) {
+      const d = Math.round((new Date(asc[i + 1].occurred_at).getTime() - evMs) / 60_000);
+      if (d > 0 && d <= 1440) actualDur = d;
+    }
+
+    const predMs = new Date(best.predictedIso).getTime();
+    const absErrMin = Math.abs(evMs - predMs) / 60_000;
+    const score = Math.max(0, Math.round(100 - (absErrMin / MAX_ALLOWED_ERROR_MIN) * 100));
+
+    rows.push({
+      predicted_event_time: best.predictedIso,
+      actual_event_time: ev.occurred_at,
+      error_minutes: Math.round(absErrMin),
+      accuracy_score: score,
+      duration_type: ev.event_type === "UTILITY_ON" ? "ON" : "OFF",
+      predicted_duration_min: best.slotDurationMin,
+      actual_duration_min: actualDur,
+      confidence_score: best.confidence,
+      slot_id: best.id,
+    });
+    outcome.resolvedSnapIds.add(best.id);
+  }
+
+  if (rows.length > 0) {
+    const { error } = await supabase.from("prediction_accuracy_logs").insert(rows);
+    if (error) {
+      console.error("[analyze-patterns] resolve insert error:", error.message);
+    } else {
+      outcome.inserted = rows.length;
+    }
+  }
+  return outcome;
+}
+
+// ── Snapshot list maintenance ─────────────────────────────────────────────────
+function mergeSnapshots(
+  prevSnapshots: PredictionSnapshot[],
+  newSnap: PredictionSnapshot | null,
+  resolvedIds: Set<string>,
+  nowMs: number,
+): PredictionSnapshot[] {
+  const valid = (Array.isArray(prevSnapshots) ? prevSnapshots : []).filter(
+    s => s && typeof s.id === "string" && typeof s.predictedIso === "string" &&
+      typeof s.generatedAt === "string"
+  );
+
+  const kept = valid.filter(s => {
+    if (resolvedIds.has(s.id)) return false;                          // resolved → archived in logs
+    const genMs = new Date(s.generatedAt).getTime();
+    const predMs = new Date(s.predictedIso).getTime();
+    if (nowMs - genMs > SNAPSHOT_MAX_AGE_HOURS * 3600_000) return false; // too old
+    if (predMs < nowMs - SNAPSHOT_MATCH_TOLERANCE_MS) return false;      // missed, unresolvable
+    return true;
+  });
+
+  // Dedupe by id (keep earliest issued — the one users saw first)
+  const seen = new Set<string>();
+  const deduped: PredictionSnapshot[] = [];
+  for (const s of kept) {
+    if (seen.has(s.id)) continue;
+    seen.add(s.id);
+    deduped.push(s);
+  }
+
+  if (newSnap && !seen.has(newSnap.id)) deduped.push(newSnap);
+
+  deduped.sort((a, b) => new Date(a.generatedAt).getTime() - new Date(b.generatedAt).getTime());
+  return deduped.slice(-SNAPSHOT_CAP);
+}
+
+// ── Load accuracy history (v5: includes slot_id) ──────────────────────────────
 async function loadHistory(supabase: ReturnType<typeof getSupabase>): Promise<AccuracyLogRow[]> {
   const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
   const { data, error } = await supabase
     .from("prediction_accuracy_logs")
     .select(
       "predicted_event_time, actual_event_time, error_minutes, accuracy_score, " +
-      "duration_type, predicted_duration_min, actual_duration_min, confidence_score, created_at"
+      "duration_type, predicted_duration_min, actual_duration_min, confidence_score, " +
+      "slot_id, created_at"
     )
     .gte("created_at", since)
     .order("created_at", { ascending: true });
 
   if (error) {
     console.error("[analyze-patterns] loadHistory error:", error.message);
-    // If the error is about missing columns (schema evolution), retry without those cols
-    if (error.message.includes("duration_type") || error.message.includes("column")) {
-      const { data: fallbackData } = await supabase
-        .from("prediction_accuracy_logs")
-        .select("predicted_event_time, actual_event_time, error_minutes, accuracy_score, created_at")
-        .gte("created_at", since)
-        .order("created_at", { ascending: true });
-      return (fallbackData ?? []).map((r: any) => ({
-        ...r,
-        duration_type: null,
-        predicted_duration_min: null,
-        actual_duration_min: null,
-        confidence_score: null,
-      }));
-    }
-    return [];
+    // Schema fallback: slot_id / duration columns may not exist yet
+    const { data: fallbackData } = await supabase
+      .from("prediction_accuracy_logs")
+      .select("predicted_event_time, actual_event_time, error_minutes, accuracy_score, created_at")
+      .gte("created_at", since)
+      .order("created_at", { ascending: true });
+    return (fallbackData ?? []).map((r: Record<string, unknown>) => ({
+      ...(r as object),
+      duration_type: null,
+      predicted_duration_min: null,
+      actual_duration_min: null,
+      confidence_score: null,
+      slot_id: null,
+    })) as AccuracyLogRow[];
   }
-
-  return (data ?? []).map((r: any) => ({
-    predicted_event_time: r.predicted_event_time,
-    actual_event_time: r.actual_event_time,
-    error_minutes: Number(r.error_minutes) || 0,
-    accuracy_score: Number(r.accuracy_score) || 0,
-    duration_type: r.duration_type ?? null,
-    predicted_duration_min: r.predicted_duration_min !== null && r.predicted_duration_min !== undefined
-      ? Number(r.predicted_duration_min) : null,
-    actual_duration_min: r.actual_duration_min !== null && r.actual_duration_min !== undefined
-      ? Number(r.actual_duration_min) : null,
-    confidence_score: r.confidence_score !== null ? Number(r.confidence_score) : null,
-    created_at: r.created_at,
-  }));
+  return (data ?? []) as AccuracyLogRow[];
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -708,7 +925,7 @@ Deno.serve(async (req) => {
   const nowMs = Date.now();
   const windowMs = ANALYSIS_WINDOW_HOURS * 3600_000;
 
-  console.log("[analyze-patterns] Starting APPPE v4 analysis...");
+  console.log("[analyze-patterns] Starting APPPE v5 analysis...");
 
   try {
     // ── 1. Load current inverter state ────────────────────────────────────────
@@ -740,8 +957,8 @@ Deno.serve(async (req) => {
     const events: PowerEvent[] = (rawEvents ?? []) as PowerEvent[];
     console.log(`[analyze-patterns] Loaded ${events.length} events in last ${ANALYSIS_WINDOW_HOURS}h`);
 
-    // ── 3. Load extended history for pattern learning (7 days) ────────────────
-    const extWindowStart = new Date(nowMs - 7 * 24 * 3600_000).toISOString();
+    // ── 3. Load extended history for pattern learning ─────────────────────────
+    const extWindowStart = new Date(nowMs - LEARNING_WINDOW_DAYS * 24 * 3600_000).toISOString();
     const { data: extEvents } = await supabase
       .from("power_events")
       .select("id, event_type, occurred_at")
@@ -749,7 +966,9 @@ Deno.serve(async (req) => {
       .order("occurred_at", { ascending: false })
       .limit(500);
 
-    const allCycles = extractCycles((extEvents ?? []) as PowerEvent[], 7 * 24 * 3600_000, nowMs);
+    const allCycles = extractCycles(
+      (extEvents ?? []) as PowerEvent[], LEARNING_WINDOW_DAYS * 24 * 3600_000, nowMs
+    );
     const recentCycles = extractCycles(events, windowMs, nowMs);
 
     console.log(`[analyze-patterns] Cycles: ${allCycles.length} total, ${recentCycles.length} recent`);
@@ -762,41 +981,51 @@ Deno.serve(async (req) => {
     const dayStats = computePatternStats(dayCycles);
     const nightStats = computePatternStats(nightCycles);
 
-    // ── 5. Load accuracy history (Phase 4) ────────────────────────────────────
+    // ── 5. Accuracy history (clean snapshot rows drive drift/bias) ────────────
     const history = await loadHistory(supabase);
-    console.log(`[analyze-patterns] Accuracy history: ${history.length} rows`);
+    const cleanHistoryCount = history.filter(
+      r => r.slot_id !== null && r.slot_id.startsWith("snap_")
+    ).length;
+    console.log(`[analyze-patterns] Accuracy history: ${history.length} rows (${cleanHistoryCount} clean)`);
 
-    // ── 6. Drift offset (timing correction) ───────────────────────────────────
+    // ── 6. Drift offset ───────────────────────────────────────────────────────
     const { driftOffset, driftSamples, sampleCount: driftSampleCount } =
       computeDriftOffset(history);
 
-    // ── 7. Volatility EMA ─────────────────────────────────────────────────────
-    // Read previous EMA from last prediction if available
+    // ── 7. Previous prediction (volatility EMA + snapshots) ───────────────────
     const { data: prevPred } = await supabase
       .from("utility_predictions")
       .select("prediction")
       .eq("id", 1)
       .maybeSingle();
 
-    const prevVolEMA: number = (prevPred?.prediction as any)?.apppe?.volatilityEMA ?? 0;
-    const volatilityEMA = computeVolatilityEMA(history, prevVolEMA);
+    const prevPayload = (prevPred?.prediction ?? null) as Record<string, unknown> | null;
+    const prevApppe = (prevPayload?.apppe ?? null) as Record<string, unknown> | null;
+    const prevVolEMA: number = (prevApppe?.volatilityEMA as number) ?? 0;
+    const prevSnapshots: PredictionSnapshot[] =
+      (Array.isArray(prevPayload?.snapshots) ? prevPayload.snapshots : []) as PredictionSnapshot[];
 
-    // ── 8. Crisis detection ────────────────────────────────────────────────────
-    // Use last 24h as "recent" vs 7-day as "historical" baseline
+    const volatilityEMA = computeVolatilityEMA(
+      history.filter(r => r.slot_id !== null && r.slot_id.startsWith("snap_")),
+      prevVolEMA,
+    );
+
+    // ── 8. Crisis detection (last 24h vs 7-day baseline) ─────────────────────
     const last24hCycles = allCycles.filter(c => c.startMs > nowMs - 24 * 3600_000);
     const { crisisActive, crisisReason, crisisShift } = detectCrisis(last24hCycles, allCycles);
     console.log(`[analyze-patterns] Crisis: ${crisisActive}, reason: ${crisisReason ?? "none"}`);
 
-    // ── 9. Phase 4 Bias Engine ────────────────────────────────────────────────
+    // ── 9. Bias Engine ────────────────────────────────────────────────────────
     const biasResult = loadBiasFromHistory(history);
     console.log(
       `[analyze-patterns] Bias: ON=${biasResult.biasRatioOn.toFixed(2)}x ` +
       `OFF=${biasResult.biasRatioOff.toFixed(2)}x samples=${biasResult.sampleCount}`
     );
 
-    // ── 10. APPPE v4 quality factors ──────────────────────────────────────────
+    // ── 10. Quality factors & confidence ──────────────────────────────────────
     const biasSamples = history
-      .filter(r => r.predicted_duration_min !== null && r.actual_duration_min !== null)
+      .filter(r => r.slot_id !== null && r.slot_id.startsWith("snap_") &&
+        r.predicted_duration_min !== null && r.actual_duration_min !== null)
       .map(r => r.actual_duration_min! / r.predicted_duration_min!);
 
     const qualityFactors = computeQualityFactors(
@@ -814,18 +1043,10 @@ Deno.serve(async (req) => {
       effectiveWeightedSamples >= 21 ? "learned" :
       effectiveWeightedSamples >= 7 ? "hybrid" : "prior_only";
 
-    // ── 12. Determine effective ON/OFF durations ──────────────────────────────
-    // Use period-specific stats if available, otherwise all-period stats
-    const currentPeriod = getPeriod(nowMs);
-    const periodStats = currentPeriod === "day" ? dayStats : nightStats;
-
-    const avgOffMin = periodStats.avgOffMin > 0
-      ? periodStats.avgOffMin
-      : allStats.avgOffMin > 0 ? allStats.avgOffMin : 120;
-    const avgOnMin = (periodStats.avgOnMin ?? allStats.avgOnMin) ?? 120;
+    // ── 12. Solar-aware duration model ────────────────────────────────────────
+    const model = buildDurationModel(allCycles, nowMs);
 
     // ── 13. Current state start time ─────────────────────────────────────────
-    // Find the last event that matches the current state
     const sortedEvents = [...events].sort(
       (a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime()
     );
@@ -838,12 +1059,11 @@ Deno.serve(async (req) => {
 
     const currentStateDurationMin = Math.round((nowMs - currentStateStartMs) / 60_000);
 
-    // ── 14. Generate day schedule ─────────────────────────────────────────────
+    // ── 14. Generate day schedule (per-slot durations) ────────────────────────
     const daySchedule = generateDaySchedule(
       currentState,
       currentStateStartMs,
-      avgOnMin,
-      avgOffMin,
+      model,
       driftOffset,
       biasResult,
       nowMs,
@@ -854,13 +1074,59 @@ Deno.serve(async (req) => {
     console.log(`[analyze-patterns] Generated ${daySchedule.length} schedule slots`);
 
     // ── 15. Next transition ───────────────────────────────────────────────────
-    const nextTransition = computeNextTransition(daySchedule, currentState, nowMs);
+    const nextTransition = computeNextTransition(daySchedule, currentState, model, nowMs) as {
+      type: "UTILITY_ON" | "UTILITY_OFF";
+      earliestTime: string;
+      rangeStartIso: string;
+    } | null;
 
-    // ── 16. Stability metrics ─────────────────────────────────────────────────
-    const offDurations = allCycles.filter(c => c.state === "OFF").map(c => c.durationMin);
+    // ── 16. Resolve past snapshots against real events ────────────────────────
+    let accInserted = 0;
+    let resolvedSnapIds = new Set<string>();
+    try {
+      const res = await resolveAccuracyRows(supabase, events, prevSnapshots);
+      accInserted = res.inserted;
+      resolvedSnapIds = res.resolvedSnapIds;
+      console.log(`[analyze-patterns] Accuracy resolve: inserted=${accInserted}`);
+    } catch (accErr) {
+      console.error("[analyze-patterns] Accuracy resolve failed (non-fatal):", accErr);
+    }
+
+    // ── 17. Append the live prediction as a new snapshot ──────────────────────
+    let newSnap: PredictionSnapshot | null = null;
+    if (nextTransition) {
+      const targetState = nextTransition.type === "UTILITY_ON" ? "ON" : "OFF";
+      const slot = daySchedule.find(
+        s => s.state === targetState && s.startIso === nextTransition.earliestTime
+      );
+      let slotDurMin = 0;
+      if (slot?.endIso) {
+        slotDurMin = Math.round(
+          (new Date(slot.endIso).getTime() - new Date(slot.startIso).getTime()) / 60_000
+        );
+      } else {
+        slotDurMin = Math.round(
+          targetState === "ON" ? model.onDurAt(nowMs) : model.offDurAt(nowMs)
+        );
+      }
+      newSnap = {
+        id: `snap_${nextTransition.type}_${nextTransition.rangeStartIso}`,
+        type: nextTransition.type,
+        predictedIso: nextTransition.earliestTime,
+        slotDurationMin: slotDurMin,
+        generatedAt: new Date(nowMs).toISOString(),
+        confidence,
+      };
+    }
+    const snapshots = mergeSnapshots(prevSnapshots, newSnap, resolvedSnapIds, nowMs);
+
+    // ── 18. Stability metrics (censored runs excluded) ────────────────────────
+    const offDurations = allCycles
+      .filter(c => c.state === "OFF" && !c.censored).map(c => c.durationMin);
     const madOffVal = Math.round(mad(offDurations));
     const avgOffVal = mean(offDurations);
-    const onDurations = allCycles.filter(c => c.state === "ON").map(c => c.durationMin);
+    const onDurations = allCycles
+      .filter(c => c.state === "ON" && !c.censored).map(c => c.durationMin);
     const madOnVal = onDurations.length > 0 ? Math.round(mad(onDurations)) : null;
     const relativeMAD = avgOffVal > 0 ? mad(offDurations) / avgOffVal : 1;
     const stabilityScore = Math.max(0, Math.min(100, Math.round(100 - relativeMAD * 200)));
@@ -868,7 +1134,7 @@ Deno.serve(async (req) => {
       : stabilityScore >= 45 ? "Slightly Unstable" : "Unstable";
     const isUnstable = stabilityScore < 45;
 
-    // ── 17. Expected ranges ───────────────────────────────────────────────────
+    // ── 19. Expected ranges ───────────────────────────────────────────────────
     const computeRange = (arr: number[]) => {
       if (arr.length === 0) return null;
       const avg = mean(arr);
@@ -880,17 +1146,28 @@ Deno.serve(async (req) => {
     const expectedOffRange = computeRange(offDurations);
     const expectedOnRange = computeRange(onDurations);
 
-    // ── 18. Confidence label ──────────────────────────────────────────────────
+    // ── 20. Confidence label ──────────────────────────────────────────────────
     const confidenceLabel =
       confidence >= 88 ? "مرتفعة جداً" :
       confidence >= 72 ? "مرتفعة" :
       confidence >= 52 ? "متوسطة" : "منخفضة";
 
-    // ── 19. Reasoning ─────────────────────────────────────────────────────────
+    // ── 21. Reasoning ─────────────────────────────────────────────────────────
     const reasoning: string[] = [];
     reasoning.push(
-      `تم تحليل ${allCycles.length} دورة في نافذة ${ANALYSIS_WINDOW_HOURS} ساعة`
+      `تم تحليل ${allCycles.length} دورة في نافذة ${LEARNING_WINDOW_DAYS} أيام`
     );
+    if (model.offCurve.length > 0) {
+      const durs = model.offCurve.map(p => p.durMin);
+      const lo = Math.min(...durs);
+      const hi = Math.max(...durs);
+      if (hi - lo >= 30) {
+        reasoning.push(
+          `مدة الانقطاع تعتمد على وقت بدئها: من ${durationLabel(lo)} ظهراً (دعم الطاقة الشمسية) ` +
+          `حتى ${durationLabel(hi)} في ذروة المساء`
+        );
+      }
+    }
     if (crisisActive && crisisReason) {
       reasoning.push(`⚠️ وضع الأزمة: ${crisisReason}`);
     }
@@ -910,7 +1187,9 @@ Deno.serve(async (req) => {
       reasoning.push("وضع التعلم المبكر — التوقعات تعتمد على النماذج الأساسية في الوقت الحالي");
     }
 
-    // ── 20. Assemble prediction object ────────────────────────────────────────
+    const currentPeriod = getPeriod(nowMs);
+
+    // ── 22. Assemble prediction object (v4 shape + v5 additions) ─────────────
     const prediction = {
       currentState,
       currentStateDurationMin,
@@ -922,6 +1201,7 @@ Deno.serve(async (req) => {
       expectedOffRange,
       expectedOnRange,
       daySchedule,
+      snapshots,
 
       confidence,
       confidenceLabel,
@@ -943,7 +1223,7 @@ Deno.serve(async (req) => {
       computedAt: new Date(nowMs).toISOString(),
 
       apppe: {
-        version: "4",
+        version: "5",
         crisisActive,
         crisisReason,
         driftOffset,
@@ -960,12 +1240,13 @@ Deno.serve(async (req) => {
         madOff: madOffVal,
         madOn: madOnVal,
         predictionQuality: qualityFactors,
-        historySource: `${history.length} accuracy log rows`,
+        offDurationCurve: model.offCurve,
+        historySource: `${cleanHistoryCount} snapshot-resolved rows (of ${history.length} total)`,
         rangeWasClamped: false,
       },
     };
 
-    // ── 21. Upsert to utility_predictions ─────────────────────────────────────
+    // ── 23. Upsert to utility_predictions ─────────────────────────────────────
     const { error: upsertErr } = await supabase
       .from("utility_predictions")
       .upsert({
@@ -983,30 +1264,10 @@ Deno.serve(async (req) => {
       );
     }
 
-    // ── 22. Server-side accuracy logging ──────────────────────────────────────
-    // Must run AFTER the upsert so the schedule is fully committed. Failures
-    // are non-fatal — they must never block the main prediction response.
-    let accInserted = 0;
-    let accSkipped = 0;
-    try {
-      const accResult = await logAccuracyForRecentEvents(
-        supabase,
-        daySchedule,
-        prediction.computedAt,
-        confidence,
-      );
-      accInserted = accResult.inserted;
-      accSkipped  = accResult.skipped;
-      console.log(
-        `[analyze-patterns] Accuracy logging: inserted=${accInserted} skipped=${accSkipped}`,
-      );
-    } catch (accErr) {
-      console.error("[analyze-patterns] Accuracy logging failed (non-fatal):", accErr);
-    }
-
     console.log(
       `[analyze-patterns] Done. state=${currentState} confidence=${confidence}% ` +
-      `slots=${daySchedule.length} drift=${driftOffset}min crisis=${crisisActive}`
+      `slots=${daySchedule.length} drift=${driftOffset}min crisis=${crisisActive} ` +
+      `snapshots=${snapshots.length}`
     );
 
     return new Response(
@@ -1023,7 +1284,7 @@ Deno.serve(async (req) => {
         biasSampleCount: biasResult.sampleCount,
         computedAt: prediction.computedAt,
         accuracyInserted: accInserted,
-        accuracySkipped:  accSkipped,
+        snapshotCount: snapshots.length,
       }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
