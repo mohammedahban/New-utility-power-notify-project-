@@ -620,53 +620,17 @@ export function useUserPredictions(
         }
       };
 
-      const handleAccuracyEvent = (event: AccuracyLogEvent) => {
-        // ── Write-guard: deduplicate using minute-precision composite key ──────
-        // Truncate both timestamps to the minute so that sub-second retiming
-        // differences between successive 30-second ticks don't produce a
-        // different key for the same logical event.
-        const predKey = event.predictedTransitionIso.slice(0, 16); // YYYY-MM-DDTHH:MM
-        const actKey  = event.actualTransitionIso.slice(0, 16);
-        const pairKey = `${predKey}|${actKey}`;
-
-        if (loggedPairsRef.current.has(pairKey)) {
-          // Already persisted — skip silently
-          return;
-        }
-
-        // Optimistically mark as logged BEFORE the async insert so that any
-        // re-render triggered by the insert response doesn't fire a second insert.
-        loggedPairsRef.current.add(pairKey);
-
-        // Persist the updated set (fire-and-forget, capped at MAX_SIZE)
-        const pairsArray = Array.from(loggedPairsRef.current);
-        const trimmed = pairsArray.length > ACCURACY_LOG_MAX_SIZE
-          ? pairsArray.slice(pairsArray.length - ACCURACY_LOG_MAX_SIZE)
-          : pairsArray;
-        if (trimmed.length !== pairsArray.length) {
-          loggedPairsRef.current = new Set(trimmed);
-        }
-        AsyncStorage.setItem(ACCURACY_LOGGED_KEY, JSON.stringify(trimmed)).catch(() => {});
-
-        supabase
-          .from('prediction_accuracy_logs')
-          .insert({
-            predicted_event_time: event.predictedTransitionIso,
-            actual_event_time: event.actualTransitionIso,
-            predicted_state: event.targetState,
-            actual_state: event.targetState,
-            error_minutes: Math.round(Math.abs(event.errorMinutes) * 100) / 100,
-            accuracy_score: Math.round(Math.max(0, Math.min(100, event.accuracyScore)) * 100) / 100,
-            slot_id: `client_hook_${event.targetState === 'UTILITY_ON' ? 'ON' : 'OFF'}`,
-            created_at: new Date().toISOString(),
-          })
-          .then(({ error }) => {
-            if (error) {
-              // Roll back the optimistic mark so it can be retried next cycle
-              loggedPairsRef.current.delete(pairKey);
-              console.error('[useUserPredictions] accuracy log insert error:', error.message);
-            }
-          });
+      const handleAccuracyEvent = (_event: AccuracyLogEvent) => {
+        // ── APPPE v5: client-side accuracy writes are DISABLED ────────────────
+        // Accuracy rows are now written exclusively by the server's
+        // snapshot-and-resolve logger (slot_id 'snap_%'), which scores each
+        // event against the prediction that was actually live BEFORE the
+        // event — one truthful row per event. The old client writer
+        // ('client_hook_*') mixed device-local shifted-schedule measurements
+        // into the same table and made the admin accuracy metrics unreadable.
+        // The engine callback is kept as a no-op so the timing engine's
+        // behavior is completely unchanged.
+        return;
       };
 
       // ── Engine pipeline ──────────────────────────────────────────────────
