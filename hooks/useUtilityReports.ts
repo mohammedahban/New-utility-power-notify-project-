@@ -642,9 +642,53 @@ export function useUtilityReports() {
 
     let v22Offset: ReporterOffsetResult | { error: string } | null = null;
     if (schedule.length > 0) {
-      // SPEC-FIX (F9): classify the period at the SUBMISSION time (nowMs);
-      // the offset VALUE is still computed from the reported transition time.
-      v22Offset = calculateReporterOffset(schedule, transitionMs, nowMs);
+      // SPEC-FIX B3 (Selected Time Option): when the user picks a PAST time T,
+      // the period must be classified AT T (spec: "the selected time consumes
+      // durations"). The live schedule only covers the present cycle, so T
+      // often falls outside every slot → silent NEUTRAL. Fix: extend the
+      // schedule BACKWARDS from power_events history so T has a slot to be
+      // classified against, and classify at T itself.
+      let effectiveSchedule = schedule;
+      const earliestMs = Math.min(
+        ...schedule.map((s: any) => new Date(s.start).getTime()).filter(Number.isFinite),
+      );
+      if (transitionMs < nowMs - 60_000 && Number.isFinite(earliestMs) && transitionMs < earliestMs - 60_000) {
+        try {
+          const { data: histEvents } = await supabase
+            .from('power_events')
+            .select('event_type, occurred_at')
+            .lt('occurred_at', new Date(earliestMs).toISOString())
+            .order('occurred_at', { ascending: false })
+            .limit(14);
+          if (histEvents && histEvents.length > 0) {
+            const chrono = [...histEvents].reverse(); // oldest → newest
+            const histSlots: ScheduleSlot[] = [];
+            for (let i = 0; i < chrono.length; i++) {
+              const startIso = chrono[i].occurred_at;
+              const endIso = i + 1 < chrono.length
+                ? chrono[i + 1].occurred_at
+                : new Date(earliestMs).toISOString();
+              const startMs = new Date(startIso).getTime();
+              const endMs = new Date(endIso).getTime();
+              if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
+              histSlots.push({
+                state: chrono[i].event_type === 'UTILITY_ON' ? 'ON' : 'OFF',
+                start: startIso,
+                end: endIso,
+                durationMin: Math.round((endMs - startMs) / 60_000),
+              } as ScheduleSlot);
+            }
+            if (histSlots.length > 0) {
+              effectiveSchedule = [...histSlots, ...schedule];
+            }
+          }
+        } catch (e) {
+          console.warn('[useUtilityReports] Failed to extend schedule from history (falling back to live schedule):', e);
+        }
+      }
+      // Classify the period at the REPORTED time T against the extended
+      // schedule; the offset value is likewise anchored at T.
+      v22Offset = calculateReporterOffset(effectiveSchedule, transitionMs, transitionMs);
       if ('error' in v22Offset) {
         console.warn('[useUtilityReports] Offset calculation error:', v22Offset.error);
         v22Offset = null;
@@ -667,57 +711,80 @@ export function useUtilityReports() {
       ? v22Offset.generatedOnReferenceKind
       : null;
 
-    // ── V2.3 (Issue 1A, part 2): Resolve PENDING_NEGATIVE immediately ────────
-    // If the report was classified as PENDING_NEGATIVE (Period 2), the
-    // numeric offset value is normally resolved later when a NEW
-    // UTILITY_ON power_event arrives. But if Growatt is ALREADY ON at
-    // submission time — e.g. because the schedule was stale, or the user
-    // submitted just after Growatt flipped — no new event will arrive, and
-    // the offset would stay PENDING forever (the bug the user reported).
+    // ── SPEC-FIX B3 (Selected Time Option): Resolve PENDING_NEGATIVE from ────
+    // power_events RELATIVE TO THE REPORTED TIME T — not from the inverter's
+    // live state. The old inverter_state check only worked when the Growatt
+    // was ON *right now*; for a past-time report (or an ON that started after
+    // T but before submission) it either missed the resolution or anchored on
+    // the wrong ON event.
     //
-    // Fix: query `inverter_state` for the current Growatt state. If it's ON,
-    // query the most recent UTILITY_ON power_event and compute the offset
-    // as `transitionMs - growattOnMs`. This makes the offset resolve
-    // immediately, matching the user's expectation that "when a user
-    // reports changing state while the Growatt state is ON the logic can
-    // detect it".
+    // Event-based rule:
+    //   1. Find the latest UTILITY_ON and latest UTILITY_OFF at or before T.
+    //   2. If the ON is newer than the OFF → Growatt was already ON at T →
+    //      offset = T − that ON (negative).
+    //   3. Otherwise find the FIRST UTILITY_ON after T → the user reported
+    //      early → offset = T − that ON (negative, the ON arrived later).
+    //   The value is clamped to ≤ 0 (and ≥ −12 h) per spec.
     if (offsetState === 'PENDING_NEGATIVE') {
       try {
-        const { data: invRow } = await supabase
-          .from('inverter_state')
-          .select('utility_on, last_polled')
-          .eq('id', 1)
-          .maybeSingle();
-        if (invRow?.utility_on === true) {
-          // Growatt is ON — find the most recent UTILITY_ON event timestamp
-          const { data: onEvent } = await supabase
+        const transitionIso = new Date(transitionMs).toISOString();
+        const [onBeforeRes, offBeforeRes] = await Promise.all([
+          supabase
             .from('power_events')
             .select('occurred_at')
             .eq('event_type', 'UTILITY_ON')
+            .lte('occurred_at', transitionIso)
             .order('occurred_at', { ascending: false })
+            .limit(1),
+          supabase
+            .from('power_events')
+            .select('occurred_at')
+            .eq('event_type', 'UTILITY_OFF')
+            .lte('occurred_at', transitionIso)
+            .order('occurred_at', { ascending: false })
+            .limit(1),
+        ]);
+        const onBeforeRows = onBeforeRes.data;
+        const offBeforeRows = offBeforeRes.data;
+        let growattOnIso: string | null = null;
+        const onBeforeMs = onBeforeRows?.[0]?.occurred_at ? new Date(onBeforeRows[0].occurred_at).getTime() : 0;
+        const offBeforeMs = offBeforeRows?.[0]?.occurred_at ? new Date(offBeforeRows[0].occurred_at).getTime() : 0;
+        if (onBeforeMs > offBeforeMs) {
+          // Growatt was already ON at T — anchor on that ON event.
+          growattOnIso = onBeforeRows![0].occurred_at;
+        } else {
+          // Growatt turned ON after T — the first subsequent ON event is the anchor.
+          const { data: onAfterRows } = await supabase
+            .from('power_events')
+            .select('occurred_at')
+            .eq('event_type', 'UTILITY_ON')
+            .gt('occurred_at', transitionIso)
+            .order('occurred_at', { ascending: true })
             .limit(1);
-          const growattOnIso = onEvent?.[0]?.occurred_at;
-          if (growattOnIso) {
-            const growattOnMs = new Date(growattOnIso).getTime();
-            if (Number.isFinite(growattOnMs)) {
-              const resolvedOffsetMin = Math.round((transitionMs - growattOnMs) / 60_000);
-              offsetState = 'NEGATIVE';
-              offsetValue = resolvedOffsetMin;
-              timelineAlignment = growattOnIso;
-              generatedOnReferenceIso = growattOnIso;
-              console.info(
-                '[useUtilityReports] PENDING_NEGATIVE resolved immediately: ' +
-                `T=${estimatedTransitionAt}, GrowattON=${growattOnIso}, ` +
-                `offset=${resolvedOffsetMin} min`,
-              );
-            }
+          growattOnIso = onAfterRows?.[0]?.occurred_at ?? null;
+        }
+        if (growattOnIso) {
+          const growattOnMs = new Date(growattOnIso).getTime();
+          if (Number.isFinite(growattOnMs)) {
+            let resolvedOffsetMin = Math.round((transitionMs - growattOnMs) / 60_000);
+            if (resolvedOffsetMin > 0) resolvedOffsetMin = 0;
+            if (resolvedOffsetMin < -720) resolvedOffsetMin = -720;
+            offsetState = 'NEGATIVE';
+            offsetValue = resolvedOffsetMin;
+            timelineAlignment = growattOnIso;
+            generatedOnReferenceIso = growattOnIso;
+            console.info(
+              '[useUtilityReports] PENDING_NEGATIVE resolved from event history: ' +
+              `T=${estimatedTransitionAt}, GrowattON=${growattOnIso}, ` +
+              `offset=${resolvedOffsetMin} min`,
+            );
           }
         }
       } catch (e) {
         // Non-fatal — the PENDING_NEGATIVE state will be resolved later by
         // the useGrowattOnWatcher in useResyncNotifications when the next
         // UTILITY_ON event arrives.
-        console.warn('[useUtilityReports] Failed to check current Growatt state for immediate resolution:', e);
+        console.warn('[useUtilityReports] Failed to resolve pending offset from event history:', e);
       }
     }
 
