@@ -354,11 +354,15 @@ function useGrowattOnWatcher(
   resyncPoint: ResyncPoint | null,
   isPendingNegative: boolean,
   isNegativeOffset: boolean,
+  // SPEC-FIX D1: positive offsets also need the live Growatt-ON signal so the
+  // user device can anchor its timeline the moment the sensor flips (the engine
+  // would otherwise keep the user OFF until analyze-patterns regenerates).
+  isPositiveOffset: boolean = false,
 ): { growattOnTick: number; growattOnIso: string | null; clearGrowattOn: () => void } {
   const [tick, setTick] = useState(0);
   const [growattOnIso, setGrowattOnIso] = useState<string | null>(null);
 
-  const shouldSubscribe = isPendingNegative || isNegativeOffset;
+  const shouldSubscribe = isPendingNegative || isNegativeOffset || isPositiveOffset;
 
   const clearGrowattOn = useCallback(() => {
     setGrowattOnIso(null);
@@ -513,9 +517,16 @@ export function useUserPredictions(
     let cancelled = false;
     (async () => {
       try {
+        // SPEC-FIX C4: scope both queries to the authenticated user. The old
+        // unscoped "latest row" could read ANOTHER user's resync metadata
+        // (offset state / Generated ON) and corrupt this user's timeline.
+        const { data: authData } = await supabase.auth.getUser();
+        const uid = authData?.user?.id;
+        if (!uid || cancelled) return;
         const { data: primaryData, error: primaryError } = await supabase
           .from('resync_history')
           .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind, reverted_at')
+          .eq('user_id', uid)
           .order('confirmed_at', { ascending: false })
           .limit(1)
           .maybeSingle();
@@ -525,6 +536,7 @@ export function useUserPredictions(
           const fallback = await supabase
             .from('resync_history')
             .select('offset_state, offset_value, timeline_alignment, generated_on_start_iso, generated_on_duration_min, generated_on_reference_iso, generated_on_reference_kind')
+            .eq('user_id', uid)
             .order('confirmed_at', { ascending: false })
             .limit(1)
             .maybeSingle();
@@ -566,6 +578,7 @@ export function useUserPredictions(
     resyncPoint,
     isPendingNegativeV21,
     isNegativeOffset,
+    offsetMinutes > 0, // SPEC-FIX D1
   );
   const resolutionTick = growattOnTick;
 
@@ -759,6 +772,19 @@ export function useUserPredictions(
         modeV22 !== 'COMMUNITY_SYNCED' &&
         offsetMinutes < 0;
 
+      // SPEC-FIX D1: positive-offset anchoring on live Growatt ON.
+      // A positive-offset user's ON starts offsetMinutes AFTER the sensor
+      // flips. Without this branch the app sat in WAITING_FOR_GROWATT until
+      // analyze-patterns regenerated the schedule (10–30 s+). The moment the
+      // watcher sees this cycle's Growatt UTILITY_ON we either start the
+      // POSITIVE_OFFSET_PENDING countdown (ON still ahead) or flip straight
+      // to ON (offset already elapsed).
+      const shouldPositiveGrowattAnchor =
+        growattOnIsCurrentCycle &&
+        inUncertainFamily &&
+        modeV22 === 'WAITING_FOR_GROWATT' &&
+        offsetMinutes > 0;
+
       if (shouldImmediateFlip && growattOnIso) {
         const growattOnMs = new Date(growattOnIso).getTime();
         // User's ON started = Growatt ON time + offset (negative → shifts backward)
@@ -776,6 +802,14 @@ export function useUserPredictions(
           : 120 * 60_000; // 2h default
         const userOnEndMs = userOnStartMs + onDurationMs;
         const userOnEndIso = new Date(userOnEndMs).toISOString();
+
+        // SPEC-FIX B4: if the reconstructed ON window has ALREADY ended by now,
+        // flipping to ON would show a broken state (elapsed > duration, zero
+        // remaining). Bail out and keep the engine's result instead.
+        if (userOnEndMs <= nowV22) {
+          immediateOnActiveRef.current = false;
+          return finalResult;
+        }
 
         const fmtLocal = (iso: string) => new Date(iso).toLocaleString('en-US', {
           timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
@@ -846,6 +880,120 @@ export function useUserPredictions(
             isHoldingState: false,
           },
         };
+      } else if (shouldPositiveGrowattAnchor && growattOnIso) {
+        // SPEC-FIX D1: anchor a positive-offset user's timeline on the live
+        // Growatt UTILITY_ON of the current cycle.
+        const growattOnMsP = new Date(growattOnIso).getTime();
+        // User's ON starts = Growatt ON time + offset (positive → shifts forward)
+        const userOnStartMsP = growattOnMsP + offsetMinutes * 60_000;
+        const userOnStartIsoP = new Date(userOnStartMsP).toISOString();
+
+        const fmtLocalP = (iso: string) => new Date(iso).toLocaleString('en-US', {
+          timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+        }).replace('AM', ' ص').replace('PM', ' م');
+
+        if (userOnStartMsP > nowV22) {
+          // ON time still ahead → POSITIVE_OFFSET_PENDING countdown state.
+          // currentState stays OFF; the banner counts down to the user's own ON.
+          const minFromNowP = Math.max(0, (userOnStartMsP - nowV22) / 60_000);
+          finalResult = {
+            ...v21Result,
+            currentState: 'OFF',
+            isHoldingState: true,
+            nextTransition: {
+              type: 'UTILITY_ON' as const,
+              earliestTime: userOnStartIsoP,
+              latestTime: userOnStartIsoP,
+              earliestFormatted: fmtLocalP(userOnStartIsoP),
+              latestFormatted: fmtLocalP(userOnStartIsoP),
+              minFromNowMin: minFromNowP,
+              maxFromNowMin: minFromNowP,
+              rangeLabel: fmtLocalP(userOnStartIsoP),
+              rangeStartIso: userOnStartIsoP,
+              rangeEndIso: userOnStartIsoP,
+              inRangeWindow: false,
+            },
+            atc: {
+              ...v21Result.atc,
+              mode: 'POSITIVE_OFFSET_PENDING' as any,
+              statusLine: 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد',
+              overrunMinutes: 0,
+              communityElevated: false,
+              isHoldingState: true,
+              scheduledAutoTransitionIso: userOnStartIsoP,
+            },
+          };
+        } else {
+          // Offset already elapsed since the sensor flip → user is ON now.
+          // Mirrors the negative-offset synthetic ON above.
+          const scheduledOnSlotP = (v21Result.daySchedule ?? []).find(
+            (s: ShiftedScheduleSlot) => s.state === 'ON' && new Date(s.startIso).getTime() >= growattOnMsP - 2 * 3600_000,
+          );
+          const onDurationMsP = scheduledOnSlotP?.endIso
+            ? new Date(scheduledOnSlotP.endIso).getTime() - new Date(scheduledOnSlotP.startIso).getTime()
+            : 120 * 60_000;
+          const userOnEndMsP = userOnStartMsP + onDurationMsP;
+          const userOnEndIsoP = new Date(userOnEndMsP).toISOString();
+
+          // SPEC-FIX B4 (positive variant): never flip into an ON window that
+          // has already ended by now.
+          if (userOnEndMsP <= nowV22) {
+            immediateOnActiveRef.current = false;
+            return finalResult;
+          }
+
+          const durMinP = Math.round(onDurationMsP / 60_000);
+          const durHP = Math.floor(durMinP / 60); const durMP = durMinP % 60;
+          const durationLabelP = durHP === 0 ? `${durMP}د`
+            : durMP === 0 ? (durHP === 1 ? 'ساعة' : `${durHP}س`)
+            : `${durHP}س ${durMP}د`;
+
+          const syntheticOnSlotP: ShiftedScheduleSlot = {
+            state: 'ON',
+            startIso: userOnStartIsoP,
+            endIso: userOnEndIsoP,
+            startFormatted: fmtLocalP(userOnStartIsoP),
+            endFormatted: fmtLocalP(userOnEndIsoP),
+            shiftedStartFormatted: fmtLocalP(userOnStartIsoP),
+            shiftedEndFormatted: fmtLocalP(userOnEndIsoP),
+            durationLabel: durationLabelP,
+            zone: 'DAY',
+            isEstimated: true,
+          };
+
+          immediateOnActiveRef.current = true;
+          shouldClearGrowattOnRef.current = false; // keep active while holding
+
+          finalResult = {
+            ...v21Result,
+            currentState: 'ON',
+            currentStateStartIso: userOnStartIsoP,
+            reconciledCycleStartIso: userOnStartIsoP,
+            isHoldingState: false,
+            daySchedule: [syntheticOnSlotP, ...(v21Result.daySchedule ?? [])],
+            nextTransition: {
+              type: 'UTILITY_OFF' as const,
+              earliestTime: userOnEndIsoP,
+              latestTime: userOnEndIsoP,
+              earliestFormatted: fmtLocalP(userOnEndIsoP),
+              latestFormatted: fmtLocalP(userOnEndIsoP),
+              minFromNowMin: Math.max(0, (userOnEndMsP - nowV22) / 60_000),
+              maxFromNowMin: Math.max(0, (userOnEndMsP - nowV22) / 60_000),
+              rangeLabel: fmtLocalP(userOnEndIsoP),
+              rangeStartIso: userOnEndIsoP,
+              rangeEndIso: userOnEndIsoP,
+              inRangeWindow: false,
+            },
+            atc: {
+              ...v21Result.atc,
+              mode: 'NORMAL' as any,
+              statusLine: '',
+              overrunMinutes: 0,
+              communityElevated: false,
+              isHoldingState: false,
+            },
+          };
+        }
       } else {
         immediateOnActiveRef.current = false;
         // If the engine has caught up (v21Result shows ON), schedule growattOnIso
