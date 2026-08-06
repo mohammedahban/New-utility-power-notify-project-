@@ -13,6 +13,8 @@ import { useResync } from '../../contexts/ResyncContext';
 import { UserPredictionProvider } from '../../contexts/UserPredictionContext';
 import { AR } from '../../constants/arabic';
 
+// Submit-page time options: only "Now" .. "30 minutes before" are offered —
+// the longer lookback options were removed per product decision.
 const TIME_OPTS: { key: TimeOption; label: string }[] = [
   { key: 'now',   label: AR.timeNow   },
   { key: '5min',  label: AR.time5min  },
@@ -20,17 +22,6 @@ const TIME_OPTS: { key: TimeOption; label: string }[] = [
   { key: '15min', label: AR.time15min },
   { key: '20min', label: AR.time20min },
   { key: '30min', label: AR.time30min },
-  { key: '1h',    label: AR.time1h    },
-  { key: '1.5h',  label: AR.time1_5h  },
-  { key: '2h',    label: AR.time2h    },
-  { key: '2.5h',  label: AR.time2_5h  },
-  { key: '3h',    label: AR.time3h    },
-  { key: '3.5h',  label: AR.time3_5h  },
-  { key: '4h',    label: AR.time4h    },
-  { key: '4.5h',  label: AR.time4_5h  },
-  { key: '5h',    label: AR.time5h    },
-  { key: '5.5h',  label: AR.time5_5h  },
-  { key: '6h',    label: AR.time6h    },
 ];
 
 // TMMS V2.2: Global Report Modal — ON-ONLY reporting.
@@ -46,6 +37,7 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
   cooldownLabel: string | null;
 }) {
   const [time, setTime] = useState<TimeOption>('now');
+  const insets = useSafeAreaInsets();
 
   const T = {
     surface: '#0f172a', elevated: '#1e293b', border: '#334155',
@@ -56,12 +48,12 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={grmStyles.overlay}>
+        <View style={[grmStyles.sheet, { paddingBottom: insets.bottom + 24 }]}>
         <ScrollView
-          style={{ flex: 1 }}
-          contentContainerStyle={{ justifyContent: 'flex-end', flexGrow: 1 }}
+          style={{ flexShrink: 1 }}
+          showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
         >
-        <View style={grmStyles.sheet}>
           <View style={grmStyles.handle} />
           {/* V2.2: title changed to ON-only */}
           <Text style={grmStyles.title}>{AR.reportUtilityOn}</Text>
@@ -120,16 +112,18 @@ function GlobalReportModal({ visible, onClose, onSubmit, submitting, isCoolingDo
           <TouchableOpacity style={grmStyles.cancelBtn} onPress={onClose}>
             <Text style={grmStyles.cancelText}>{AR.cancel}</Text>
           </TouchableOpacity>
-        </View>
         </ScrollView>
+        </View>
       </View>
     </Modal>
   );
 }
 
 const grmStyles = StyleSheet.create({
-  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)' },
-  sheet: { backgroundColor: '#0f172a', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40 },
+  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
+  // maxHeight keeps the sheet inside the viewport; the inner ScrollView makes
+  // every widget reachable on small screens (fixes clipped title/buttons).
+  sheet: { backgroundColor: '#0f172a', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, maxHeight: '94%' },
   handle: { width: 40, height: 4, backgroundColor: '#334155', borderRadius: 2, alignSelf: 'center', marginBottom: 20 },
   title: { color: '#f1f5f9', fontSize: 20, fontWeight: '800', marginBottom: 6, textAlign: 'right' },
   sub: { color: '#64748b', fontSize: 13, lineHeight: 19, marginBottom: 20, textAlign: 'right' },
