@@ -5,6 +5,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
+import { useUserOffset } from '../../hooks/useUserOffset';
+import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { supabase } from '../../lib/supabase';
 
 const T = {
@@ -67,10 +69,32 @@ function fmtEventTime(iso: string): string {
 
 function EventsHistorySection() {
   const { events, loading } = usePowerEventsHistory(25);
+  const { offset } = useUserOffset();
+  const { userPrediction } = useSharedUserPrediction();
+
+  // Offset-shifted display: the stored power_events are the GROWATT SENSOR's
+  // timeline. A user with a resolved positive/negative offset experiences each
+  // transition offsetMinutes later/earlier than the sensor, so the history is
+  // shifted by that value to show the user's OWN timeline. Neutral and
+  // PendingNegative users see the sensor timeline unchanged.
+  const offsetState = (userPrediction as any)?.offsetState as
+    'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE' | null | undefined;
+  const storedMin = offset?.offset_minutes ?? 0;
+  const engineVal = (userPrediction as any)?.offsetValue;
+  const shiftMin = offsetState == null
+    ? storedMin
+    : (offsetState === 'POSITIVE' || offsetState === 'NEGATIVE')
+      ? (typeof engineVal === 'number' ? engineVal : storedMin)
+      : 0;
+  const shiftIso = (iso: string) => shiftMin === 0 ? iso
+    : new Date(new Date(iso).getTime() + shiftMin * 60_000).toISOString();
+
   return (
     <View style={ehStyles.container}>
       <Text style={ehStyles.sectionTitle}>📋 سجل الأحداث الفعلية</Text>
-      <Text style={ehStyles.sectionSub}>الأحداث الحقيقية المسجَّلة من الحساس الرئيسي</Text>
+      <Text style={ehStyles.sectionSub}>{shiftMin !== 0
+        ? `الأحداث الحقيقية المسجَّلة من الحساس الرئيسي — معروضة بعد تطبيق فارقك الزمني (${shiftMin > 0 ? '+' : ''}${shiftMin}د)`
+        : 'الأحداث الحقيقية المسجَّلة من الحساس الرئيسي'}</Text>
       {loading ? (
         <ActivityIndicator color={T.accent} size="small" style={{ marginVertical: 16 }} />
       ) : events.length === 0 ? (
@@ -97,7 +121,7 @@ function EventsHistorySection() {
               </View>
               <View style={ehStyles.details}>
                 <Text style={[ehStyles.eventLabel, { color }]}>{icon} {label}</Text>
-                <Text style={ehStyles.eventTime}>{fmtEventTime(ev.occurred_at)}</Text>
+                <Text style={ehStyles.eventTime}>{fmtEventTime(shiftIso(ev.occurred_at))}</Text>
               </View>
               <View style={[ehStyles.colorBar, { backgroundColor: color }]} />
             </View>
