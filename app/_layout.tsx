@@ -4,6 +4,13 @@ import { StatusBar } from 'expo-status-bar';
 import { ActivityIndicator, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as SplashScreen from 'expo-splash-screen';
+
+// Keep the native splash up while AuthContext recovers the session and the
+// onboarding flag is read — it is hidden in AuthGate once routing state is
+// known. Without this the splash auto-hid on the first JS frame and exposed
+// the route-resolution window (cold-start flash of the wrong home screen).
+SplashScreen.preventAutoHideAsync().catch(() => {});
 import { AuthProvider, useAuth } from '../contexts/AuthContext';
 import { ResyncProvider } from '../contexts/ResyncContext';
 import {
@@ -33,6 +40,15 @@ function AuthGate() {
   const router = useRouter();
   const segments = useSegments();
   const [onboardingChecked, setOnboardingChecked] = useState(false);
+
+  // Hide the native splash only when the routing decision inputs are ready.
+  // The index route behind it renders an identical splash, so the handoff is
+  // seamless even if hideAsync fires a frame late.
+  useEffect(() => {
+    if (!loading && onboardingChecked) {
+      SplashScreen.hideAsync().catch(() => {});
+    }
+  }, [loading, onboardingChecked]);
 
   // Check onboarding status once on mount.
   useEffect(() => {
