@@ -309,6 +309,14 @@ export default function ScheduleScreen() {
   const offsetMs = currentOffset * 60_000;
   const atcMode = userPrediction?.atc?.mode;
   const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+  // SPEC-FIX (UNCERTAIN_ZONE schedule hold): while the engine HOLDS the OFF
+  // state (UNCERTAIN_ZONE / WAITING_FOR_GROWATT — predicted OFF consumed but
+  // Growatt has NOT confirmed ON), the wall clock sits inside the predicted ON
+  // window. The schedule must NOT mark that ON slot as the active "now" block —
+  // it shows the held OFF as current and only turns ON when the sensor flips.
+  const holdsOff = (userPrediction?.isHoldingState ?? false)
+    && userPrediction?.currentState === 'OFF'
+    && !!atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING';
 
   // reconciledCycleStartIso: set when an UNCERTAIN_ZONE deduction backdates the ON cycle.
   // When present, it MUST be the start-time anchor so the schedule shows the
@@ -356,6 +364,7 @@ export default function ScheduleScreen() {
   // closest to reconciledStartIso is the active slot (it may be at index 0 if
   // useUserPredictions injected the synthetic slot there).
   const activeIdx = (() => {
+    if (holdsOff) return -1; // no wall-clock slot is "current" while holding OFF
     if (isPositiveOffsetPending && allSlots.length > 0) return 0;
     if (isReconciledFlip && reconciledStartIso) {
       // Find the ON slot that best represents the reconciledCycleStartIso anchor.
@@ -381,9 +390,30 @@ export default function ScheduleScreen() {
     });
   })();
 
-  const startIdx = activeIdx >= 0 ? activeIdx
+  const startIdx = holdsOff
+    ? allSlots.findIndex(s => { const end = s.endIso ? new Date(s.endIso).getTime() : Infinity; return end > nowMs; })
+    : activeIdx >= 0 ? activeIdx
     : allSlots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
-  const slots = startIdx > 0 ? allSlots.slice(startIdx) : allSlots;
+  const slots = startIdx > 0 ? allSlots.slice(startIdx) : (holdsOff && startIdx < 0 ? [] : allSlots);
+
+  // While holding OFF, prepend a synthetic "held OFF" block as the current row.
+  const heldStartIso = userPrediction?.currentStateStartIso ?? new Date(nowMs).toISOString();
+  const heldStartF = new Date(heldStartIso).toLocaleString('en-US', {
+    timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+  }).replace('AM', ' ص').replace('PM', ' م');
+  const heldOffSlot: ShiftedScheduleSlot | null = holdsOff ? {
+    state: 'OFF',
+    startIso: heldStartIso,
+    endIso: '',
+    startFormatted: heldStartF,
+    endFormatted: '',
+    shiftedStartFormatted: heldStartF,
+    shiftedEndFormatted: '',
+    durationLabel: '',
+    zone: 'DAY',
+    isEstimated: false,
+  } as ShiftedScheduleSlot : null;
+  const displaySlots = heldOffSlot ? [heldOffSlot, ...slots] : slots;
 
   if (loading) {
     return (
@@ -471,7 +501,7 @@ export default function ScheduleScreen() {
       </View>
 
       {/* Upcoming schedule */}
-      {slots.length === 0 ? (
+      {displaySlots.length === 0 ? (
         <View style={styles.emptyBox}>
           <Text style={{ fontSize: 48, marginBottom: 16 }}>📅</Text>
           <Text style={styles.emptyTitle}>{AR.noScheduleYet}</Text>
@@ -480,17 +510,22 @@ export default function ScheduleScreen() {
       ) : (
         <View style={styles.timeline}>
           <Text style={styles.sectionLabel}>{AR.scheduleTitle}</Text>
-          {slots.map((slot, i) => {
+          {displaySlots.map((slot, i) => {
             const slotStartMs = new Date(slot.startIso).getTime();
             const slotEndMs = slot.endIso ? new Date(slot.endIso).getTime() : Infinity;
-            // For POSITIVE_OFFSET_PENDING: first slot is always active
-            const isActive = isPositiveOffsetPending ? i === 0 : (nowMs >= slotStartMs && nowMs < slotEndMs);
+            // For POSITIVE_OFFSET_PENDING: first slot is always active.
+            // While holding OFF (UNCERTAIN_ZONE), only the prepended held-OFF
+            // block (index 0) is active — the in-window predicted ON slot must
+            // NEVER render as the current block until Growatt confirms ON.
+            const isActive = isPositiveOffsetPending ? i === 0 : holdsOff ? i === 0 : (nowMs >= slotStartMs && nowMs < slotEndMs);
             const slotKey = `${slot.state}|${Math.round(slotStartMs / 60_000)}`;
 
             // Active start: use mathematicalActiveStartIso for the active slot.
             // For isReconciledFlip, this is reconciledCycleStartIso (the backdated start).
             let activeStartFormatted: string | undefined;
-            if (isActive && mathematicalActiveStartIso) {
+            // While holding OFF, the held block's own startIso (the engine's
+            // currentStateStartIso) is authoritative — do not override it.
+            if (isActive && mathematicalActiveStartIso && !holdsOff) {
               activeStartFormatted = new Date(mathematicalActiveStartIso).toLocaleString('en-US', {
                 timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
               }).replace('AM', ' ص').replace('PM', ' م');
