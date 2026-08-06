@@ -214,10 +214,10 @@ function GeneratedOnBanner({ prediction }: { prediction: UserPrediction | null }
 const goStyles = StyleSheet.create({
   banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#052e16', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.success, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 6 },
-  ref: { color: T.textMuted, fontSize: 10, lineHeight: 15, textAlign: 'right', marginBottom: 4 },
-  note: { color: T.success + 'aa', fontSize: 10, fontStyle: 'italic', textAlign: 'right' },
+  title: { color: T.success, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
+  body: { color: T.textPrimary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 6 },
+  ref: { color: T.textSecondary, fontSize: 10, lineHeight: 15, textAlign: 'right', marginBottom: 4 },
+  note: { color: T.success + 'cc', fontSize: 10, fontStyle: 'italic', textAlign: 'right', fontWeight: '600' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,12 +258,12 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
 const pn2Styles = StyleSheet.create({
   banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#1a0e00', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.warning, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 8 },
+  title: { color: T.warning, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
+  body: { color: T.textPrimary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 8 },
   countdownRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 6 },
   countdownLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
   countdownValue: { color: T.warning, fontSize: 16, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
-  note: { color: T.warning + 'aa', fontSize: 10, fontStyle: 'italic', textAlign: 'right' },
+  note: { color: T.warning + 'cc', fontSize: 10, fontStyle: 'italic', textAlign: 'right', fontWeight: '600' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -342,9 +342,9 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
 const popStyles = StyleSheet.create({
   banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#001a2e', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.accent + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.accent, fontSize: 11, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5 },
-  body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 8 },
-  sub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginTop: 6 },
+  title: { color: T.accent, fontSize: 11, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
+  body: { color: T.textPrimary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 8 },
+  sub: { color: T.textSecondary, fontSize: 10, textAlign: 'right', marginTop: 6 },
   countdownRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 8 },
   countdownLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
   countdownValue: { color: T.accent, fontSize: 18, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
@@ -385,7 +385,7 @@ function ValidationWindowToast({ prediction }: { prediction: UserPrediction | nu
 const vwStyles = StyleSheet.create({
   toast: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
   title: { color: T.warning, fontSize: 12, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  body: { color: '#fbbf24aa', fontSize: 11, lineHeight: 17, textAlign: 'right' },
+  body: { color: '#fbbf24dd', fontSize: 11, lineHeight: 17, textAlign: 'right', fontWeight: '600' },
   close: { width: 26, height: 26, borderRadius: 13, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   closeText: { color: T.textMuted, fontSize: 11, fontWeight: '700' },
 });
@@ -676,7 +676,7 @@ const psStyles = StyleSheet.create({
   liveClockValue: { color: T.warning, fontSize: 22, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 2 },
   deductionNote: { color: T.warning + 'cc', fontSize: 11, fontWeight: '600', textAlign: 'right', fontStyle: 'italic' },
   reasoningBox: { backgroundColor: T.elevated, borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.border },
-  reasoningText: { color: T.textMuted, fontSize: 11, lineHeight: 17, textAlign: 'right' },
+  reasoningText: { color: T.textSecondary, fontSize: 11, lineHeight: 17, textAlign: 'right', fontWeight: '500' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

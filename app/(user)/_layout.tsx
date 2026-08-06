@@ -137,7 +137,7 @@ const grmStyles = StyleSheet.create({
   cooldownBox: { backgroundColor: '#1e293b', borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginBottom: 10, borderWidth: 1, borderColor: '#334155' },
   cooldownText: { color: '#94a3b8', fontSize: 14, fontWeight: '600', textAlign: 'center' },
   calibHint: { backgroundColor: '#001a2e', borderRadius: 10, padding: 12, marginBottom: 16, borderWidth: 1, borderColor: '#38bdf833' },
-  calibHintText: { color: '#94a3b8', fontSize: 12, textAlign: 'right', lineHeight: 18 },
+  calibHintText: { color: '#38bdf8', fontSize: 12, textAlign: 'right', lineHeight: 18, fontWeight: '600' },
   cancelBtn: { paddingVertical: 12, alignItems: 'center' },
   cancelText: { color: '#64748b', fontSize: 14 },
   // V2.2: ON-only banner styles (replaces stateRow/stateBtn* styles)

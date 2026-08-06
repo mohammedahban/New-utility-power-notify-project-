@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "onspace-app",
-    "slug": "onspace-app",
+    "name": "متى تلصي؟عدن",
+    "slug": "mata-talsi-aden",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/logo.png",
@@ -50,7 +50,7 @@
           "color": "#22c55e",
           "sounds": ["./assets/sounds/alarm.wav"],
           "androidMode": "default",
-          "androidCollapsedTitle": "Grid Monitor"
+          "androidCollapsedTitle": "متى تلصي؟عدن"
         }
       ]
     ],

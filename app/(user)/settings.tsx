@@ -315,7 +315,7 @@ export default function UserSettings() {
               <Text style={styles.appIconText}>⚡</Text>
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={styles.appNameText}>مراقب الكهرباء</Text>
+              <Text style={styles.appNameText}>{AR.appName}</Text>
               <Text style={styles.appVersionText}>الإصدار 1.0 · عدن، اليمن</Text>
             </View>
           </View>
