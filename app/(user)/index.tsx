@@ -8,8 +8,7 @@ import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { useTransitionMode } from '../../hooks/useTransitionMode';
-import { UserPrediction, ScheduleStateMode } from '../../hooks/useUserPredictions';
+import { UserPrediction, ScheduleStateMode, ShiftedScheduleSlot } from '../../hooks/useUserPredictions';
 import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
@@ -19,7 +18,6 @@ import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
-import type { TransitionMode } from '../../hooks/useTransitionMode';
 
 const T = {
   bg: '#060d1a', surface: '#0d1526', elevated: '#162035',
@@ -47,46 +45,7 @@ function fmtOverrunAr(min: number): string {
   return m === 0 ? hLabel : `${hLabel} و ${m} دقيقة`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TRANSITION MODE TOGGLE
-// ─────────────────────────────────────────────────────────────────────────────
-function TransitionModeToggle({ mode, onToggle }: { mode: TransitionMode; onToggle: () => void }) {
-  const isAuto = mode === 'AUTO';
-  const bg = isAuto ? '#001a2e' : '#1a0a00';
-  const border = isAuto ? T.accent + '55' : T.warning + '55';
-  const iconColor = isAuto ? T.accent : T.warning;
-  const label = isAuto ? 'الانتقال التلقائي مفعَّل' : 'الانتقال اليدوي مفعَّل';
-  const sub = isAuto ? 'يعتمد على الحساس الرئيسي + التقارير الموثوقة' : 'يعتمد فقط على بلاغاتك وتأكيدات المجتمع';
-  const icon = isAuto ? '⚙️' : '✋';
-  return (
-    <TouchableOpacity style={[tmtStyles.wrap, { backgroundColor: bg, borderColor: border }]} onPress={onToggle} activeOpacity={0.8}>
-      <View style={tmtStyles.left}>
-        <Text style={[tmtStyles.switchLabel, { color: T.textMuted }]}>{isAuto ? 'تبديل إلى يدوي' : 'تبديل إلى تلقائي'}</Text>
-        <View style={[tmtStyles.switchTrack, { backgroundColor: isAuto ? T.accent + '33' : T.warning + '33' }]}>
-          <View style={[tmtStyles.switchThumb, { backgroundColor: iconColor, alignSelf: isAuto ? 'flex-end' : 'flex-start' }]} />
-        </View>
-      </View>
-      <View style={{ flex: 1 }}>
-        <View style={tmtStyles.labelRow}>
-          <Text style={[tmtStyles.modeBadge, { backgroundColor: iconColor + '22', color: iconColor, borderColor: iconColor + '55' }]}>{icon}  {isAuto ? 'AUTO' : 'MANUAL'}</Text>
-          <Text style={[tmtStyles.modeLabel, { color: iconColor }]}>{label}</Text>
-        </View>
-        <Text style={tmtStyles.modeSub}>{sub}</Text>
-      </View>
-    </TouchableOpacity>
-  );
-}
-const tmtStyles = StyleSheet.create({
-  wrap: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 11, marginBottom: 12, borderWidth: 1.5 },
-  labelRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 3 },
-  modeLabel: { fontSize: 13, fontWeight: '800', textAlign: 'right', flex: 1 },
-  modeBadge: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, fontSize: 10, fontWeight: '800', borderWidth: 1, overflow: 'hidden', flexShrink: 0 },
-  modeSub: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
-  left: { alignItems: 'center', gap: 4 },
-  switchLabel: { fontSize: 9, fontWeight: '600', textAlign: 'center', width: 48 },
-  switchTrack: { width: 40, height: 22, borderRadius: 11, padding: 3, justifyContent: 'center' },
-  switchThumb: { width: 16, height: 16, borderRadius: 8 },
-});
+
 
 // ── Stable elapsed timer ──────────────────────────────────────────────────────
 function useElapsedFromIso(startIso: string | null): string {
@@ -763,8 +722,8 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     const isCurrentOn = prediction.currentState === 'ON';
     const tMode = prediction.atc.transitionMode ?? 'AUTO';
     const modeConfigs: Record<string, { icon: string; title: string; body: string; borderColor: string; iconColor: string }> = {
-      UNCERTAIN_ZONE: { icon: '⚠️', title: 'استمرار غير معتاد', body: overrunMin > 0 ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — عند تأكيد Growatt يبدأ التشغيل ويُحسب المتبقي من فارقك المخزّن. إذا وصلتك الكهرباء أرسل بلاغك الآن` : 'بانتظار تأكيد تغير الحالة — التغيير محتمل ولكن غير مؤكد. إذا وصلتك الكهرباء أرسل بلاغك الآن', borderColor: T.warning + '44', iconColor: T.warning },
-      WAITING_FOR_GROWATT: { icon: '⏳', title: 'بانتظار تأكيد الحساس', body: tMode === 'MANUAL' ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة' : 'تجاوزنا نطاق التوقع. بانتظار تأكيد مجتمعي أو Growatt', borderColor: T.accent + '44', iconColor: T.accent },
+      UNCERTAIN_ZONE: { icon: '⚠️', title: 'استمرار غير معتاد', body: overrunMin > 0 ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — قد تعود الكهرباء في أي لحظة الآن. عند تأكيد الحساس (Growatt) يبدأ التشغيل ويُحسب المتبقي من فارقك المخزّن تلقائياً. إذا وصلتك الكهرباء قبل ذلك أرسل بلاغ تغيير الحالة فوراً ليستفيد جيرانك` : 'الكهرباء قد تشتغل في أي لحظة — التغيير محتمل لكنه غير مؤكد بعد. بمجرد أن تصلك الكهرباء أرسل بلاغ تغيير الحالة ليتحدّث توقيتك وتوقيت مجتمعك فوراً', borderColor: T.warning + '44', iconColor: T.warning },
+      WAITING_FOR_GROWATT: { icon: '⏳', title: 'بانتظار تأكيد الحساس', body: tMode === 'MANUAL' ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة' : 'تجاوزنا نطاق التوقع وبانتظار تأكيد الحساس أو بلاغ مجتمعي — قد تشتغل الكهرباء في أي لحظة. إذا وصلتك الكهرباء أرسل بلاغ تغيير الحالة فوراً', borderColor: T.accent + '44', iconColor: T.accent },
       PREDICTION_RANGE: { icon: '🔮', title: 'نطاق التوقع نشط', body: 'التغيير محتمل الآن — بانتظار تأكيد', borderColor: T.accent + '33', iconColor: T.accent },
       GRACE_MODE: { icon: '⏳', title: 'تأخر غير معتاد', body: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع — سيتم المزامنة فور تغيير الحالة', borderColor: T.warning + '44', iconColor: T.warning },
       POSITIVE_OFFSET_PENDING: { icon: '⏰', title: 'تغيير تلقائي مجدول', body: prediction?.atc?.statusLine ?? 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد', borderColor: T.accent + '44', iconColor: T.accent },
@@ -914,20 +873,53 @@ function TodayTimeline({ prediction, anchorStartIso }: { prediction: UserPredict
   const nowMs = Date.now();
   const atcMode = prediction?.atc?.mode;
   const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
+  // SPEC-FIX (UNCERTAIN_ZONE timeline hold): while the engine is HOLDING the
+  // OFF state (UNCERTAIN_ZONE / WAITING_FOR_GROWATT — the predicted OFF slot
+  // has been consumed but the Growatt sensor has NOT confirmed the ON yet),
+  // the wall clock already sits inside the predicted ON window. The timeline
+  // must NEVER promote that ON slot to "now" — it keeps showing OFF as the
+  // current row for the whole UNCERTAIN_ZONE period and only turns ON when
+  // the sensor actually flips OFF→ON (the engine result then changes and this
+  // flag clears).
+  const holdsOff = (prediction?.isHoldingState ?? false)
+    && prediction?.currentState === 'OFF'
+    && !!atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING';
   const activeIdx = (() => {
+    if (holdsOff) return -1; // no wall-clock slot is "current" while holding OFF
     if (isPositiveOffsetPending && slots.length > 0) return 0;
     return slots.findIndex(s => { const start = new Date(s.startIso).getTime(); const end = s.endIso ? new Date(s.endIso).getTime() : Infinity; return nowMs >= start && nowMs < end; });
   })();
 
-  const startIdx = activeIdx >= 0 ? activeIdx : slots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
-  const displaySlots = startIdx >= 0 ? slots.slice(startIdx, startIdx + 4) : slots.slice(0, 4);
+  // While holding OFF, keep slots whose window has not fully passed so the
+  // in-window predicted ON slot stays visible as an upcoming (estimated) row.
+  const startIdx = holdsOff
+    ? slots.findIndex(s => { const end = s.endIso ? new Date(s.endIso).getTime() : Infinity; return end > nowMs; })
+    : activeIdx >= 0 ? activeIdx : slots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
+
+  const fmtHoldStart = (iso: string) => new Date(iso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true }).replace('AM', ' ص').replace('PM', ' م');
+  const heldStartIso = prediction?.currentStateStartIso ?? new Date(nowMs).toISOString();
+  const heldOffSlot: ShiftedScheduleSlot | null = holdsOff ? {
+    state: 'OFF',
+    startIso: heldStartIso,
+    endIso: '',
+    startFormatted: fmtHoldStart(heldStartIso),
+    endFormatted: '',
+    shiftedStartFormatted: fmtHoldStart(heldStartIso),
+    shiftedEndFormatted: '',
+    durationLabel: '',
+    zone: 'DAY',
+    isEstimated: false,
+  } : null;
+
+  const baseSlots = startIdx >= 0 ? slots.slice(startIdx, startIdx + 4) : slots.slice(0, 4);
+  const displaySlots = (heldOffSlot ? [heldOffSlot, ...baseSlots] : baseSlots).slice(0, 4);
   if (displaySlots.length === 0) return null;
 
   return (
     <View style={tlStyles.card}>
       <Text style={tlStyles.title}>جدول اليوم</Text>
       {displaySlots.map((slot, i) => {
-        const isActive = i === 0 && activeIdx >= 0;
+        const isActive = i === 0 && (activeIdx >= 0 || holdsOff);
         const isOn = slot.state === 'ON'; const color = isOn ? T.success : T.danger;
         const slotKey = `${slot.state}|${Math.round(new Date(slot.startIso).getTime() / 60_000)}`;
         let currentStartF: string;
@@ -939,7 +931,7 @@ function TodayTimeline({ prediction, anchorStartIso }: { prediction: UserPredict
         const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
         if (!stableEndMapRef.current[slotKey] && currentEndF) stableEndMapRef.current[slotKey] = currentEndF;
         const endF = stableEndMapRef.current[slotKey] ?? currentEndF;
-        const isFuture = !isActive && new Date(slot.startIso).getTime() > nowMs;
+        const isFuture = !isActive && (holdsOff || new Date(slot.startIso).getTime() > nowMs);
         return (
           <View key={i} style={[tlStyles.row, i < displaySlots.length - 1 && tlStyles.rowBorder]}>
             <View style={tlStyles.timelineCol}>
@@ -949,6 +941,7 @@ function TodayTimeline({ prediction, anchorStartIso }: { prediction: UserPredict
             <View style={[tlStyles.content, isFuture && !isActive && tlStyles.contentFaded]}>
               <View style={tlStyles.topRow}>
                 {isActive && (<View style={[tlStyles.nowChip, { backgroundColor: color + '20', borderColor: color + '66' }]}><Text style={[tlStyles.nowChipText, { color }]}>الآن</Text></View>)}
+                {isActive && holdsOff && (<View style={tlStyles.pendingChip}><Text style={tlStyles.pendingChipText}>⏳ بانتظار تأكيد الحساس</Text></View>)}
                 {slot.isEstimated && !isActive && (<View style={tlStyles.estChip}><Text style={tlStyles.estChipText}>تقديري</Text></View>)}
                 {slot.isResynced && (<View style={tlStyles.syncChip}><Text style={tlStyles.syncChipText}>👥</Text></View>)}
                 {(slot as any).isGeneratedOn && (<View style={tlStyles.genOnChip}><Text style={tlStyles.genOnChipText}>⚡ مُولّدة</Text></View>)}
@@ -1136,7 +1129,6 @@ export default function Home() {
   const { profile, signOut } = useAuth();
   const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD, saveOffset } = useUserOffset();
   const { resyncPoint, clearResync, registerSnapshotCallback } = useResync();
-  const { mode: transitionMode, toggle: toggleTransitionMode } = useTransitionMode();
   const { anchor } = useStateAnchor();
 
   // SPEC-FIX (F13): single shared engine instance — provider lives in
@@ -1300,7 +1292,6 @@ export default function Home() {
           return (<View style={styles.historyDiagBadge}><Text style={styles.historyDiagText}>🛡️ تم تجاهل {filtered} صفّاً ملوّثاً من سجلّ الدقّة لمحرك التوقّع</Text></View>);
         })()}
 
-        <TransitionModeToggle mode={transitionMode} onToggle={toggleTransitionMode} />
         <ParticipationNudge userId={profile?.id} />
         <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
         <GeneratedOnBanner prediction={stablePrediction} />
