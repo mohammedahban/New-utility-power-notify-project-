@@ -767,11 +767,105 @@ export function useUserPredictions(
         const userOnEndMs = userOnStartMs + onDurationMs;
         const userOnEndIso = new Date(userOnEndMs).toISOString();
 
-        // SPEC-FIX B4: if the reconstructed ON window has ALREADY ended by now,
-        // flipping to ON would show a broken state (elapsed > duration, zero
-        // remaining). Bail out and keep the engine's result instead.
+        // SPEC-FIX B4 + NEGATIVE CARRY-OVER: if the reconstructed ON window has
+        // ALREADY ended by now, the negative offset exceeded the ON duration
+        // (|offset| > onDur). Per spec the ON is fully consumed (duration 0)
+        // and the REMAINING offset (|offset| - onDur) is declined from the
+        // FOLLOWING OFF state: the user's current state is OFF, the OFF began
+        // at userOnEndMs (where the consumed ON ended), and its elapsed time is
+        // (now - userOnEndMs), i.e. the remainder of the offset the ON could
+        // not absorb. Build that synthetic OFF state instead of bailing out to
+        // the stale held-OFF engine result (which showed the UNCERTAIN_ZONE
+        // banner and wrong timers ~1s after app open).
         if (userOnEndMs <= nowV22) {
-          immediateOnActiveRef.current = false;
+          const fmtLocalC = (iso: string) => new Date(iso).toLocaleString('en-US', {
+            timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
+          }).replace('AM', ' ص').replace('PM', ' م');
+
+          // The OFF slot that follows the consumed ON slot in the shifted
+          // schedule carries the predicted OFF duration. The held (consumed)
+          // OFF slot starts BEFORE the ON slot, so filtering by startIso >=
+          // the ON slot's start reliably skips it.
+          const onSlotStartMsC = scheduledOnSlot
+            ? new Date(scheduledOnSlot.startIso).getTime()
+            : userOnStartMs;
+          const followingOffSlot = (v21Result.daySchedule ?? []).find(
+            (s: ShiftedScheduleSlot) => s.state === 'OFF' && new Date(s.startIso).getTime() >= onSlotStartMsC - 60_000,
+          );
+          const offDurationMsC = followingOffSlot?.endIso
+            ? new Date(followingOffSlot.endIso).getTime() - new Date(followingOffSlot.startIso).getTime()
+            : 360 * 60_000; // 6h fallback when no following OFF slot is available
+          const userOffStartMsC = userOnEndMs; // OFF begins where the consumed ON ended
+          const userOffEndMsC = userOffStartMsC + offDurationMsC;
+          const userOffStartIsoC = new Date(userOffStartMsC).toISOString();
+          const userOffEndIsoC = new Date(userOffEndMsC).toISOString();
+
+          // Degenerate case: |offset| exceeds onDur + offDur too — even the
+          // carried-over OFF has ended. Fall back to the engine's held-OFF
+          // result (original B4 behavior).
+          if (userOffEndMsC <= nowV22) {
+            immediateOnActiveRef.current = false;
+            return finalResult;
+          }
+
+          const offDurMinC = Math.round(offDurationMsC / 60_000);
+          const offDurHC = Math.floor(offDurMinC / 60); const offDurMC = offDurMinC % 60;
+          const offDurationLabelC = offDurHC === 0 ? `${offDurMC}د`
+            : offDurMC === 0 ? (offDurHC === 1 ? 'ساعة' : `${offDurHC}س`)
+            : `${offDurHC}س ${offDurMC}د`;
+
+          const syntheticOffSlot: ShiftedScheduleSlot = {
+            state: 'OFF',
+            startIso: userOffStartIsoC,
+            endIso: userOffEndIsoC,
+            startFormatted: fmtLocalC(userOffStartIsoC),
+            endFormatted: fmtLocalC(userOffEndIsoC),
+            shiftedStartFormatted: fmtLocalC(userOffStartIsoC),
+            shiftedEndFormatted: fmtLocalC(userOffEndIsoC),
+            durationLabel: offDurationLabelC,
+            zone: 'DAY',
+            isEstimated: true,
+          };
+
+          immediateOnActiveRef.current = true;
+          shouldClearGrowattOnRef.current = false; // keep growattOnIso until the engine catches up
+
+          finalResult = {
+            ...v21Result,
+            currentState: 'OFF',
+            currentStateStartIso: userOffStartIsoC,
+            // Home-screen elapsed timer reads reconciledCycleStartIso first —
+            // shows (|offset| - onDur) minutes of OFF elapsed immediately.
+            reconciledCycleStartIso: userOffStartIsoC,
+            isHoldingState: false,
+            daySchedule: [syntheticOffSlot, ...(v21Result.daySchedule ?? [])],
+            nextTransition: {
+              type: 'UTILITY_ON' as const,
+              earliestTime: userOffEndIsoC,
+              latestTime: userOffEndIsoC,
+              earliestFormatted: fmtLocalC(userOffEndIsoC),
+              latestFormatted: fmtLocalC(userOffEndIsoC),
+              minFromNowMin: Math.max(0, (userOffEndMsC - nowV22) / 60_000),
+              maxFromNowMin: Math.max(0, (userOffEndMsC - nowV22) / 60_000),
+              rangeLabel: fmtLocalC(userOffEndIsoC),
+              rangeStartIso: userOffEndIsoC,
+              rangeEndIso: userOffEndIsoC,
+              inRangeWindow: false,
+            },
+            atc: {
+              ...v21Result.atc,
+              mode: 'NORMAL' as any,
+              statusLine: '',
+              overrunMinutes: 0,
+              communityElevated: false,
+              isHoldingState: false,
+              // Precise re-render at the OFF end: the memo then re-evaluates and,
+              // if the engine is still stale, falls back to the held-OFF
+              // uncertain state awaiting the next Growatt ON — the correct
+              // next-cycle behavior for a negative-offset user.
+              scheduledAutoTransitionIso: userOffEndIsoC,
+            },
+          };
           return finalResult;
         }
 
