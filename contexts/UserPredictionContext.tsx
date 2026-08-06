@@ -17,7 +17,7 @@ import React, { createContext, useCallback, useContext, useMemo, ReactNode } fro
 import { useUserPredictions, type UserPrediction } from '../hooks/useUserPredictions';
 import { useUserOffset } from '../hooks/useUserOffset';
 import { useResync } from './ResyncContext';
-import { useTransitionMode } from '../hooks/useTransitionMode';
+import type { TransitionMode } from '../hooks/useTransitionMode';
 import { useStateAnchor } from '../hooks/useStateAnchor';
 
 interface UserPredictionContextType {
@@ -30,7 +30,11 @@ const UserPredictionContext = createContext<UserPredictionContextType | undefine
 export function UserPredictionProvider({ children }: { children: ReactNode }) {
   const { offset, saveOffset } = useUserOffset();
   const { resyncPoint } = useResync();
-  const { mode: transitionMode } = useTransitionMode();
+  // The home-screen AUTO/MANUAL toggle was removed per product decision —
+  // the app always runs in the default AUTO mode (Growatt + community +
+  // user reports may all trigger transitions). The hook is kept in the repo
+  // in case the toggle is reintroduced later.
+  const transitionMode: TransitionMode = 'AUTO';
   const { anchor } = useStateAnchor();
 
   // Community-computed offsets are persisted (moved here from the Home screen
