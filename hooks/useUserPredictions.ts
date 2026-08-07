@@ -239,6 +239,92 @@ function markEstimatedPendingOffset(
   return schedule;
 }
 
+// ── V2.1 FIX: Recompute prediction metadata after Generated ON schedule surgery
+// The engine's nextTransition / currentState / currentStateStartIso are stale
+// after applyGeneratedOnToSchedule shifts the timeline. Re-derive them from
+// the post-surgery schedule so Home Screen + Schedule widgets show correct
+// times anchored to the Generated ON.
+function recomputeMetaAfterScheduleSurgery(
+  base: UserPrediction,
+  schedule: ShiftedScheduleSlot[],
+  nowMs: number,
+  isGeneratedOnCurrent: boolean,
+): Partial<UserPrediction> {
+  if (!schedule.length) return {};
+
+  // Find the slot that currently contains "now"
+  const activeSlot = schedule.find(s => {
+    const start = new Date(s.startIso).getTime();
+    const end = s.endIso ? new Date(s.endIso).getTime() : Infinity;
+    return nowMs >= start && nowMs < end;
+  });
+
+  const currentState = activeSlot?.state ?? base.currentState;
+  const currentStateStartIso = activeSlot?.startIso ?? base.currentStateStartIso;
+
+  // Derive nextTransition from the post-surgery schedule
+  let nextTransition = base.nextTransition;
+  if (activeSlot?.endIso) {
+    // Active slot has an end time — next transition is when it ends
+    const endMs = new Date(activeSlot.endIso).getTime();
+    const minFromNow = Math.max(0, (endMs - nowMs) / 60_000);
+    nextTransition = {
+      type: activeSlot.state === 'ON' ? 'UTILITY_OFF' : 'UTILITY_ON',
+      earliestTime: activeSlot.endIso,
+      latestTime: activeSlot.endIso,
+      earliestFormatted: fmtYemenTime(activeSlot.endIso),
+      latestFormatted: fmtYemenTime(activeSlot.endIso),
+      minFromNowMin: minFromNow,
+      maxFromNowMin: minFromNow,
+      rangeLabel: fmtYemenTime(activeSlot.endIso),
+      rangeStartIso: activeSlot.endIso,
+      rangeEndIso: activeSlot.endIso,
+      inRangeWindow: false,
+    };
+  } else if (!activeSlot) {
+    // In a gap — next transition is the start of the next upcoming slot
+    const nextSlot = schedule.find(s => new Date(s.startIso).getTime() > nowMs);
+    if (nextSlot) {
+      const startMs = new Date(nextSlot.startIso).getTime();
+      const minFromNow = Math.max(0, (startMs - nowMs) / 60_000);
+      nextTransition = {
+        type: nextSlot.state === 'ON' ? 'UTILITY_ON' : 'UTILITY_OFF',
+        earliestTime: nextSlot.startIso,
+        latestTime: nextSlot.startIso,
+        earliestFormatted: fmtYemenTime(nextSlot.startIso),
+        latestFormatted: fmtYemenTime(nextSlot.startIso),
+        minFromNowMin: minFromNow,
+        maxFromNowMin: minFromNow,
+        rangeLabel: fmtYemenTime(nextSlot.startIso),
+        rangeStartIso: nextSlot.startIso,
+        rangeEndIso: nextSlot.startIso,
+        inRangeWindow: false,
+      };
+    }
+  }
+
+  // When the Generated ON slot is currently active, we are in a normal
+  // deterministic state — not holding, not uncertain.
+  const isGenOnActive = isGeneratedOnCurrent && activeSlot && (activeSlot as any).isGeneratedOn;
+
+  return {
+    currentState,
+    currentStateStartIso,
+    nextTransition,
+    isHoldingState: isGenOnActive ? false : base.isHoldingState,
+    atc: isGenOnActive
+      ? {
+          ...base.atc,
+          mode: 'NORMAL' as any,
+          statusLine: '',
+          overrunMinutes: 0,
+          communityElevated: false,
+          isHoldingState: false,
+        }
+      : base.atc,
+  };
+}
+
 // ── V2.2 (#4): UNCERTAIN_ZONE exceeded-time deduction ────────────────────
 // DEPRECATED (2026-08-01, spec Part 1 "Negative Offset Processing"):
 // This function declined the ELAPSED WAITING TIME from the ON duration —
@@ -666,11 +752,23 @@ export function useUserPredictions(
       v21Schedule = applyGeneratedOnToSchedule(v21Schedule, v21Meta.generatedOn, nowV22);
       v21Schedule = markEstimatedPendingOffset(v21Schedule, isPendingNegative, nowV22);
 
+      // Detect whether the schedule was actually modified (new slot inserted
+      // or subsequent slots shifted). If so, the engine's nextTransition,
+      // currentState and currentStateStartIso are stale and must be re-
+      // derived from the post-surgery schedule.
+      const origSchedule = (engineResult.daySchedule ?? []) as ShiftedScheduleSlot[];
+      const scheduleWasModified =
+        v21Schedule.length !== origSchedule.length ||
+        v21Schedule.some((s, i) => {
+          const o = origSchedule[i];
+          return !o || s.startIso !== o.startIso || s.endIso !== o.endIso;
+        });
+
       const pendingNegativeResolutionIso =
         isPendingNegative && engineResult.nextTransition?.type === 'UTILITY_ON'
           ? engineResult.nextTransition.rangeStartIso : null;
 
-      const v21Result: UserPrediction = {
+      let v21Result: UserPrediction = {
         ...engineResult,
         daySchedule: v21Schedule,
         offsetState: finalOffsetState,
@@ -681,6 +779,19 @@ export function useUserPredictions(
         isPendingNegative,
         isGeneratedOnCurrent,
       };
+
+      // Recompute metadata when the schedule was surgically altered so the
+      // Home Screen widgets (next OFF, after-that, today timeline) and the
+      // Schedule page all read correct shifted times.
+      if (scheduleWasModified) {
+        const recomputed = recomputeMetaAfterScheduleSurgery(
+          v21Result,
+          v21Schedule,
+          nowV22,
+          isGeneratedOnCurrent,
+        );
+        v21Result = { ...v21Result, ...recomputed };
+      }
 
       // ── UNCERTAIN_ZONE / WAITING_FOR_GROWATT state tracking ──────────────
       const modeV22 = v21Result.atc.mode;

@@ -100,6 +100,10 @@ export interface ResyncNotification {
   reporter_offset_state?: OffsetState | null;
   reporter_offset_value?: OffsetValue | null;
   reporter_timeline_alignment?: TimelineAlignment | null;
+  // ── TMMS V2.1: Generated ON metadata (cloned from report) ──
+  generated_on_duration_min?: number | null;
+  generated_on_reference_iso?: string | null;
+  generated_on_reference_kind?: 'completed' | 'active' | null;
   // response state
   response?: 'yes' | 'no' | 'ignore' | null;
 }
@@ -464,6 +468,9 @@ export function useResyncNotifications() {
           reporter_offset_state: report?.reporter_offset_state ?? null,
           reporter_offset_value: report?.reporter_offset_value ?? null,
           reporter_timeline_alignment: report?.reporter_timeline_alignment ?? null,
+          generated_on_duration_min: report?.generated_on_duration_min ?? null,
+          generated_on_reference_iso: report?.generated_on_reference_iso ?? null,
+          generated_on_reference_kind: report?.generated_on_reference_kind ?? null,
           response: responseMap[n.id] ?? null,
         } as ResyncNotification;
       })
@@ -633,11 +640,11 @@ export function useResyncNotifications() {
       // current state.
       const generatedOnStartIso = effectiveTransitionAt; // = report time
       const generatedOnDurationMin: number | null =
-        (notif as any).generated_on_duration_min ?? null;
+        notif.generated_on_duration_min ?? null;
       const generatedOnReferenceIso: string | null =
-        (notif as any).generated_on_reference_iso ?? null;
+        notif.generated_on_reference_iso ?? null;
       const generatedOnReferenceKind: 'completed' | 'active' | null =
-        (notif as any).generated_on_reference_kind ?? null;
+        notif.generated_on_reference_kind ?? null;
 
       // Persist to resync_history — V2.1: include the cloned offset data
       // and Generated ON metadata so the Home Screen / Schedule / Debug
