@@ -1,14 +1,21 @@
 # Add project specific ProGuard rules here.
-# By default, the flags in this file are appended to flags specified
-# in /usr/local/Cellar/android-sdk/24.3.3/tools/proguard/proguard-android.txt
-# You can edit the include path and order by changing the proguardFiles
-# directive in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
 
 # react-native-reanimated
 -keep class com.swmansion.reanimated.** { *; }
 -keep class com.facebook.react.turbomodule.** { *; }
+
+# Stripe - keep ALL Stripe classes
+-keep class com.stripe.android.** { *; }
+-keep class com.reactnativestripesdk.** { *; }
+-keep interface com.stripe.android.** { *; }
+
+# OkHttp (used by Stripe)
+-keep class okhttp3.** { *; }
+-keep interface okhttp3.** { *; }
+
+# Suppress warnings for Stripe classes that may not be present
+-dontwarn com.stripe.android.**
+-dontwarn com.reactnativestripesdk.**
+-dontwarn okhttp3.**
 
 # Add any project specific keep options here:

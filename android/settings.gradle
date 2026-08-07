@@ -33,6 +33,7 @@ expoAutolinking.useExpoModules()
 
 rootProject.name = 'متى تلصي؟عدن'
 
+// Keep expo version catalog for dependencies (provides expoLibs)
 expoAutolinking.useExpoVersionCatalog()
 
 include ':app'

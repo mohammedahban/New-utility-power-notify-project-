@@ -1,0 +1,12 @@
+[versions]
+compileSdk = "36"
+targetSdk = "36"
+minSdk = "24"
+buildTools = "36.0.0"
+ndkVersion = "27.1.12297006"
+kotlin = "2.0.21"
+ksp = "2.0.21-1.0.28"
+
+[libraries]
+expo = { module = "expo.modules:expo", version.ref = "expo" }
+# ... other libraries will come from expo version catalog

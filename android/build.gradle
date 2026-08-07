@@ -6,12 +6,19 @@ buildscript {
     mavenCentral()
   }
   dependencies {
-        classpath 'com.google.gms:google-services:4.4.1'
+      classpath 'com.google.gms:google-services:4.4.1'
     classpath('com.android.tools.build:gradle')
     classpath('com.facebook.react:react-native-gradle-plugin')
     classpath('org.jetbrains.kotlin:kotlin-gradle-plugin')
   }
 }
+
+// Set SDK versions here so they're available to all subprojects
+ext.compileSdkVersion = 36
+ext.targetSdkVersion = 36
+ext.minSdkVersion = 24
+ext.buildToolsVersion = "35.0.0"
+ext.ndkVersion = "27.1.12297006"
 
 def reactNativeAndroidDir = new File(
   providers.exec {
