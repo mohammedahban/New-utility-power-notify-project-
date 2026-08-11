@@ -1163,7 +1163,19 @@ export default function Home() {
   const { snapshot, hasSnapshot, captureSnapshot, clearSnapshot } = useStatusSnapshot();
   useEffect(() => {
     registerSnapshotCallback(async (_point) => {
-      await captureSnapshot(userPrediction?.currentState ?? 'OFF', userPrediction?.currentStateStartIso ?? null, offset?.offset_minutes ?? 0, resyncPoint, 'community_confirm');
+      // F-18: snapshot the full offset semantics so revert restores state +
+      // value, not just the numeric minutes.
+      await captureSnapshot(
+        userPrediction?.currentState ?? 'OFF',
+        userPrediction?.currentStateStartIso ?? null,
+        offset?.offset_minutes ?? 0,
+        resyncPoint,
+        'community_confirm',
+        {
+          offsetState: (offset as any)?.offset_state ?? null,
+          offsetValue: (offset as any)?.offset_value ?? null,
+        },
+      );
     });
     return () => registerSnapshotCallback(null);
   }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
@@ -1172,13 +1184,31 @@ export default function Home() {
     if (!snapshot) return;
     try {
       const targetOffset = snapshot.previousOffsetMinutes;
-      await saveOffset(targetOffset);
+      // AUDIT-FIX (F-18): restore the FULL offset semantics — a bare numeric
+      // restore cannot represent NEUTRAL-with-value or PENDING_NEGATIVE and
+      // would silently re-derive the wrong offset_state from the sign.
+      if (snapshot.previousOffsetState) {
+        await saveOffset(targetOffset, {
+          state: snapshot.previousOffsetState,
+          value: snapshot.previousOffsetValue ?? targetOffset,
+        });
+      } else {
+        await saveOffset(targetOffset);
+      }
       try {
-        const { data: lastRow } = await supabase.from('resync_history').select('id').eq('user_id', profile?.id ?? '').order('confirmed_at', { ascending: false }).limit(1).maybeSingle();
-        if (lastRow?.id) {
-          const { error: softErr } = await supabase.from('resync_history').update({ reverted_at: new Date().toISOString() }).eq('id', lastRow.id);
+        // AUDIT-FIX (F-17): mark EXACTLY the resync_history row recorded in
+        // the snapshot. The old code marked the LATEST row — if any newer
+        // resync landed after the snapshot, the wrong row got reverted and
+        // the row created by this action stayed live.
+        let targetRowId: number | null = snapshot.resyncHistoryRowId ?? null;
+        if (targetRowId == null) {
+          const { data: lastRow } = await supabase.from('resync_history').select('id').eq('user_id', profile?.id ?? '').order('confirmed_at', { ascending: false }).limit(1).maybeSingle();
+          targetRowId = lastRow?.id ?? null;
+        }
+        if (targetRowId != null) {
+          const { error: softErr } = await supabase.from('resync_history').update({ reverted_at: new Date().toISOString() }).eq('id', targetRowId);
           if (softErr && (softErr.message.includes('reverted_at') || softErr.message.includes('column'))) {
-            await supabase.from('resync_history').delete().eq('id', lastRow.id);
+            await supabase.from('resync_history').delete().eq('id', targetRowId);
           }
         }
       } catch (e) { console.warn('[handleRestoreSnapshot] Failed to revert resync_history row:', e); }

@@ -152,6 +152,8 @@ export interface YesResyncResult {
   generatedOnDurationMin: number | null;
   generatedOnReferenceIso: string | null;
   generatedOnReferenceKind: 'completed' | 'active' | null;
+  /** F-17: id of the cloned resync_history row created by this YES */
+  cloneRowId?: number | null;
 }
 
 /**
@@ -594,9 +596,13 @@ export function useResyncNotifications() {
 
     // Reporter's counters — how THEIR report was judged by this responder.
     // ('ignore' is not a judgment on accuracy, so it doesn't count either way.)
-    if (response === 'yes') {
-      await bumpReliabilityCounters(notif.reporter_id, { accepted_reports: 1 });
-    } else if (response === 'no') {
+    // AUDIT-FIX (F-23): accepted_reports is incremented by the
+    // handle_resync_history_insert DB trigger when the YES clone row is
+    // inserted below (source='community_resync', reporter ≠ user) — a single
+    // authoritative writer. Bumping here as well double-counted every YES,
+    // and the reverted_at trigger decrements once per row, so the client
+    // bump would also have survived reverts.
+    if (response === 'no') {
       await bumpReliabilityCounters(notif.reporter_id, { rejected_reports: 1 });
     }
 
@@ -649,25 +655,34 @@ export function useResyncNotifications() {
       // Persist to resync_history — V2.1: include the cloned offset data
       // and Generated ON metadata so the Home Screen / Schedule / Debug
       // Simulator can read them back without re-deriving anything.
-      await supabase.from('resync_history').insert({
-        user_id: user.id,
-        report_id: notif.report_id,
-        reporter_id: notif.reporter_id,
-        reporter_username: notif.reporter_username,
-        reported_state: 'UTILITY_ON', // V2.1: hardcoded
-        effective_transition_at: effectiveTransitionAt,
-        confirmed_at: new Date().toISOString(),
-        source: 'community_resync',
-        // V2.1 cloned offset data:
-        offset_state: clonedOffsetState,
-        offset_value: clonedOffsetValue,
-        timeline_alignment: clonedTimelineAlignment,
-        // V2.1 Generated ON metadata (cloned from report):
-        generated_on_start_iso: generatedOnStartIso,
-        generated_on_duration_min: generatedOnDurationMin,
-        generated_on_reference_iso: generatedOnReferenceIso,
-        generated_on_reference_kind: generatedOnReferenceKind,
-      });
+      // F-17: capture the row id so a later revert marks EXACTLY this clone
+      // row instead of the latest row (which may belong to a newer event).
+      let cloneRowId: number | null = null;
+      try {
+        const { data: cloneRow, error: cloneErr } = await supabase.from('resync_history').insert({
+          user_id: user.id,
+          report_id: notif.report_id,
+          reporter_id: notif.reporter_id,
+          reporter_username: notif.reporter_username,
+          reported_state: 'UTILITY_ON', // V2.1: hardcoded
+          effective_transition_at: effectiveTransitionAt,
+          confirmed_at: new Date().toISOString(),
+          source: 'community_resync',
+          // V2.1 cloned offset data:
+          offset_state: clonedOffsetState,
+          offset_value: clonedOffsetValue,
+          timeline_alignment: clonedTimelineAlignment,
+          // V2.1 Generated ON metadata (cloned from report):
+          generated_on_start_iso: generatedOnStartIso,
+          generated_on_duration_min: generatedOnDurationMin,
+          generated_on_reference_iso: generatedOnReferenceIso,
+          generated_on_reference_kind: generatedOnReferenceKind,
+        }).select('id').single();
+        cloneRowId = cloneRow?.id ?? null;
+        if (cloneErr) console.warn('[useResyncNotifications] clone history insert error:', cloneErr.message);
+      } catch (cloneEx) {
+        console.warn('[useResyncNotifications] clone history insert exception (non-fatal):', cloneEx);
+      }
 
       // V2.1: also upsert the user's user_offsets row so the next
       // useUserPredictions mount reads the cloned offset directly.
@@ -698,6 +713,7 @@ export function useResyncNotifications() {
         generatedOnDurationMin,
         generatedOnReferenceIso,
         generatedOnReferenceKind,
+        cloneRowId,
       };
 
       await fetchHistory();

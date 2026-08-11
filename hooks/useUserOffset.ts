@@ -62,18 +62,45 @@ export function useUserOffset() {
   const [loading, setLoading] = useState(false);
   const [pendingDSD, setPendingDSD] = useState<PendingDSDCandidate | null>(null);
 
-  useEffect(() => {
+  const fetchOffset = useCallback(async () => {
     if (!user) { setOffset(null); return; }
-    (async () => {
-      setLoading(true);
-      const { data } = await supabase
-        .from('user_offsets')
-        .select('*')
-        .eq('user_id', user.id)
-        .maybeSingle();
-      if (data) setOffset(data);
-      setLoading(false);
-    })();
+    setLoading(true);
+    const { data } = await supabase
+      .from('user_offsets')
+      .select('*')
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (data) setOffset(data);
+    setLoading(false);
+  }, [user]);
+
+  useEffect(() => {
+    fetchOffset();
+  }, [fetchOffset]);
+
+  // AUDIT-FIX F-05 (session-stale offset): user_offsets is written directly by
+  // the report/YES paths, and this hook previously never re-read it — the
+  // engine kept running on the pre-report offset until app restart. The table
+  // is now in the realtime publication, so subscribe to our own row and update
+  // the engine's offset immediately when it changes (report, YES-confirm,
+  // backend pending-resolution, revert).
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel(`user_offsets_live_${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'user_offsets', filter: `user_id=eq.${user.id}` },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            setOffset(null);
+          } else if (payload.new) {
+            setOffset(payload.new as OffsetRow);
+          }
+        },
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
   }, [user]);
 
   /**
@@ -82,8 +109,15 @@ export function useUserOffset() {
    * For Period 2: stored as PENDING_NEGATIVE state; numeric value resolves
    *               when Growatt ON begins.
    * For Period 3: 0 (NEUTRAL).
+   *
+   * AUDIT-FIX F-18: callers that know the exact state/value semantics (e.g.
+   * revert restoring a PENDING_NEGATIVE) may pass them explicitly; otherwise
+   * the state is derived from the numeric sign (legacy behaviour).
    */
-  const updateOffset = useCallback(async (offsetMinutes: number) => {
+  const updateOffset = useCallback(async (
+    offsetMinutes: number,
+    explicit?: { state?: string; value?: string | number },
+  ) => {
     if (!user) return;
     const upsertData: any = {
       user_id: user.id,
@@ -92,11 +126,12 @@ export function useUserOffset() {
     };
     // V2.2: derive and store offset_state alongside the numeric value
     const offsetState: string =
-      offsetMinutes > 0 ? 'POSITIVE'
+      explicit?.state ??
+      (offsetMinutes > 0 ? 'POSITIVE'
       : offsetMinutes < 0 ? 'NEGATIVE'
-      : 'NEUTRAL';
+      : 'NEUTRAL');
     upsertData.offset_state = offsetState;
-    upsertData.offset_value = offsetMinutes;
+    upsertData.offset_value = explicit?.value ?? offsetMinutes;
 
     const { data } = await supabase
       .from('user_offsets')

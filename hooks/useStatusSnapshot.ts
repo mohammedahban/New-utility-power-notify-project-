@@ -33,6 +33,19 @@ export interface StatusSnapshot {
   previousOffsetMinutes: number;
   /** Resync point BEFORE the report/sync (null if none was active) */
   previousResyncPoint: ResyncPoint | null;
+  /**
+   * F-18: full V2.1 offset semantics BEFORE the report/sync.
+   * `offset_minutes` alone cannot represent NEUTRAL-with-value or
+   * PENDING_NEGATIVE — restoring only the number loses the state machine.
+   */
+  previousOffsetState?: string | null;
+  previousOffsetValue?: string | number | null;
+  /**
+   * F-17: id of the resync_history row created BY the action that followed
+   * this snapshot (self-report row or cloned community row). Revert marks
+   * exactly this row as reverted instead of blindly marking the LATEST row.
+   */
+  resyncHistoryRowId?: number | null;
   /** When the snapshot was created */
   createdAt: string;
   /** Human-readable context for debugging / display */
@@ -83,14 +96,47 @@ export function useStatusSnapshot() {
     currentOffsetMinutes: number,
     currentResyncPoint: ResyncPoint | null,
     trigger: 'user_report' | 'community_confirm',
+    // F-17/F-18: optional extras — full offset semantics + the id of the
+    // resync_history row the subsequent action creates. Optional so existing
+    // call sites keep compiling; revert falls back to legacy behavior when
+    // they are absent.
+    extra?: {
+      offsetState?: string | null;
+      offsetValue?: string | number | null;
+      resyncHistoryRowId?: number | null;
+    },
   ): Promise<void> => {
     if (!storageKey) return;
+
+    // Race guard: some paths capture explicitly (with the resync_history row
+    // id attached) and THEN call applyResync, whose registered snapshot
+    // callback captures again. If a fresh snapshot (< 15 s old) already
+    // carries a resyncHistoryRowId and this capture doesn't, carry it over
+    // so the second capture doesn't silently strip the revert target (F-17).
+    let carriedRowId: number | null = extra?.resyncHistoryRowId ?? null;
+    if (carriedRowId == null) {
+      try {
+        const raw = await AsyncStorage.getItem(storageKey);
+        if (raw) {
+          const prev: StatusSnapshot = JSON.parse(raw);
+          if (
+            prev?.resyncHistoryRowId != null &&
+            Date.now() - new Date(prev.createdAt).getTime() < 15_000
+          ) {
+            carriedRowId = prev.resyncHistoryRowId;
+          }
+        }
+      } catch (_) {}
+    }
 
     const snap: StatusSnapshot = {
       previousState: currentState,
       previousStateStartIso: currentStateStartIso,
       previousOffsetMinutes: currentOffsetMinutes,
       previousResyncPoint: currentResyncPoint,
+      previousOffsetState: extra?.offsetState ?? null,
+      previousOffsetValue: extra?.offsetValue ?? null,
+      resyncHistoryRowId: carriedRowId,
       createdAt: new Date().toISOString(),
       trigger,
     };
@@ -101,6 +147,21 @@ export function useStatusSnapshot() {
     try {
       await AsyncStorage.setItem(storageKey, JSON.stringify(snap));
     } catch (_) {}
+  }, [storageKey]);
+
+  /**
+   * F-17: the resync_history row is inserted AFTER the snapshot is captured
+   * (capture must happen before applying state). Call this once the insert
+   * returns its id so revert can target exactly that row.
+   */
+  const attachResyncHistoryRowId = useCallback(async (rowId: number | null): Promise<void> => {
+    if (!storageKey || rowId == null) return;
+    setSnapshot(prev => {
+      if (!prev) return prev;
+      const next: StatusSnapshot = { ...prev, resyncHistoryRowId: rowId };
+      AsyncStorage.setItem(storageKey, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
   }, [storageKey]);
 
   /**
@@ -119,6 +180,7 @@ export function useStatusSnapshot() {
     snapshot,
     hasSnapshot,
     captureSnapshot,
+    attachResyncHistoryRowId,
     clearSnapshot,
   };
 }

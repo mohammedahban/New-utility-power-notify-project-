@@ -149,21 +149,25 @@ function applyGeneratedOnToSchedule(
   const startMs = new Date(generatedOn.startIso).getTime();
   const endMs = startMs + generatedOn.durationMin * 60_000;
   if (!Number.isFinite(startMs) || generatedOn.durationMin <= 0) return schedule;
-  // Stale guard: only apply surgery within the same day-cycle as the report.
-  if (nowMs - startMs > 12 * 3600_000) return schedule;
+  // Stale guard (AUDIT-FIX F-04): the spec caps clone validity at 3 hours —
+  // a Generated ON older than that must not keep reshaping the schedule.
+  // (Was 12 h.)
+  if (nowMs - startMs > 3 * 3600_000) return schedule;
 
   // ±60 s match — the engine already replaced this slot with the Generated ON.
   const existingIdx = schedule.findIndex(s =>
     Math.abs(new Date(s.startIso).getTime() - startMs) < 60_000,
   );
-  if (existingIdx >= 0) {
-    const updated = [...schedule];
-    updated[existingIdx] = { ...updated[existingIdx], isGeneratedOn: true };
-    return updated;
-  }
 
-  // Remove post-regen duplicates of the same physical ON (overlap / ±30 min).
-  const cleaned = schedule.filter(s => {
+  // AUDIT-FIX (F-11): no early return on an existingIdx match. The matched
+  // slot still needs the full surgery — otherwise duplicate ON slots
+  // overlapping the Generated ON window survive and an in-progress OFF slot
+  // keeps running straight through the Generated ON.
+
+  // Remove post-regen duplicates of the same physical ON (overlap / ±30 min),
+  // except the matched Generated ON slot itself.
+  const cleaned = schedule.filter((s, idx) => {
+    if (idx === existingIdx) return true;
     if (s.state !== 'ON') return true;
     const st = new Date(s.startIso).getTime();
     const en = s.endIso ? new Date(s.endIso).getTime() : Infinity;
@@ -171,6 +175,43 @@ function applyGeneratedOnToSchedule(
     const near = Math.abs(st - startMs) < 30 * 60_000;
     return !(overlaps || near);
   });
+
+  // F-11: resolve OFF slots colliding with the Generated ON window —
+  // drop OFF slots fully contained in the window, and trim an in-progress
+  // OFF slot so it ends exactly at the Generated ON start.
+  const trimmed = cleaned.flatMap(s => {
+    if (s.state !== 'OFF' || !s.endIso) return [s];
+    const st = new Date(s.startIso).getTime();
+    const en = new Date(s.endIso).getTime();
+    if (st >= startMs && en <= endMs) return []; // fully consumed by the Generated ON
+    if (st < startMs && en > startMs) {
+      const endIso = new Date(startMs).toISOString();
+      return [{
+        ...s,
+        endIso,
+        endFormatted: fmtYemenTime(endIso),
+        shiftedEndFormatted: fmtYemenTime(endIso),
+      }];
+    }
+    return [s];
+  });
+
+  // Mark the matched slot as the Generated ON (identity by ±60 s start) and
+  // align its end with the Generated ON window so the re-anchored OFF chain
+  // stays contiguous.
+  const genEndIso = new Date(endMs).toISOString();
+  const marked = existingIdx >= 0
+    ? trimmed.map(s =>
+        Math.abs(new Date(s.startIso).getTime() - startMs) < 60_000
+          ? {
+              ...s,
+              isGeneratedOn: true,
+              endIso: genEndIso,
+              endFormatted: fmtYemenTime(genEndIso),
+              shiftedEndFormatted: fmtYemenTime(genEndIso),
+            }
+          : s)
+    : trimmed;
 
   // Re-anchor the following OFF (and the chain after it) to the Generated
   // ON's end — full original OFF duration, delta applied to all later slots.
@@ -203,7 +244,12 @@ function applyGeneratedOnToSchedule(
   if (endMs <= nowMs) {
     // EXPIRED Generated ON — consume the remainder from the following OFF.
     // The Generated ON itself is history; it is not inserted into the schedule.
-    return anchorOff(cleaned);
+    return anchorOff(marked);
+  }
+
+  // The matched slot IS the Generated ON — no synthetic insert needed.
+  if (existingIdx >= 0) {
+    return anchorOff(marked);
   }
 
   // Current/future Generated ON — insert at the sorted position, then anchor.
@@ -223,10 +269,10 @@ function applyGeneratedOnToSchedule(
     isEstimated: false,
     isGeneratedOn: true,
   } as ShiftedScheduleSlot;
-  const insertIdx = cleaned.findIndex(s => new Date(s.startIso).getTime() > startMs);
+  const insertIdx = marked.findIndex(s => new Date(s.startIso).getTime() > startMs);
   const withGen = insertIdx < 0
-    ? [...cleaned, synthetic]
-    : [...cleaned.slice(0, insertIdx), synthetic, ...cleaned.slice(insertIdx)];
+    ? [...marked, synthetic]
+    : [...marked.slice(0, insertIdx), synthetic, ...marked.slice(insertIdx)];
   return anchorOff(withGen);
 }
 
@@ -599,6 +645,35 @@ export function useUserPredictions(
     generatedOn: GeneratedOnInfo | null;
   }>({ offsetState: null, offsetValue: null, timelineAlignment: null, generatedOn: null });
 
+  // AUDIT-FIX (F-05 companion): resync_history is now in the realtime
+  // publication — refresh v21Meta IMMEDIATELY when this user's rows change
+  // (e.g. the backend trigger resolves PENDING_NEGATIVE, or a revert marks
+  // reverted_at) instead of waiting for the next 30-s tick.
+  const [v21MetaRefreshTick, setV21MetaRefreshTick] = useState(0);
+  useEffect(() => {
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    let disposed = false;
+    (async () => {
+      try {
+        const { data: authData } = await supabase.auth.getUser();
+        const uid = authData?.user?.id;
+        if (!uid || disposed) return;
+        channel = supabase
+          .channel(`resync_history_v21_${uid}`)
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'resync_history', filter: `user_id=eq.${uid}` },
+            () => setV21MetaRefreshTick(t => t + 1),
+          )
+          .subscribe();
+      } catch (_) { /* non-fatal */ }
+    })();
+    return () => {
+      disposed = true;
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -653,7 +728,7 @@ export function useUserPredictions(
       } catch (_) { /* non-fatal */ }
     })();
     return () => { cancelled = true; };
-  }, [resyncPoint?.syncedAtIso, tick]);
+  }, [resyncPoint?.syncedAtIso, tick, v21MetaRefreshTick]);
 
   // ── V2.3 FIX: Growatt-ON watcher (negative offset + pending negative) ───
   // isPendingNegative: must re-read resync_history after offset resolves

@@ -10,7 +10,8 @@ import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useUtilityReports, TimeOption } from '../../hooks/useUtilityReports';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useResync } from '../../contexts/ResyncContext';
-import { UserPredictionProvider } from '../../contexts/UserPredictionContext';
+import { UserPredictionProvider, useSharedUserPrediction } from '../../contexts/UserPredictionContext';
+import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
 import { AR } from '../../constants/arabic';
 
 // Submit-page time options: only "Now" .. "30 minutes before" are offered —
@@ -152,35 +153,81 @@ const grmStyles = StyleSheet.create({
 });
 
 export default function UserLayout() {
+  const [reportModalVisible, setReportModalVisible] = useState(false);
+
+  return (
+    // SPEC-FIX (F13): one shared TMMS engine instance for all user screens —
+    // Home / Schedule / Community read the same prediction (spec: "No
+    // independent calculations are allowed").
+    // AUDIT-FIX (F-08): the interactive shell lives in UserLayoutInner,
+    // rendered INSIDE the provider, so the FAB report path can read the
+    // shared prediction and capture a revert snapshot exactly like the
+    // community-screen report path does.
+    <UserPredictionProvider>
+      <UserLayoutInner
+        reportModalVisible={reportModalVisible}
+        setReportModalVisible={setReportModalVisible}
+      />
+    </UserPredictionProvider>
+  );
+}
+
+function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
+  reportModalVisible: boolean;
+  setReportModalVisible: (v: boolean) => void;
+}) {
   const insets = useSafeAreaInsets();
   const { pendingCount } = useResyncNotifications();
   const { submitting, submitReport, isCoolingDown, cooldownLabel } = useUtilityReports();
-  const { applyResync } = useResync();
-  const [reportModalVisible, setReportModalVisible] = useState(false);
+  const { applyResync, resyncPoint } = useResync();
+  const { userPrediction } = useSharedUserPrediction();
+  const { offset } = useUserOffset();
+  const { captureSnapshot, attachResyncHistoryRowId } = useStatusSnapshot();
 
   // V2.2: handleReport — ON-only, no calibrate() call.
   // The Period 1/2/3 offset is computed automatically inside submitReport.
+  // AUDIT-FIX (F-08): this FAB path previously applied the resync with NO
+  // snapshot, so "العودة إلى الحالة الأصلية" had nothing to restore. It now
+  // captures the same full snapshot (state + offset semantics) as the
+  // community-screen report path, BEFORE submitting.
   const handleReport = useCallback(async (time: TimeOption) => {
+    await captureSnapshot(
+      userPrediction?.currentState ?? 'OFF',
+      userPrediction?.currentStateStartIso ?? null,
+      offset?.offset_minutes ?? 0,
+      resyncPoint ?? null,
+      'user_report',
+      {
+        offsetState: (offset as any)?.offset_state ?? null,
+        offsetValue: (offset as any)?.offset_value ?? null,
+      },
+    );
+
     // V2.2: always UTILITY_ON
-    const { selfResync, error } = await submitReport('UTILITY_ON', time);
+    const { selfResync, error, duplicate, selfResyncHistoryId } = await submitReport('UTILITY_ON', time);
     setReportModalVisible(false);
+    // F-17: bind the snapshot to the exact resync_history row created.
+    if (selfResyncHistoryId != null) {
+      attachResyncHistoryRowId(selfResyncHistoryId);
+    }
     if (error) {
       Alert.alert(AR.error, error);
+      return;
+    }
+    if (duplicate) {
+      // F-24: idempotent re-submission — nothing new was written.
+      Alert.alert(AR.reportShared, 'تم استلام هذا البلاغ مسبقاً — لا حاجة لإرساله مرة أخرى.');
       return;
     }
     // Auto-apply community resync (existing behaviour)
     if (selfResync) await applyResync(selfResync);
 
     Alert.alert(AR.reportShared, AR.reportSharedBody);
-  }, [submitReport, applyResync]);
+  }, [submitReport, applyResync, captureSnapshot, attachResyncHistoryRowId, userPrediction, offset, resyncPoint, setReportModalVisible]);
 
   const fabBottom = insets.bottom + 80;
 
   return (
-    // SPEC-FIX (F13): one shared TMMS engine instance for all user screens —
-    // Home / Schedule / Community read the same prediction (spec: "No
-    // independent calculations are allowed").
-    <UserPredictionProvider>
     <View style={{ flex: 1 }}>
       <GlobalReportModal
         visible={reportModalVisible}
@@ -275,7 +322,6 @@ export default function UserLayout() {
         />
       </Tabs>
     </View>
-    </UserPredictionProvider>
   );
 }
 

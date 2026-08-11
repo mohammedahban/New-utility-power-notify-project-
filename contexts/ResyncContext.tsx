@@ -28,7 +28,7 @@
  *
  * Original (V2) responsibilities preserved unchanged:
  *   - AsyncStorage persistence (per-user key)
- *   - 6-hour safety-net auto-clear
+ *   - 3-hour safety-net auto-clear (spec three-hour rule, F-04)
  *   - Snapshot callback for revert
  *   - Permanent personal timeline branch (does NOT auto-revert)
  */
@@ -81,11 +81,24 @@ export interface ResyncPoint {
    * For reporters, this is the same as syncedAtIso.
    */
   confirmationTime?: string;
+  /**
+   * AUDIT-FIX (F-01/F-06): origin of this resync point. Required by the
+   * applyResync guards: a user's OWN manual report has priority over
+   * community clones, and within the one-hour window the earliest community
+   * event wins. Legacy persisted points have no source — they are treated
+   * as 'community_resync' (the less privileged origin).
+   */
+  source?: 'self_report' | 'community_resync';
 }
 
 interface ResyncContextType {
   resyncPoint: ResyncPoint | null;
-  applyResync: (point: ResyncPoint) => Promise<void>;
+  /**
+   * Apply a resync point. AUDIT-FIX (F-01/F-06): returns true when the
+   * point was applied, false when a guard rejected it (manual-state
+   * priority or the one-hour earliest-wins rule).
+   */
+  applyResync: (point: ResyncPoint) => Promise<boolean>;
   clearResync: () => Promise<void>;
   /**
    * Callback registered by the Home screen's useStatusSnapshot instance.
@@ -101,7 +114,16 @@ const ResyncContext = createContext<ResyncContextType | undefined>(undefined);
 
 const STORAGE_KEY_PREFIX = 'community_resync_point_v2_';
 const VALIDATION_WINDOW_MS = 20 * 60 * 1000;   // 20 minutes
-const MAX_AGE_MS          = 6 * 60 * 60 * 1000; // 6 hours
+// AUDIT-FIX (F-04): the spec caps community-clone validity at 3 hours
+// ("three-hour rule"). The client safety-net was 6 h — double the spec —
+// so a stale clone could drive the timeline for hours after it became
+// invalid. Now aligned with the 3 h expiry the server stamps on
+// resync_notifications.
+const MAX_AGE_MS          = 3 * 60 * 60 * 1000; // 3 hours
+// AUDIT-FIX (F-01): one-hour community window — within one hour of the
+// currently-applied community event, later community events must NOT
+// replace it (earliest wins).
+const ONE_HOUR_MS         = 60 * 60 * 1000;
 
 export function ResyncProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
@@ -140,7 +162,7 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
   // ── Max-age watchdog ────────────────────────────────────────────────────────
   // Per spec §10: community sync is a PERMANENT personal timeline branch.
   // It must NOT be cleared because Growatt disagrees or the validation window
-  // expired. The ONLY programmatic clear allowed is the 6-hour safety-net to
+  // expired. The ONLY programmatic clear allowed is the 3-hour safety-net to
   // prevent forever-stale data. The user must explicitly press a revert button
   // to leave the community-synced branch at any other time.
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -155,9 +177,9 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
     const check = async () => {
       if (!resyncPoint) return;
       const ageMs = Date.now() - new Date(resyncPoint.appliedAtIso).getTime();
-      // Safety-net only: clear after 6-hour max age
+      // Safety-net only: clear after 3-hour max age (F-04)
       if (ageMs >= MAX_AGE_MS) {
-        console.log('[ResyncContext] 6-hour safety-net reached — clearing resync');
+        console.log('[ResyncContext] 3-hour safety-net reached — clearing resync');
         await AsyncStorage.removeItem(storageKey!);
         setResyncPoint(null);
       }
@@ -180,7 +202,40 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
   // V2.1: Now accepts and stores all V2.1 fields (offsetState, offsetValue,
   // timelineAlignment, generatedOn metadata, confirmationTime).
   // No UI changes — just passes through the extended ResyncPoint.
-  const applyResync = useCallback(async (point: ResyncPoint) => {
+  const applyResync = useCallback(async (point: ResyncPoint): Promise<boolean> => {
+    const incomingSource = point.source ?? 'community_resync';
+    const existing = resyncPoint;
+
+    if (existing) {
+      const existingSource = existing.source ?? 'community_resync';
+
+      // AUDIT-FIX (F-06 — manual-state priority): the user's OWN report is
+      // first-hand information and outranks community clones. A community
+      // resync must never overwrite a self-report; only another (newer)
+      // self-report may.
+      if (existingSource === 'self_report' && incomingSource !== 'self_report') {
+        console.log('[ResyncContext] applyResync rejected — manual self-report has priority over community clone');
+        return false;
+      }
+
+      // AUDIT-FIX (F-01 — one-hour rule, earliest wins): within one hour of
+      // the currently-applied community event, a LATER community event must
+      // not replace it. The window is anchored on the EVENT time
+      // (syncedAtIso), not the application time. An earlier event, or any
+      // event more than one hour away, starts a new window and applies.
+      if (incomingSource === 'community_resync' && existingSource === 'community_resync') {
+        const existingMs = new Date(existing.syncedAtIso).getTime();
+        const incomingMs = new Date(point.syncedAtIso).getTime();
+        if (
+          Number.isFinite(existingMs) && Number.isFinite(incomingMs) &&
+          incomingMs > existingMs && incomingMs - existingMs < ONE_HOUR_MS
+        ) {
+          console.log('[ResyncContext] applyResync rejected — one-hour rule: later community event inside the window of the applied one');
+          return false;
+        }
+      }
+    }
+
     // Capture snapshot BEFORE applying so the revert button can restore fully.
     // The callback is registered by the Home screen's useStatusSnapshot hook.
     try {
@@ -190,11 +245,12 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
     } catch (_) {}
 
     setResyncPoint(point);
-    if (!storageKey) return;
+    if (!storageKey) return true;
     try {
       await AsyncStorage.setItem(storageKey, JSON.stringify(point));
     } catch (_) {}
-  }, [storageKey]);
+    return true;
+  }, [storageKey, resyncPoint]);
 
   // ── clearResync ──────────────────────────────────────────────────────────────
   const clearResync = useCallback(async () => {

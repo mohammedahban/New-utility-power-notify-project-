@@ -819,7 +819,7 @@ export default function CommunityScreen() {
   const { offset } = useUserOffset();
   // SPEC-FIX (F13): shared engine instance — same prediction as Home/Schedule
   const { userPrediction } = useSharedUserPrediction();
-  const { captureSnapshot } = useStatusSnapshot();
+  const { captureSnapshot, attachResyncHistoryRowId } = useStatusSnapshot();
 
   useEffect(() => { registerPushToken(); }, []);
 
@@ -898,19 +898,33 @@ export default function CommunityScreen() {
   const handleReport = useCallback(async (time: TimeOption) => {
     // Capture snapshot BEFORE report is saved so "العودة إلى الحالة الأصلية" can
     // fully restore the pre-report state (offset + resync + state start).
+    // F-18: snapshot the FULL offset semantics (state + value), not just the
+    // numeric minutes.
     await captureSnapshot(
       userPrediction?.currentState ?? 'OFF',
       userPrediction?.currentStateStartIso ?? null,
       offset?.offset_minutes ?? 0,
       resyncPoint ?? null,
       'user_report',
+      {
+        offsetState: (offset as any)?.offset_state ?? null,
+        offsetValue: (offset as any)?.offset_value ?? null,
+      },
     );
 
     // V2.2: hardcoded UTILITY_ON — no OFF reporting path.
-    const { selfResync, error } = await submitReport('UTILITY_ON' as any, time);
+    const { selfResync, error, duplicate, selfResyncHistoryId } = await submitReport('UTILITY_ON' as any, time);
     setReportModalVisible(false);
+    // F-17: bind the snapshot to the exact resync_history row this report
+    // created so revert marks that row — not whatever row is latest.
+    if (selfResyncHistoryId != null) {
+      attachResyncHistoryRowId(selfResyncHistoryId);
+    }
     if (error) {
       Alert.alert(AR.error, error);
+    } else if (duplicate) {
+      // F-24: idempotent re-submission — nothing new was written.
+      Alert.alert(AR.reportShared, 'تم استلام هذا البلاغ مسبقاً — لا حاجة لإرساله مرة أخرى.');
     } else {
       if (selfResync) await applyResync(selfResync);
       // V2.2: updated copy to mention Generated ON creation.
@@ -919,7 +933,7 @@ export default function CommunityScreen() {
         'تم إنشاء "حالة تشغيل مُولّدة" في خطّك الزمني وتحديث الجداول لديك ولدى من يتابعك. لا حاجة للإبلاغ عن الانطفاء — سيتولّاه النظام تلقائياً.',
       );
     }
-  }, [submitReport, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
+  }, [submitReport, applyResync, captureSnapshot, attachResyncHistoryRowId, userPrediction, offset, resyncPoint]);
 
   // TMMS V2.2: handleRespond — the YES branch no longer recalculates anything.
   // useResyncNotifications.respond() clones the reporter's OffsetState /
@@ -939,6 +953,12 @@ export default function CommunityScreen() {
         offset?.offset_minutes ?? 0,
         resyncPoint ?? null,
         'community_confirm',
+        {
+          offsetState: (offset as any)?.offset_state ?? null,
+          offsetValue: (offset as any)?.offset_value ?? null,
+          // F-17: the clone row this YES created — revert must mark this row.
+          resyncHistoryRowId: yesResult.cloneRowId ?? null,
+        },
       );
       // Fetch reporter reliability to surface in community sync meta
       let reporterReliability: number | null = null;
@@ -955,7 +975,11 @@ export default function CommunityScreen() {
       // V2.2: syncedState is ALWAYS 'ON' (no OFF reporting). The cloned
       // OffsetState / OffsetValue / TimelineAlignment travel inside
       // yesResult — applyResync will pass them through to the engine.
-      await applyResync({
+      // F-01/F-06: applyResync now enforces the one-hour earliest-wins rule
+      // and manual-state priority — it returns false when the clone is
+      // rejected. The YES is still recorded (reliability bookkeeping), but
+      // the timeline is left untouched and the user is told why.
+      const applied = await applyResync({
         syncedState: 'ON', // V2.2: hardcoded
         syncedAtIso: yesResult.effectiveTransitionAt,
         appliedAtIso: new Date().toISOString(),
@@ -969,7 +993,16 @@ export default function CommunityScreen() {
         generatedOnDurationMin: yesResult.generatedOnDurationMin,
         generatedOnReferenceIso: yesResult.generatedOnReferenceIso,
         generatedOnReferenceKind: yesResult.generatedOnReferenceKind,
+        source: 'community_resync',
       } as any);
+
+      if (!applied) {
+        Alert.alert(
+          AR.scheduleUpdated,
+          'تم تسجيل تأكيدك وحساب موثوقية المُبلِّغ، لكن لم يتم تغيير خطّك الزمني: لديك بلاغ شخصي أحدث أو بلاغ مجتمع مؤكَّد خلال الساعة الماضية (قاعدة الأولوية / قاعدة الساعة الواحدة).',
+        );
+        return;
+      }
 
       // V2.2: confirmation-only copy. Per the spec, confirmation never
       // modifies timeline calculations — it only validates the report and

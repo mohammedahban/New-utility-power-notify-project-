@@ -79,10 +79,32 @@ async function ensureCommunityAndroidChannel() {
   });
 }
 
+// AUDIT-FIX (F-14, client half): quiet variant of the community channel.
+// distribute-resync routes throttled community alerts (a second alert for
+// the same recipient within one hour) to `community-alerts-quiet` with no
+// `sound` key — matching the spec's sound-throttling rule: one sounding
+// alert per one-hour window, subsequent ones arrive silently.
+async function ensureCommunityQuietAndroidChannel() {
+  if (Platform.OS !== 'android') return;
+  await Notifications.setNotificationChannelAsync('community-alerts-quiet', {
+    name: 'تنبيهات المجتمع الصامتة — Community Alerts (Quiet)',
+    description: 'إشعارات المزامنة المجتمعية المكررة خلال ساعة واحدة — تصل بصمت',
+    importance: Notifications.AndroidImportance.DEFAULT,
+    vibrationPattern: [0, 150],
+    lightColor: '#38bdf8',
+    enableLights: true,
+    enableVibrate: false,
+    sound: undefined,
+    showBadge: true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    bypassDnd: false,
+  });
+}
+
 // Create channels immediately at module load so they exist before any push arrives.
 // Safe to call multiple times — Android deduplicates by channel ID.
 if (Platform.OS === 'android') {
-  Promise.all([ensureAndroidChannel(), ensureCommunityAndroidChannel()]).catch(
+  Promise.all([ensureAndroidChannel(), ensureCommunityAndroidChannel(), ensureCommunityQuietAndroidChannel()]).catch(
     (err) => console.warn('[notifications] Channel setup error:', err),
   );
 }
@@ -92,9 +114,10 @@ export async function registerPushToken(): Promise<void> {
   if (Platform.OS === 'web') return;
 
   try {
-    // Ensure both channels exist before requesting permission
+    // Ensure all channels exist before requesting permission
     await ensureAndroidChannel();
     await ensureCommunityAndroidChannel();
+    await ensureCommunityQuietAndroidChannel();
 
     const { status: existing } = await Notifications.getPermissionsAsync();
     let finalStatus = existing;

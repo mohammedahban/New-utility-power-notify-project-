@@ -422,23 +422,38 @@ function computeATCMode(
   // ── COMMUNITY_SYNCED ─────────────────────────────────────────────────────
   // A community resync overrides everything — the user's timeline is
   // synced to the community report's Generated ON.
-  if (resyncPoint) {
+  //
+  // AUDIT-FIX (F-09): EXCEPT Period 3. A NEUTRAL clone (offsetState NEUTRAL,
+  // value 0) means the personal timeline is an EXACT clone of Growatt —
+  // same start/end times and durations. Holding a COMMUNITY_SYNCED cycle
+  // with a predicted duration would decouple the user from the real Growatt
+  // schedule, so the hold is skipped and the standard machine runs
+  // (offset 0 → shifted schedule mirrors the raw schedule).
+  if (resyncPoint && resyncPoint.offsetState !== 'NEUTRAL') {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
     // FIX (#3): a missing/zero Generated-ON duration previously matched the
     // `durationMin === 0` branch below and held the synced state FOREVER —
     // the automatic ON→OFF transition never fired. Resolve a usable
-    // duration instead: explicit value → average same-state slot duration
-    // from the shifted schedule → 120 min default.
+    // duration instead.
+    // AUDIT-FIX (F-25): never invent a flat duration. Prefer the duration of
+    // the same-state slot NEAREST to the sync instant (best estimate of the
+    // real cycle), then the schedule average, and only as a last resort the
+    // 120-min default.
     let durationMin = resyncPoint.generatedOnDurationMin ?? 0;
     if (durationMin <= 0) {
-      const sameStateSlots = shiftedSlots.filter(
-        s => s.state === resyncPoint.syncedState && s.endIso,
-      );
-      durationMin = sameStateSlots.length > 0
-        ? Math.round(sameStateSlots.reduce((sum, s) =>
-            sum + (new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60_000, 0,
-          ) / sameStateSlots.length)
-        : 120;
+      const sameStateDurations = shiftedSlots
+        .filter(s => s.state === resyncPoint.syncedState && s.endIso)
+        .map(s => ({
+          startMs: new Date(s.startIso).getTime(),
+          dur: Math.round((new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60_000),
+        }))
+        .filter(x => Number.isFinite(x.startMs) && x.dur > 0);
+      const nearest = [...sameStateDurations].sort(
+        (a, b) => Math.abs(a.startMs - syncedMs) - Math.abs(b.startMs - syncedMs),
+      )[0];
+      durationMin = nearest?.dur ?? (sameStateDurations.length > 0
+        ? Math.round(sameStateDurations.reduce((sum, x) => sum + x.dur, 0) / sameStateDurations.length)
+        : 120);
     }
     const cycleEndMs = syncedMs + durationMin * 60_000;
     const inWindow = nowMs < cycleEndMs;
@@ -494,6 +509,18 @@ function computeATCMode(
     }
   }
 
+  // ── AUDIT-FIX (F-K1): PENDING_NEGATIVE belongs to the negative family ────
+  // While a Period-2 report/clone is unresolved, the numeric offset is the
+  // 0 placeholder — which previously routed the user into the NEUTRAL
+  // branches (exact Growatt mirror, "بانتظار Growatt" neutral hold) and made
+  // UNCERTAIN_ZONE unreachable during the pending window, contradicting the
+  // spec ("after the Generated ON and predicted OFF finish, the user remains
+  // in UNCERTAIN_ZONE until Growatt ON"). For sign gating only, a pending
+  // user is treated as negative; all displayed/stored offsets stay 0.
+  const isPendingNegative = resyncPoint?.offsetState === 'PENDING_NEGATIVE' ||
+    resyncPoint?.offsetValue === 'PENDING';
+  const offsetSign = isPendingNegative && offsetMinutes === 0 ? -1 : offsetMinutes;
+
   // ── CASE 1: No active slot — user is between slots ───────────────────────
   //
   // THREE CASES BY OFFSET SIGN:
@@ -521,7 +548,7 @@ function computeATCMode(
     // Growatt has already transitioned, but the user's scheduled transition
     // is still in the future. The user holds their current state until
     // their scheduled time arrives.
-    if (offsetMinutes > 0) {
+    if (offsetSign > 0) {
       const nextSlot = shiftedSlots
         .filter(s => new Date(s.startIso).getTime() > nowMs)
         .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
@@ -580,7 +607,7 @@ function computeATCMode(
     //   - Growatt actually turns ON (handled by useGrowattOnWatcher)
     //   - A new accepted community ON report
     // The wait time (overrun) is DEDUCTED from the next ON cycle duration.
-    if (offsetMinutes < 0) {
+    if (offsetSign < 0) {
       const recentlyEnded = shiftedSlots
         .filter(s => s.endIso && new Date(s.endIso).getTime() <= nowMs)
         .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
@@ -691,7 +718,7 @@ function computeATCMode(
       .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
     const heldStartIso = prevOff?.startIso ?? null;
 
-    if (offsetMinutes < 0) {
+    if (offsetSign < 0) {
       // ── NEGATIVE: UNCERTAIN_ZONE family (same thresholds as the gap path) ──
       // The user's ON can never legitimately overlap Growatt OFF (both slot
       // ends shift by the same negative offset, so user ON always ends before
@@ -736,7 +763,7 @@ function computeATCMode(
       return nowMs >= st && nowMs < en;
     }) ?? null;
 
-    if (offsetMinutes > 0 && rawActive?.state === 'ON') {
+    if (offsetSign > 0 && rawActive?.state === 'ON') {
       // ── POSITIVE: Verification Window — unbounded wait for Growatt ──────
       return {
         mode: 'WAITING_FOR_GROWATT',
@@ -752,7 +779,7 @@ function computeATCMode(
       };
     }
 
-    if (offsetMinutes === 0) {
+    if (offsetSign === 0) {
       // ── NEUTRAL: mirror Growatt (still OFF) + waiting widget ────────────
       return {
         mode: 'WAITING_FOR_GROWATT',
@@ -772,7 +799,7 @@ function computeATCMode(
   // ── NEUTRAL mirror (reverse direction): slot OFF but Growatt still ON ────
   // The predicted OFF started before Growatt actually turned OFF — do NOT
   // auto-change; keep mirroring Growatt (ON) with a waiting widget.
-  if (activeSlot && activeSlot.state === 'OFF' && growattCurrentState === 'ON' && offsetMinutes === 0) {
+  if (activeSlot && activeSlot.state === 'OFF' && growattCurrentState === 'ON' && offsetSign === 0) {
     const slotStartMs = new Date(activeSlot.startIso).getTime();
     const overrunMin = Math.max(0, Math.round((nowMs - slotStartMs) / 60_000));
     const prevOn = shiftedSlots
@@ -809,7 +836,7 @@ function computeATCMode(
     const minutesUntilEnd = (endMs - nowMs) / 60_000;
 
     if (minutesUntilEnd >= 0 && minutesUntilEnd <= VERIFICATION_WINDOW_MIN) {
-      if (offsetMinutes > 0) {
+      if (offsetSign > 0) {
         // ── VERIFICATION WINDOW (Positive ONLY) ─────────────────────────
         // V2.3 (Issue 1B): NEUTRAL offset no longer gets a verification
         // window — neutral users clone Growatt EXACTLY. Only POSITIVE
@@ -828,7 +855,7 @@ function computeATCMode(
           scheduledAutoTransitionIso: null,
           statusLine: `نافذة التحقق — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
         };
-      } else if (offsetMinutes === 0) {
+      } else if (offsetSign === 0) {
         // ── NEUTRAL (Issue 1B): clone Growatt EXACTLY ───────────────────
         // No verification window, no UNCERTAIN_ZONE, no automatic changes.
         // The user's timeline mirrors Growatt's timeline 1:1. We render a
@@ -870,7 +897,7 @@ function computeATCMode(
     // V2.3 (Issue 1B): NEUTRAL offset skips this branch entirely — neutral
     // users never see PREDICTION_RANGE because their timeline mirrors
     // Growatt and there is no uncertainty to warn about.
-    if (offsetMinutes !== 0 && minutesUntilEnd >= 0 && minutesUntilEnd <= PREDICTION_RANGE_MIN) {
+    if (offsetSign !== 0 && minutesUntilEnd >= 0 && minutesUntilEnd <= PREDICTION_RANGE_MIN) {
       return {
         mode: 'PREDICTION_RANGE',
         currentState: activeSlot.state,
@@ -878,8 +905,8 @@ function computeATCMode(
         isHoldingState: false,
         overrunMinutes: 0,
         communityElevated: false,
-        inValidationWindow: offsetMinutes > 0,
-        validationWindowRemainingMin: offsetMinutes > 0 ? Math.round(minutesUntilEnd) : 0,
+        inValidationWindow: offsetSign > 0,
+        validationWindowRemainingMin: offsetSign > 0 ? Math.round(minutesUntilEnd) : 0,
         scheduledAutoTransitionIso: null,
         statusLine: `نطاق التوقع — ${Math.round(minutesUntilEnd)} دقيقة للتغيير المتوقع`,
       };
@@ -904,7 +931,7 @@ function computeATCMode(
   if (!activeSlot) {
     // No active slot and we fell through all the offset-specific handlers.
     // For NEUTRAL: mirror Growatt exactly.
-    if (offsetMinutes === 0) {
+    if (offsetSign === 0) {
       return {
         mode: 'NORMAL',
         currentState: growattCurrentState,
@@ -1019,7 +1046,20 @@ export function applyOffsetToPrediction(
   // ── 4. Inject synthetic slot for COMMUNITY_SYNCED ──────────────────────────
   if (atcResult.mode === 'COMMUNITY_SYNCED' && resyncPoint) {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
-    const durationMin = resyncPoint.generatedOnDurationMin ?? 60;
+    // AUDIT-FIX (F-25): fall back to the duration of the same-state slot
+    // nearest to the sync instant instead of an invented flat 60 min.
+    let durationMin = resyncPoint.generatedOnDurationMin ?? 0;
+    if (durationMin <= 0) {
+      const nearestDur = shiftedSlots
+        .filter(s => s.state === resyncPoint.syncedState && s.endIso)
+        .map(s => ({
+          startMs: new Date(s.startIso).getTime(),
+          dur: Math.round((new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60_000),
+        }))
+        .filter(x => Number.isFinite(x.startMs) && x.dur > 0)
+        .sort((a, b) => Math.abs(a.startMs - syncedMs) - Math.abs(b.startMs - syncedMs))[0]?.dur;
+      durationMin = nearestDur ?? 60;
+    }
     const cycleEndIso = new Date(syncedMs + durationMin * 60_000).toISOString();
     const alreadyFirst = finalSlots.length > 0 &&
       Math.abs(new Date(finalSlots[0].startIso).getTime() - syncedMs) < 60_000;
@@ -1257,7 +1297,18 @@ export function deriveCurrentStateATC(
 ): { state: 'ON' | 'OFF'; startIso: string | null } {
   if (resyncPoint?.syncedState === 'ON') {
     const syncedMs = new Date(resyncPoint.syncedAtIso).getTime();
-    const dur = resyncPoint.generatedOnDurationMin ?? 120;
+    // AUDIT-FIX (F-25): nearest same-state slot duration beats a flat 120.
+    let dur = resyncPoint.generatedOnDurationMin ?? 0;
+    if (dur <= 0) {
+      dur = schedule
+        .filter(s => s.state === 'ON' && s.endIso)
+        .map(s => ({
+          startMs: new Date(s.startIso).getTime(),
+          dur: Math.round((new Date(s.endIso!).getTime() - new Date(s.startIso).getTime()) / 60_000),
+        }))
+        .filter(x => Number.isFinite(x.startMs) && x.dur > 0)
+        .sort((a, b) => Math.abs(a.startMs - syncedMs) - Math.abs(b.startMs - syncedMs))[0]?.dur ?? 120;
+    }
     if (nowMs >= syncedMs && nowMs < syncedMs + dur * 60_000) {
       return { state: 'ON', startIso: resyncPoint.syncedAtIso };
     }

@@ -258,6 +258,80 @@ function findNextGrowattOn(schedule: ScheduleSlot[], tMs: number): ScheduleSlot 
   return next;
 }
 
+// ── AUDIT-FIX (F-07): Actual-cycle classification schedule ──────────────────
+// The period classification previously ran against the PREDICTED schedule
+// (utility_predictions.daySchedule) alone. Predicted boundaries drift from
+// reality, so reports were classified against a cycle that might not match
+// the actual Growatt state at T. Spec: classification must use ACTUAL
+// Growatt transitions; predicted durations may only fill in boundaries that
+// haven't happened yet (the end of the currently-open state).
+//
+// This helper builds a slot list from real power_events:
+//   - every UTILITY_ON/OFF event starts a slot of that state, ending at the
+//     next event (these are facts, not predictions);
+//   - the final (still-open) slot ends at a PREDICTED boundary borrowed from
+//     the overlapping predicted slot of the same state — the only place a
+//     predicted duration is used;
+//   - predicted future slots (start after the last actual event) are
+//     appended so Period-2 lookups still find a "next ON".
+// Returns null when there are no usable events (caller falls back to the
+// predicted schedule).
+function buildActualEventSchedule(
+  events: { event_type: string; occurred_at: string }[],
+  predictedSchedule: ScheduleSlot[],
+  nowMs: number,
+): ScheduleSlot[] | null {
+  if (!events || events.length === 0) return null;
+  const chrono = [...events].sort(
+    (a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime(),
+  );
+  const slots: ScheduleSlot[] = [];
+  for (let i = 0; i < chrono.length; i++) {
+    const state = chrono[i].event_type === 'UTILITY_ON' ? 'ON' : 'OFF';
+    const startIso = chrono[i].occurred_at;
+    const startMs = new Date(startIso).getTime();
+    if (!Number.isFinite(startMs)) continue;
+    let endMs: number;
+    if (i + 1 < chrono.length) {
+      endMs = new Date(chrono[i + 1].occurred_at).getTime();
+    } else {
+      // Open slot — borrow the end from the overlapping predicted slot of
+      // the same state; if none, leave a 3h horizon so progress math works.
+      let predictedEndMs: number | null = null;
+      for (const ps of predictedSchedule) {
+        if (ps.state !== state) continue;
+        const psStart = toMs(ps.start, nowMs);
+        const psEnd = toMs(ps.end, nowMs);
+        if (psStart === null || psEnd === null) continue;
+        // Overlapping or next-future predicted slot of the same state.
+        if (psEnd > startMs && (predictedEndMs === null || psEnd < predictedEndMs)) {
+          predictedEndMs = psEnd;
+        }
+      }
+      endMs = predictedEndMs ?? (startMs + 3 * 3600_000);
+      // Never let the open slot end in the past relative to now — that
+      // would make the current state look finished when it isn't.
+      if (endMs <= nowMs) endMs = nowMs + 3 * 3600_000;
+    }
+    if (!Number.isFinite(endMs) || endMs <= startMs) continue;
+    slots.push({
+      state,
+      start: startIso,
+      end: new Date(endMs).toISOString(),
+      durationMin: Math.round((endMs - startMs) / 60_000),
+    } as ScheduleSlot);
+  }
+  if (slots.length === 0) return null;
+  // Append predicted slots that start after the last actual event so
+  // findNextGrowattOn still sees the upcoming cycle.
+  const lastEventMs = new Date(chrono[chrono.length - 1].occurred_at).getTime();
+  for (const ps of predictedSchedule) {
+    const psStart = toMs(ps.start, nowMs);
+    if (psStart !== null && psStart > lastEventMs) slots.push(ps);
+  }
+  return slots;
+}
+
 // ── V2.3: Calculate OFF Progress (absolute ms) ──────────────────────────────
 // Formula: OFF Progress = (Elapsed OFF Time / Expected OFF Duration) x 100
 function calculateOffProgress(offSlot: ScheduleSlot, tMs: number) {
@@ -269,15 +343,20 @@ function calculateOffProgress(offSlot: ScheduleSlot, tMs: number) {
   const expectedDuration = Math.max(1, (end - start) / 60_000);
   const elapsed = Math.max(0, Math.min(expectedDuration, (tMs - start) / 60_000));
   const progress = (elapsed / expectedDuration) * 100;
-  // SPEC-FIX (2026-08-01): Period 2 starts strictly AFTER 50% consumed —
-  // the exact-50% instant belongs to Period 1 (spec example: OFF 12:00→16:00
-  // → Period 1 ends 13:59:59, Period 2 starts 14:00:01).
+  // SPEC-FIX (2026-08-01, refined by audit F-19): the spec defines
+  // Period 1 = "OFF consumed < 50%" and Period 2 = "> 50%" and leaves the
+  // exact-50% instant undefined. The previous `<= 50` silently assigned it
+  // to Period 1 (baking in a POSITIVE offset from a predicted reference).
+  // Exact-50% now resolves to Period 2 (PENDING_NEGATIVE) — the pending
+  // branch is self-correcting: its value is fixed against the actual
+  // Growatt ON event, so the ambiguous boundary can never persist a
+  // wrong-sign offset.
   return {
     elapsed,
     expectedDuration,
     progress,
-    isLessThan50: progress <= 50,
-    isGreaterThan50: progress > 50,
+    isLessThan50: progress < 50,
+    isGreaterThan50: progress >= 50,
   };
 }
 
@@ -330,14 +409,16 @@ interface ReporterOffsetResult {
 function calculateReporterOffset(
   schedule: ScheduleSlot[],
   transitionMs: number,
-  // SPEC-FIX (2026-08-01): PERIOD CLASSIFICATION uses the submission time
-  // (nowMs), while the OFFSET VALUE is computed from the reported transition
-  // time (transitionMs = now − selectedTimeOption). The previous code
-  // classified at transitionMs against a schedule generated from the CURRENT
-  // Growatt state — for old selected times T fell outside every slot (→
-  // silent NEUTRAL fallback) and contradicted the immediate-resolution check
-  // which runs at nowMs. (Spec "Selected Time Option Logic": the selected
-  // time consumes durations; it does not redefine the current period.)
+  // SPEC-FIX (2026-08-01, doc corrected by audit F-20): BOTH the period
+  // classification AND the offset value are anchored at the reported
+  // transition time T (transitionMs = now − selectedTimeOption). Spec §19 /
+  // "Selected Time Option Logic": the selected time consumes durations —
+  // the report is classified where T falls inside the cycle, so the call
+  // site passes classifyMs = transitionMs. The schedule is extended
+  // backwards from power_events so past-T reports still have a slot to be
+  // classified against. (An earlier version of this comment claimed
+  // classification happened at submission time nowMs — that was never the
+  // behavior; the claim and the behavior now agree on T.)
   classifyMs: number = transitionMs,
 ): ReporterOffsetResult | { error: string } {
   // Find what Growatt state the submission falls in
@@ -571,6 +652,10 @@ export function useUtilityReports() {
     reportId: number | null;
     selfResync: ResyncPoint | null;
     error: string | null;
+    /** F-24: true when an identical recent report already existed */
+    duplicate?: boolean;
+    /** F-17: id of the resync_history row created for this self-report */
+    selfResyncHistoryId?: number | null;
   }> => {
     if (!user) return { reportId: null, selfResync: null, error: 'Not authenticated' };
 
@@ -642,22 +727,39 @@ export function useUtilityReports() {
 
     let v22Offset: ReporterOffsetResult | { error: string } | null = null;
     if (schedule.length > 0) {
-      // SPEC-FIX B3 (Selected Time Option): when the user picks a PAST time T,
-      // the period must be classified AT T (spec: "the selected time consumes
-      // durations"). The live schedule only covers the present cycle, so T
-      // often falls outside every slot → silent NEUTRAL. Fix: extend the
-      // schedule BACKWARDS from power_events history so T has a slot to be
-      // classified against, and classify at T itself.
+      // AUDIT-FIX (F-07): classify against the ACTUAL Growatt cycle built
+      // from power_events, not the predicted schedule. Predicted durations
+      // are used only for boundaries that haven't happened yet (the end of
+      // the currently-open state). This replaces the older B3 backward
+      // extension, which still anchored the PRESENT cycle on predictions.
       let effectiveSchedule = schedule;
-      const earliestMs = Math.min(
-        ...schedule.map((s: any) => new Date(s.start).getTime()).filter(Number.isFinite),
-      );
-      if (transitionMs < nowMs - 60_000 && Number.isFinite(earliestMs) && transitionMs < earliestMs - 60_000) {
-        try {
+      try {
+        const earliestPredictedMs = Math.min(
+          ...schedule.map((s: any) => new Date(s.start).getTime()).filter(Number.isFinite),
+        );
+        const windowStartMs = Math.min(
+          Number.isFinite(earliestPredictedMs) ? earliestPredictedMs : nowMs,
+          transitionMs,
+          nowMs,
+        ) - 24 * 3600_000;
+        const { data: actualEvents } = await supabase
+          .from('power_events')
+          .select('event_type, occurred_at')
+          .gte('occurred_at', new Date(windowStartMs).toISOString())
+          .lte('occurred_at', new Date(nowMs + 60_000).toISOString())
+          .order('occurred_at', { ascending: true })
+          .limit(200);
+        const actualSchedule = buildActualEventSchedule(actualEvents ?? [], schedule, nowMs);
+        if (actualSchedule && actualSchedule.length > 0) {
+          effectiveSchedule = actualSchedule;
+        } else if (transitionMs < nowMs - 60_000 && Number.isFinite(earliestPredictedMs) && transitionMs < earliestPredictedMs - 60_000) {
+          // Fallback (no events available): extend the predicted schedule
+          // BACKWARDS from power_events history so past-T reports still have
+          // a slot to be classified against (legacy B3 behavior).
           const { data: histEvents } = await supabase
             .from('power_events')
             .select('event_type, occurred_at')
-            .lt('occurred_at', new Date(earliestMs).toISOString())
+            .lt('occurred_at', new Date(earliestPredictedMs).toISOString())
             .order('occurred_at', { ascending: false })
             .limit(14);
           if (histEvents && histEvents.length > 0) {
@@ -667,7 +769,7 @@ export function useUtilityReports() {
               const startIso = chrono[i].occurred_at;
               const endIso = i + 1 < chrono.length
                 ? chrono[i + 1].occurred_at
-                : new Date(earliestMs).toISOString();
+                : new Date(earliestPredictedMs).toISOString();
               const startMs = new Date(startIso).getTime();
               const endMs = new Date(endIso).getTime();
               if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
@@ -682,12 +784,12 @@ export function useUtilityReports() {
               effectiveSchedule = [...histSlots, ...schedule];
             }
           }
-        } catch (e) {
-          console.warn('[useUtilityReports] Failed to extend schedule from history (falling back to live schedule):', e);
         }
+      } catch (e) {
+        console.warn('[useUtilityReports] Failed to build actual-event schedule (falling back to predicted):', e);
       }
-      // Classify the period at the REPORTED time T against the extended
-      // schedule; the offset value is likewise anchored at T.
+      // Classify the period at the REPORTED time T against the actual
+      // cycle; the offset value is likewise anchored at T.
       v22Offset = calculateReporterOffset(effectiveSchedule, transitionMs, transitionMs);
       if ('error' in v22Offset) {
         console.warn('[useUtilityReports] Offset calculation error:', v22Offset.error);
@@ -725,6 +827,12 @@ export function useUtilityReports() {
     //   3. Otherwise find the FIRST UTILITY_ON after T → the user reported
     //      early → offset = T − that ON (negative, the ON arrived later).
     //   The value is clamped to ≤ 0 (and ≥ −12 h) per spec.
+    //
+    // AUDIT-FIX (F-16): when this immediate path resolves the pending value,
+    // remember it — the resync_history row must carry pending_resolved_at so
+    // its lifecycle matches the watcher-resolved rows (one coherent
+    // PENDING_NEGATIVE → NEGATIVE + pending_resolved_at lifecycle).
+    let pendingResolvedNowIso: string | null = null;
     if (offsetState === 'PENDING_NEGATIVE') {
       try {
         const transitionIso = new Date(transitionMs).toISOString();
@@ -773,6 +881,8 @@ export function useUtilityReports() {
             offsetValue = resolvedOffsetMin;
             timelineAlignment = growattOnIso;
             generatedOnReferenceIso = growattOnIso;
+            // F-16: mark the resolution instant for the resync_history row.
+            pendingResolvedNowIso = new Date(nowMs).toISOString();
             console.info(
               '[useUtilityReports] PENDING_NEGATIVE resolved from event history: ' +
               `T=${estimatedTransitionAt}, GrowattON=${growattOnIso}, ` +
@@ -786,6 +896,35 @@ export function useUtilityReports() {
         // UTILITY_ON event arrives.
         console.warn('[useUtilityReports] Failed to resolve pending offset from event history:', e);
       }
+    }
+
+    // ── AUDIT-FIX (F-24): idempotency guard ──────────────────────────────
+    // Double-tap / retry previously created duplicate reports, each fanning
+    // out a fresh round of push notifications. The edge function now dedupes
+    // server-side too, but catching it here avoids the write entirely: if
+    // this reporter already has a report whose estimated_transition_at is
+    // within ±60 s of this one, treat the submission as a duplicate and
+    // return the existing report without inserting or fanning out again.
+    try {
+      const { data: twinReports } = await supabase
+        .from('utility_reports')
+        .select('id')
+        .eq('reporter_id', user.id)
+        .gte('estimated_transition_at', new Date(transitionMs - 60_000).toISOString())
+        .lte('estimated_transition_at', new Date(transitionMs + 60_000).toISOString())
+        .limit(1);
+      if (twinReports && twinReports.length > 0) {
+        setSubmitting(false);
+        return {
+          reportId: twinReports[0].id ?? null,
+          selfResync: null,
+          error: null,
+          duplicate: true,
+        };
+      }
+    } catch (_) {
+      // Non-fatal — if the dedupe read fails, proceed; the server-side
+      // dedupe in distribute-resync still prevents duplicate fan-out.
     }
 
     // ── Insert the report with V2.2 fields ───────────────────────────────────
@@ -831,13 +970,13 @@ export function useUtilityReports() {
           return { reportId: null, selfResync: null, error: retryError.message };
         }
         const retryReportId = retryData?.id ?? null;
-        return finishSubmission(retryReportId, estimatedTransitionAt, nowMs, offsetState, offsetValue, timelineAlignment, generatedOnDurationMin, generatedOnReferenceIso, generatedOnReferenceKind, reportedState);
+        return finishSubmission(retryReportId, estimatedTransitionAt, nowMs, offsetState, offsetValue, timelineAlignment, generatedOnDurationMin, generatedOnReferenceIso, generatedOnReferenceKind, reportedState, pendingResolvedNowIso);
       }
       return { reportId: null, selfResync: null, error: error.message };
     }
 
     const reportId = data?.id ?? null;
-    return finishSubmission(reportId, estimatedTransitionAt, nowMs, offsetState, offsetValue, timelineAlignment, generatedOnDurationMin, generatedOnReferenceIso, generatedOnReferenceKind, reportedState);
+    return finishSubmission(reportId, estimatedTransitionAt, nowMs, offsetState, offsetValue, timelineAlignment, generatedOnDurationMin, generatedOnReferenceIso, generatedOnReferenceKind, reportedState, pendingResolvedNowIso);
 
     // ── Helper: finish the submission ───────────────────────────────────────
     async function finishSubmission(
@@ -851,7 +990,11 @@ export function useUtilityReports() {
       generatedOnReferenceIso: string | null,
       generatedOnReferenceKind: 'completed' | 'active' | null,
       reportedState: ReportedState,
-    ): Promise<{ reportId: number | null; selfResync: ResyncPoint | null; error: string | null }> {
+      // F-16: set when the pending value was resolved at report time — the
+      // resync_history row must record pending_resolved_at to keep one
+      // coherent pending lifecycle across both resolution paths.
+      pendingResolvedNowIso: string | null = null,
+    ): Promise<{ reportId: number | null; selfResync: ResyncPoint | null; error: string | null; selfResyncHistoryId?: number | null }> {
       // Save submission time & start cooldown
       try { await AsyncStorage.setItem(LAST_REPORT_KEY, String(nowMs)); } catch (_) {}
       setCooldownRemainingMs(COOLDOWN_MS);
@@ -884,31 +1027,40 @@ export function useUtilityReports() {
         generatedOnReferenceIso,
         generatedOnReferenceKind: generatedOnReferenceKind ?? 'completed',
         confirmationTime: estimatedTransitionAt,
+        // F-06: self-reports carry manual priority over community clones.
+        source: 'self_report',
       };
 
       // Persist to resync_history with V2.2 fields
-      supabase.from('resync_history').insert({
-        user_id: user!.id,
-        report_id: reportId,
-        reporter_id: user!.id,
-        reporter_username: null,
-        reported_state: reportedState,
-        effective_transition_at: estimatedTransitionAt,
-        confirmed_at: new Date(nowMs).toISOString(),
-        source: 'self_report',
-        // V2.2 fields:
-        offset_state: offsetState,
-        offset_value: offsetValue,
-        timeline_alignment: timelineAlignment,
-        generated_on_start_iso: estimatedTransitionAt,
-        generated_on_duration_min: generatedOnDurationMin,
-        generated_on_reference_iso: generatedOnReferenceIso,
-        generated_on_reference_kind: generatedOnReferenceKind ?? 'completed',
-      }).then(({ error: histErr }) => {
+      // F-17: capture the row id so a later revert can mark EXACTLY this row.
+      let selfResyncHistoryId: number | null = null;
+      try {
+        const { data: histRow, error: histErr } = await supabase.from('resync_history').insert({
+          user_id: user!.id,
+          report_id: reportId,
+          reporter_id: user!.id,
+          reporter_username: null,
+          reported_state: reportedState,
+          effective_transition_at: estimatedTransitionAt,
+          confirmed_at: new Date(nowMs).toISOString(),
+          source: 'self_report',
+          // V2.2 fields:
+          offset_state: offsetState,
+          offset_value: offsetValue,
+          timeline_alignment: timelineAlignment,
+          generated_on_start_iso: estimatedTransitionAt,
+          generated_on_duration_min: generatedOnDurationMin,
+          generated_on_reference_iso: generatedOnReferenceIso,
+          generated_on_reference_kind: generatedOnReferenceKind ?? 'completed',
+          // F-16: when the pending value was resolved immediately at report
+          // time, record the resolution instant on the history row too.
+          ...(pendingResolvedNowIso ? { pending_resolved_at: pendingResolvedNowIso } : {}),
+        }).select('id').single();
+        selfResyncHistoryId = histRow?.id ?? null;
         if (histErr) {
           console.warn('[useUtilityReports] history insert error:', histErr.message);
           if (histErr.message.includes('offset_state') || histErr.message.includes('generated_on')) {
-            supabase.from('resync_history').insert({
+            const { data: retryRow, error: retryHistErr } = await supabase.from('resync_history').insert({
               user_id: user!.id,
               report_id: reportId,
               reporter_id: user!.id,
@@ -917,12 +1069,14 @@ export function useUtilityReports() {
               effective_transition_at: estimatedTransitionAt,
               confirmed_at: new Date(nowMs).toISOString(),
               source: 'self_report',
-            }).then(({ error: retryHistErr }) => {
-              if (retryHistErr) console.warn('[useUtilityReports] history retry error:', retryHistErr.message);
-            });
+            }).select('id').single();
+            selfResyncHistoryId = retryRow?.id ?? null;
+            if (retryHistErr) console.warn('[useUtilityReports] history retry error:', retryHistErr.message);
           }
         }
-      });
+      } catch (histEx) {
+        console.warn('[useUtilityReports] history insert exception (non-fatal):', histEx);
+      }
 
       // SPEC-FIX (F10, 2026-08-01): write the reporter's offset to
       // user_offsets AT REPORT TIME — the single authoritative writer.
@@ -958,7 +1112,7 @@ export function useUtilityReports() {
       await fetchMyReports();
       setSubmitting(false);
 
-      return { reportId, selfResync, error: null };
+      return { reportId, selfResync, error: null, selfResyncHistoryId };
     }
   }, [user, fetchMyReports, cooldownRemainingMs]);
 
