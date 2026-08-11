@@ -86,8 +86,12 @@ export function useUserOffset() {
   // backend pending-resolution, revert).
   useEffect(() => {
     if (!user) return;
+    // Unique topic per hook INSTANCE: useUserOffset is mounted by several
+    // components at once (layout, prediction provider, screens). A shared
+    // topic makes supabase-js return the existing (already-subscribed)
+    // channel and .on() then throws "cannot add callbacks after subscribe()".
     const channel = supabase
-      .channel(`user_offsets_live_${user.id}`)
+      .channel(`user_offsets_live_${user.id}_${Math.random().toString(36).slice(2)}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'user_offsets', filter: `user_id=eq.${user.id}` },

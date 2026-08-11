@@ -658,8 +658,10 @@ export function useUserPredictions(
         const { data: authData } = await supabase.auth.getUser();
         const uid = authData?.user?.id;
         if (!uid || disposed) return;
+        // Unique topic per hook instance — a shared topic makes supabase-js
+        // return an already-subscribed channel and .on() throws.
         channel = supabase
-          .channel(`resync_history_v21_${uid}`)
+          .channel(`resync_history_v21_${uid}_${Math.random().toString(36).slice(2)}`)
           .on(
             'postgres_changes',
             { event: '*', schema: 'public', table: 'resync_history', filter: `user_id=eq.${uid}` },
