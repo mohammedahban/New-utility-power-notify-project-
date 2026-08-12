@@ -108,26 +108,30 @@ export function useStatusSnapshot() {
   ): Promise<void> => {
     if (!storageKey) return;
 
-    // Race guard: some paths capture explicitly (with the resync_history row
-    // id attached) and THEN call applyResync, whose registered snapshot
-    // callback captures again. If a fresh snapshot (< 15 s old) already
-    // carries a resyncHistoryRowId and this capture doesn't, carry it over
-    // so the second capture doesn't silently strip the revert target (F-17).
-    let carriedRowId: number | null = extra?.resyncHistoryRowId ?? null;
-    if (carriedRowId == null) {
-      try {
-        const raw = await AsyncStorage.getItem(storageKey);
-        if (raw) {
-          const prev: StatusSnapshot = JSON.parse(raw);
-          if (
-            prev?.resyncHistoryRowId != null &&
-            Date.now() - new Date(prev.createdAt).getTime() < 15_000
-          ) {
-            carriedRowId = prev.resyncHistoryRowId;
+    // Race guard (ISSUE-FIX revert-to-neutral): some paths capture
+    // explicitly BEFORE the mutation and then applyResync's registered
+    // snapshot callback fires AFTER the mutation (respond()/submitReport()
+    // already wrote user_offsets — and the F-05 realtime subscription can
+    // deliver that write before the callback runs). A second capture would
+    // then snapshot the POST-mutation offset, so "revert" restored the
+    // cloned/pending values (NEUTRAL 0) instead of the pre-action state.
+    // If a fresh snapshot (< 15 s old) already exists, keep it — it holds
+    // the true pre-action state — and only carry over a newly-known
+    // resyncHistoryRowId.
+    try {
+      const raw = await AsyncStorage.getItem(storageKey);
+      if (raw) {
+        const prev: StatusSnapshot = JSON.parse(raw);
+        if (prev?.createdAt && Date.now() - new Date(prev.createdAt).getTime() < 15_000) {
+          if (extra?.resyncHistoryRowId != null && prev.resyncHistoryRowId == null) {
+            const merged: StatusSnapshot = { ...prev, resyncHistoryRowId: extra.resyncHistoryRowId };
+            setSnapshot(merged);
+            await AsyncStorage.setItem(storageKey, JSON.stringify(merged)).catch(() => {});
           }
+          return;
         }
-      } catch (_) {}
-    }
+      }
+    } catch (_) {}
 
     const snap: StatusSnapshot = {
       previousState: currentState,
@@ -136,7 +140,7 @@ export function useStatusSnapshot() {
       previousResyncPoint: currentResyncPoint,
       previousOffsetState: extra?.offsetState ?? null,
       previousOffsetValue: extra?.offsetValue ?? null,
-      resyncHistoryRowId: carriedRowId,
+      resyncHistoryRowId: extra?.resyncHistoryRowId ?? null,
       createdAt: new Date().toISOString(),
       trigger,
     };

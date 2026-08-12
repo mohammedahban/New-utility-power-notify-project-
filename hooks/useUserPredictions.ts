@@ -140,6 +140,19 @@ function deriveOffsetState(offsetMinutes: number): OffsetState {
 //      elapsed remainder is CONSUMED from the following OFF — that OFF is
 //      re-anchored to the Generated ON's end (spec "Selected Time Option
 //      Logic": entire ON consumed → remainder consumed from following OFF).
+// ISSUE-FIX (pending-negative timeline gaps): the surgery must return slots
+// in strict chronological order. The engine may prepend a synthetic
+// Generated ON slot ahead of the still-running OFF slot it interrupted;
+// without sorting, that past OFF slot stays sandwiched between the current
+// Generated ON and the future slots, so the Today Timeline / 24h Schedule
+// show inverted rows and apparent time gaps (spec §8/§34: the schedule must
+// remain continuous — no gaps, no overlaps, end of N = start of N+1).
+function sortSlotsChronologically(slots: ShiftedScheduleSlot[]): ShiftedScheduleSlot[] {
+  return [...slots].sort(
+    (a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime(),
+  );
+}
+
 function applyGeneratedOnToSchedule(
   schedule: ShiftedScheduleSlot[],
   generatedOn: GeneratedOnInfo | null,
@@ -244,12 +257,12 @@ function applyGeneratedOnToSchedule(
   if (endMs <= nowMs) {
     // EXPIRED Generated ON — consume the remainder from the following OFF.
     // The Generated ON itself is history; it is not inserted into the schedule.
-    return anchorOff(marked);
+    return sortSlotsChronologically(anchorOff(marked));
   }
 
   // The matched slot IS the Generated ON — no synthetic insert needed.
   if (existingIdx >= 0) {
-    return anchorOff(marked);
+    return sortSlotsChronologically(anchorOff(marked));
   }
 
   // Current/future Generated ON — insert at the sorted position, then anchor.
@@ -273,7 +286,7 @@ function applyGeneratedOnToSchedule(
   const withGen = insertIdx < 0
     ? [...marked, synthetic]
     : [...marked.slice(0, insertIdx), synthetic, ...marked.slice(insertIdx)];
-  return anchorOff(withGen);
+  return sortSlotsChronologically(anchorOff(withGen));
 }
 
 // ── V2.1 CORRECTED: no-op (PENDING_NEGATIVE never produced by engine) ──────

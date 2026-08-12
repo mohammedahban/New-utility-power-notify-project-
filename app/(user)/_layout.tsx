@@ -177,12 +177,78 @@ function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
   setReportModalVisible: (v: boolean) => void;
 }) {
   const insets = useSafeAreaInsets();
-  const { pendingCount } = useResyncNotifications();
+  const { pendingCount, registerAutoCloneHandler, findExistingCloneRowId, performClone } = useResyncNotifications();
   const { submitting, submitReport, isCoolingDown, cooldownLabel } = useUtilityReports();
   const { applyResync, resyncPoint } = useResync();
   const { userPrediction } = useSharedUserPrediction();
   const { offset } = useUserOffset();
   const { captureSnapshot, attachResyncHistoryRowId } = useStatusSnapshot();
+
+  // ── ISSUE-FIX (auto-clone, spec §21–§23): followers clone the reporter's
+  // calculated state AUTOMATICALLY when the notification arrives — manual
+  // approval is confidence/reliability bookkeeping only, never a gate for
+  // the timeline. The one-hour window is already enforced server-side
+  // (suppression) and client-side (applyResync guard); manual-state priority
+  // (§24) is enforced by applyResync. A previously-cloned (even reverted)
+  // report never re-applies (§29).
+  React.useEffect(() => {
+    registerAutoCloneHandler(async (notif) => {
+      try {
+        const existingId = await findExistingCloneRowId(notif);
+        if (existingId != null) return; // already cloned (or reverted) — do nothing
+
+        // 1. Snapshot BEFORE any mutation so revert restores the true
+        //    pre-clone state (the clone upserts user_offsets; capturing
+        //    afterwards would race the F-05 realtime echo — the
+        //    revert-to-neutral bug).
+        await captureSnapshot(
+          userPrediction?.currentState ?? 'OFF',
+          userPrediction?.currentStateStartIso ?? null,
+          offset?.offset_minutes ?? 0,
+          resyncPoint ?? null,
+          'community_confirm',
+          {
+            offsetState: (offset as any)?.offset_state ?? null,
+            offsetValue: (offset as any)?.offset_value ?? null,
+          },
+        );
+
+        // 2. Guards FIRST (spec §24 manual priority + §25 one-hour window):
+        //    if applyResync rejects, NOTHING is written — the user's own
+        //    manual state and offset row stay intact. (The one-hour window
+        //    stays anchored by the user's own existing resync_history row.)
+        const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
+        const applied = await applyResync({
+          syncedState: 'ON',
+          syncedAtIso: effectiveTransitionAt,
+          appliedAtIso: new Date().toISOString(),
+          reporterName: notif.reporter_username ?? null,
+          reporterReliability: null,
+          offsetState: notif.reporter_offset_state ?? 'NEUTRAL',
+          offsetValue: notif.reporter_offset_value ?? 0,
+          timelineAlignment: notif.reporter_timeline_alignment ?? effectiveTransitionAt,
+          generatedOnStartIso: effectiveTransitionAt,
+          generatedOnDurationMin: notif.generated_on_duration_min ?? null,
+          generatedOnReferenceIso: notif.generated_on_reference_iso ?? null,
+          generatedOnReferenceKind: notif.generated_on_reference_kind ?? null,
+          source: 'community_resync',
+        } as any);
+        if (!applied) {
+          console.log('[AutoClone] timeline application rejected by guards (manual priority or one-hour rule) — nothing written');
+          return;
+        }
+
+        // 3. Guards passed → persist the clone (history row + user_offsets).
+        const yesResult = await performClone(notif);
+        if (yesResult.cloneRowId != null) {
+          attachResyncHistoryRowId(yesResult.cloneRowId);
+        }
+      } catch (e) {
+        console.warn('[AutoClone] failed:', e);
+      }
+    });
+    return () => registerAutoCloneHandler(null);
+  }, [registerAutoCloneHandler, findExistingCloneRowId, performClone, captureSnapshot, attachResyncHistoryRowId, applyResync, userPrediction, offset, resyncPoint]);
 
   // V2.2: handleReport — ON-only, no calibrate() call.
   // The Period 1/2/3 offset is computed automatically inside submitReport.

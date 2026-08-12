@@ -233,7 +233,7 @@ function NotifCard({ notif, onRespond, onReporterPress }: {
           the user makes an informed decision. */}
       {offsetBadge && (
         <View style={[ncStyles.cloneBanner, { borderColor: offsetBadge.color + '44' }]}>
-          <Text style={ncStyles.cloneBannerTitle}>عند الموافقة ستُنسخ حالة المُبلِّغ:</Text>
+          <Text style={ncStyles.cloneBannerTitle}>تمت مزامنة جدولك تلقائياً مع حالة المُبلِّغ — هل البلاغ صحيح في موقعك؟</Text>
           <View style={ncStyles.cloneBadgeRow}>
             <View style={[ncStyles.cloneChip, { borderColor: offsetBadge.color + '66', backgroundColor: offsetBadge.color + '15' }]}>
               <Text style={[ncStyles.cloneChipText, { color: offsetBadge.color }]}>{offsetBadge.label}</Text>
@@ -812,7 +812,7 @@ export default function CommunityScreen() {
   const { nearbyUsers, loading: nearbyLoading, refresh: refreshNearby } = useNearbyUsers(myLat, myLon);
   const { following, followers, pending, outgoing, loading: followsLoading, sendRequest, respondToRequest, cancelOrUnfollow, getStatusWith, refresh: refreshFollows } = useFollows();
   const { submitting, submitReport } = useUtilityReports();
-  const { notifications, history, loading: notifLoading, pendingCount, respond, refresh: refreshNotifs } = useResyncNotifications();
+  const { notifications, history, loading: notifLoading, pendingCount, respond, refresh: refreshNotifs, findExistingCloneRowId, performClone } = useResyncNotifications();
   const { score: myScore } = useMyReliability(user?.id);
   const [myOffsetMinutes, setMyOffsetMinutes] = React.useState(0);
   const { applyResync, resyncPoint } = useResync();
@@ -935,93 +935,105 @@ export default function CommunityScreen() {
     }
   }, [submitReport, applyResync, captureSnapshot, attachResyncHistoryRowId, userPrediction, offset, resyncPoint]);
 
-  // TMMS V2.2: handleRespond — the YES branch no longer recalculates anything.
-  // useResyncNotifications.respond() clones the reporter's OffsetState /
-  // OffsetValue / TimelineAlignment internally and returns them in yesResult.
-  // Here we just apply the resync point and surface the cloned state to the UI.
+  // TMMS V2.2 + auto-clone: YES runs the SAME guard-first pipeline as the
+  // automatic clone in the user layout: existing-clone check → snapshot →
+  // guards (applyResync, spec §24/§25) → persist clone (performClone) →
+  // record the confirmation (respond = reliability bookkeeping only).
   const handleRespond = useCallback(async (notif: any, response: 'yes' | 'no' | 'ignore') => {
-    const { yesResult, error } = await respond(notif, response);
+    let skipClone = false;
+    let alreadySynced = false;
+    let rejected = false;
+
+    if (response === 'yes') {
+      const existingId = await findExistingCloneRowId(notif);
+      if (existingId != null) {
+        // Auto-clone already handled guards + application when the
+        // notification arrived — YES is confirmation-only now.
+        alreadySynced = true;
+      } else {
+        // Snapshot BEFORE any mutation (revert-to-neutral fix).
+        await captureSnapshot(
+          userPrediction?.currentState ?? 'OFF',
+          userPrediction?.currentStateStartIso ?? null,
+          offset?.offset_minutes ?? 0,
+          resyncPoint ?? null,
+          'community_confirm',
+          {
+            offsetState: (offset as any)?.offset_state ?? null,
+            offsetValue: (offset as any)?.offset_value ?? null,
+          },
+        );
+        // Guards FIRST — if they reject, nothing is written at all.
+        const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
+        let reporterReliability: number | null = null;
+        if (notif.reporter_id) {
+          try {
+            const { data } = await supabase
+              .from('user_reliability')
+              .select('reliability_score')
+              .eq('user_id', notif.reporter_id)
+              .maybeSingle();
+            if (data) reporterReliability = Math.round(data.reliability_score ?? 50);
+          } catch (_) {}
+        }
+        const applied = await applyResync({
+          syncedState: 'ON', // V2.2: hardcoded
+          syncedAtIso: effectiveTransitionAt,
+          appliedAtIso: new Date().toISOString(),
+          reporterName: notif.reporter_username ?? null,
+          reporterReliability,
+          offsetState: notif.reporter_offset_state ?? 'NEUTRAL',
+          offsetValue: notif.reporter_offset_value ?? 0,
+          timelineAlignment: notif.reporter_timeline_alignment ?? effectiveTransitionAt,
+          generatedOnStartIso: effectiveTransitionAt,
+          generatedOnDurationMin: notif.generated_on_duration_min ?? null,
+          generatedOnReferenceIso: notif.generated_on_reference_iso ?? null,
+          generatedOnReferenceKind: notif.generated_on_reference_kind ?? null,
+          source: 'community_resync',
+        } as any);
+        if (applied) {
+          const yr = await performClone(notif);
+          if (yr.cloneRowId != null) attachResyncHistoryRowId(yr.cloneRowId);
+        } else {
+          rejected = true;
+          skipClone = true; // confirmation only — no clone row, no offset write
+        }
+      }
+    }
+
+    const { error } = await respond(notif, response, skipClone ? { skipClone: true } : undefined);
     if (error) {
       Alert.alert(AR.error, error);
-    } else if (response === 'yes' && yesResult) {
-      // TMMS V2 §GAP-3: capture snapshot BEFORE applying the community resync so
-      // "العودة إلى الحالة الأصلية" can fully restore the pre-confirmation state
-      // even when the Home tab is not currently mounted (snapshotCbRef would be null).
-      await captureSnapshot(
-        userPrediction?.currentState ?? 'OFF',
-        userPrediction?.currentStateStartIso ?? null,
-        offset?.offset_minutes ?? 0,
-        resyncPoint ?? null,
-        'community_confirm',
-        {
-          offsetState: (offset as any)?.offset_state ?? null,
-          offsetValue: (offset as any)?.offset_value ?? null,
-          // F-17: the clone row this YES created — revert must mark this row.
-          resyncHistoryRowId: yesResult.cloneRowId ?? null,
-        },
-      );
-      // Fetch reporter reliability to surface in community sync meta
-      let reporterReliability: number | null = null;
-      if (notif.reporter_id) {
-        try {
-          const { data } = await supabase
-            .from('user_reliability')
-            .select('reliability_score')
-            .eq('user_id', notif.reporter_id)
-            .maybeSingle();
-          if (data) reporterReliability = Math.round(data.reliability_score ?? 50);
-        } catch (_) {}
-      }
-      // V2.2: syncedState is ALWAYS 'ON' (no OFF reporting). The cloned
-      // OffsetState / OffsetValue / TimelineAlignment travel inside
-      // yesResult — applyResync will pass them through to the engine.
-      // F-01/F-06: applyResync now enforces the one-hour earliest-wins rule
-      // and manual-state priority — it returns false when the clone is
-      // rejected. The YES is still recorded (reliability bookkeeping), but
-      // the timeline is left untouched and the user is told why.
-      const applied = await applyResync({
-        syncedState: 'ON', // V2.2: hardcoded
-        syncedAtIso: yesResult.effectiveTransitionAt,
-        appliedAtIso: new Date().toISOString(),
-        reporterName: yesResult.reporterName ?? notif.reporter_username ?? null,
-        reporterReliability,
-        // V2.2 additions (cloned from reporter):
-        offsetState: yesResult.offsetState,
-        offsetValue: yesResult.offsetValue,
-        timelineAlignment: yesResult.timelineAlignment,
-        generatedOnStartIso: yesResult.generatedOnStartIso,
-        generatedOnDurationMin: yesResult.generatedOnDurationMin,
-        generatedOnReferenceIso: yesResult.generatedOnReferenceIso,
-        generatedOnReferenceKind: yesResult.generatedOnReferenceKind,
-        source: 'community_resync',
-      } as any);
+      return;
+    }
+    if (response !== 'yes') return;
 
-      if (!applied) {
-        Alert.alert(
-          AR.scheduleUpdated,
-          'تم تسجيل تأكيدك وحساب موثوقية المُبلِّغ، لكن لم يتم تغيير خطّك الزمني: لديك بلاغ شخصي أحدث أو بلاغ مجتمع مؤكَّد خلال الساعة الماضية (قاعدة الأولوية / قاعدة الساعة الواحدة).',
-        );
-        return;
-      }
-
-      // V2.2: confirmation-only copy. Per the spec, confirmation never
-      // modifies timeline calculations — it only validates the report and
-      // bumps confidence. The user message reflects that.
-      const stateLabelAr: Record<string, string> = {
-        POSITIVE: 'إيجابي',
-        NEGATIVE: 'سلبي',
-        NEUTRAL: 'محايد',
-        PENDING_NEGATIVE: 'سلبي معلَّق',
-      };
-      const valueLabel = yesResult.offsetValue === 'PENDING' || yesResult.offsetState === 'PENDING_NEGATIVE'
-        ? 'بانتظار تحوّل Growatt القادم'
-        : `${(yesResult.offsetValue as number) > 0 ? '+' : ''}${yesResult.offsetValue}د`;
+    if (rejected) {
       Alert.alert(
         AR.scheduleUpdated,
-        `تمت مزامنة خطّك الزمني مع بلاغ المُبلِّغ وفق قواعد TMMS V2.2. الفارق المنسوخ: ${stateLabelAr[yesResult.offsetState]} · ${valueLabel}. لا يؤثر تأكيدك على وقت البلاغ الأصلي — يُؤثّر فقط على موثوقية المُبلِّغ.`,
+        'تم تسجيل تأكيدك وحساب موثوقية المُبلِّغ، لكن لم يتم تغيير خطّك الزمني: لديك بلاغ شخصي أحدث أو بلاغ مجتمع مؤكَّد خلال الساعة الماضية (قاعدة الأولوية / قاعدة الساعة الواحدة).',
       );
+      return;
     }
-  }, [respond, applyResync, captureSnapshot, userPrediction, offset, resyncPoint]);
+
+    const stateLabelAr: Record<string, string> = {
+      POSITIVE: 'إيجابي',
+      NEGATIVE: 'سلبي',
+      NEUTRAL: 'محايد',
+      PENDING_NEGATIVE: 'سلبي معلَّق',
+    };
+    const st: string = notif.reporter_offset_state ?? 'NEUTRAL';
+    const val = notif.reporter_offset_value ?? 0;
+    const valueLabel = val === 'PENDING' || st === 'PENDING_NEGATIVE'
+      ? 'بانتظار تحوّل Growatt القادم'
+      : `${(val as number) > 0 ? '+' : ''}${val}د`;
+    Alert.alert(
+      AR.scheduleUpdated,
+      alreadySynced
+        ? `خطّك الزمني مُزامَن تلقائياً مع هذا البلاغ منذ وصوله (الفارق المنسوخ: ${stateLabelAr[st]} · ${valueLabel}). تم تسجيل تأكيدك — يُؤثّر فقط على موثوقية المُبلِّغ.`
+        : `تمت مزامنة خطّك الزمني مع بلاغ المُبلِّغ وفق قواعد TMMS V2.2. الفارق المنسوخ: ${stateLabelAr[st]} · ${valueLabel}. لا يؤثر تأكيدك على وقت البلاغ الأصلي — يُؤثّر فقط على موثوقية المُبلِّغ.`,
+    );
+  }, [respond, applyResync, captureSnapshot, attachResyncHistoryRowId, findExistingCloneRowId, performClone, userPrediction, offset, resyncPoint]);
 
   const myBadge = myScore ? getReliabilityBadge(myScore.reliability_score) : null;
   const { profile } = useAuth();

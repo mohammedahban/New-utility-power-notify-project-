@@ -154,6 +154,12 @@ export interface YesResyncResult {
   generatedOnReferenceKind: 'completed' | 'active' | null;
   /** F-17: id of the cloned resync_history row created by this YES */
   cloneRowId?: number | null;
+  /**
+   * True when this call actually WROTE the clone (false when the clone was
+   * already applied automatically on notification arrival — YES then only
+   * records the confirmation; spec §21–§23).
+   */
+  isNew?: boolean;
 }
 
 /**
@@ -480,6 +486,23 @@ export function useResyncNotifications() {
 
     setNotifications(enriched);
     setLoading(false);
+
+    // ── ISSUE-FIX (auto-clone, spec §21): surface notifications that have
+    // not been processed yet in this session so the registered handler can
+    // apply the clone AUTOMATICALLY (snapshot → clone → apply). The handler
+    // dedups against resync_history, so previously-cloned reports (including
+    // reverted ones) never re-apply — a reopened app after a revert stays
+    // reverted.
+    const handler = autoCloneHandlerRef.current;
+    if (handler) {
+      const fresh = enriched.filter(n => !autoCloneProcessedRef.current.has(n.id));
+      for (const n of fresh) {
+        autoCloneProcessedRef.current.add(n.id);
+        Promise.resolve(handler(n)).catch(e =>
+          console.warn('[useResyncNotifications] auto-clone handler error:', e),
+        );
+      }
+    }
   }, [user]);
 
   const fetchHistory = useCallback(async () => {
@@ -523,6 +546,22 @@ export function useResyncNotifications() {
     setHistory(v21Entries);
   }, [user]);
 
+  // ── Auto-clone registration (spec §21: followers clone automatically) ──
+  // The handler is registered by a component that owns the timeline
+  // contexts (snapshot + applyResync) — the user layout. It receives each
+  // not-yet-processed notification exactly once per session.
+  const autoCloneHandlerRef = useRef<((notif: ResyncNotification) => void | Promise<void>) | null>(null);
+  const autoCloneProcessedRef = useRef<Set<number>>(new Set());
+  const registerAutoCloneHandler = useCallback(
+    (cb: ((notif: ResyncNotification) => void | Promise<void>) | null) => {
+      autoCloneHandlerRef.current = cb;
+      // On (re)registration, re-scan the current list so notifications that
+      // arrived while no handler was attached still get cloned.
+      if (cb) fetchNotifications();
+    },
+    [fetchNotifications],
+  );
+
   useEffect(() => {
     fetchNotifications();
     fetchHistory();
@@ -561,9 +600,158 @@ export function useResyncNotifications() {
    * Returns a YesResyncResult when the response is 'yes' so the caller
    * can immediately update the ResyncContext.
    */
+  // ── Clone helpers (shared by YES-approval and automatic cloning) ─────────
+  //
+  // SPEC (PDF §21): "A real report → backend calculates A → eligible
+  // followers clone A." Cloning is NOT gated on a manual approval — the
+  // follower's timeline adopts the reporter's calculated state automatically
+  // (subject to the one-hour window, manual-state priority and the 3-hour
+  // validity). The notification's YES/NO is confidence/reliability
+  // bookkeeping ("Community confirmations only increase confidence and never
+  // modify timeline calculations").
+
+  /**
+   * Id of the clone row this user already has for this report — including
+   * reverted rows (a revert must NOT make the same event cloneable again;
+   * spec §29 keeps historical events authoritative for the window).
+   */
+  const findExistingCloneRowId = useCallback(async (
+    notif: ResyncNotification,
+  ): Promise<number | null> => {
+    if (!user) return null;
+    try {
+      const { data } = await supabase
+        .from('resync_history')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('report_id', notif.report_id)
+        .eq('source', 'community_resync')
+        .order('confirmed_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      return data?.id ?? null;
+    } catch (_) {
+      return null;
+    }
+  }, [user]);
+
+  /**
+   * Write the clone: resync_history row + user_offsets upsert. Caller must
+   * have checked findExistingCloneRowId first (this function does NOT dedup).
+   */
+  const performClone = useCallback(async (
+    notif: ResyncNotification,
+  ): Promise<YesResyncResult> => {
+    /**
+     * Effective transition time — Confirmation Timestamp Rule (preserved
+     * from V2). estimated_transition_at is ALREADY the correct, complete,
+     * absolute timestamp: the reporter computed it as
+     *   report_created_at - selectedOffsetMinutes
+     * at the moment they submitted the report. It is never adjusted by
+     * the recipient's response delay.
+     */
+    const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
+
+    // ── V2.1: Clone the reporter's offset snapshot ───────────────────
+    // If the report was created under V2.1, the reporter's offset
+    // state/value/alignment live on the joined utility_reports row (we
+    // fetched them in fetchNotifications). For legacy V2 reports these
+    // fields are null — in that case the approver falls back to
+    // NEUTRAL/0/effectiveTransitionAt, which is the safest possible
+    // default (no shift, perfect alignment with the report time).
+    const clonedOffsetState: OffsetState =
+      notif.reporter_offset_state ?? 'NEUTRAL';
+    const clonedOffsetValue: OffsetValue =
+      notif.reporter_offset_value ?? 0;
+    const clonedTimelineAlignment: TimelineAlignment =
+      notif.reporter_timeline_alignment ?? effectiveTransitionAt;
+
+    // ── V2.1: Clone the Generated ON metadata ────────────────────────
+    // The reporter's report already created a Generated ON at submission
+    // time. The approver inherits the SAME Generated ON — they don't get
+    // a fresh one (PDF §"GENERATED ON IS A REAL TIMELINE EVENT": "Never
+    // delete Generated ON later. Never replace it."). The approver's
+    // timeline simply adopts the reporter's Generated ON as their
+    // current state.
+    const generatedOnStartIso = effectiveTransitionAt; // = report time
+    const generatedOnDurationMin: number | null =
+      notif.generated_on_duration_min ?? null;
+    const generatedOnReferenceIso: string | null =
+      notif.generated_on_reference_iso ?? null;
+    const generatedOnReferenceKind: 'completed' | 'active' | null =
+      notif.generated_on_reference_kind ?? null;
+
+    // Persist to resync_history — V2.1: include the cloned offset data
+    // and Generated ON metadata so the Home Screen / Schedule / Debug
+    // Simulator can read them back without re-deriving anything.
+    // F-17: capture the row id so a later revert marks EXACTLY this clone
+    // row instead of the latest row (which may belong to a newer event).
+    let cloneRowId: number | null = null;
+    try {
+      const { data: cloneRow, error: cloneErr } = await supabase.from('resync_history').insert({
+        user_id: user!.id,
+        report_id: notif.report_id,
+        reporter_id: notif.reporter_id,
+        reporter_username: notif.reporter_username,
+        reported_state: 'UTILITY_ON', // V2.1: hardcoded
+        effective_transition_at: effectiveTransitionAt,
+        confirmed_at: new Date().toISOString(),
+        source: 'community_resync',
+        // V2.1 cloned offset data:
+        offset_state: clonedOffsetState,
+        offset_value: clonedOffsetValue,
+        timeline_alignment: clonedTimelineAlignment,
+        // V2.1 Generated ON metadata (cloned from report):
+        generated_on_start_iso: generatedOnStartIso,
+        generated_on_duration_min: generatedOnDurationMin,
+        generated_on_reference_iso: generatedOnReferenceIso,
+        generated_on_reference_kind: generatedOnReferenceKind,
+      }).select('id').single();
+      cloneRowId = cloneRow?.id ?? null;
+      if (cloneErr) console.warn('[useResyncNotifications] clone history insert error:', cloneErr.message);
+    } catch (cloneEx) {
+      console.warn('[useResyncNotifications] clone history insert exception (non-fatal):', cloneEx);
+    }
+
+    // V2.1: also upsert the user's user_offsets row so the next
+    // useUserPredictions mount reads the cloned offset directly.
+    // The numeric offset_minutes is 0 when the state is PENDING_NEGATIVE
+    // — the actual numeric value will be filled in later by the backend
+    // resolve-pending trigger when Growatt turns ON.
+    const numericOffsetForUserRow = typeof clonedOffsetValue === 'number'
+      ? clonedOffsetValue
+      : 0; // PENDING → 0 placeholder, replaced on resolution
+    await supabase
+      .from('user_offsets')
+      .upsert({
+        user_id: user!.id,
+        offset_minutes: numericOffsetForUserRow,
+        offset_state: clonedOffsetState,
+        offset_value: clonedOffsetValue,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id' });
+
+    await fetchHistory();
+    return {
+      effectiveTransitionAt,
+      reportedState: 'UTILITY_ON', // V2.1: always ON
+      reporterName: notif.reporter_username ?? null,
+      offsetState: clonedOffsetState,
+      offsetValue: clonedOffsetValue,
+      timelineAlignment: clonedTimelineAlignment,
+      generatedOnStartIso,
+      generatedOnDurationMin,
+      generatedOnReferenceIso,
+      generatedOnReferenceKind,
+      cloneRowId,
+      isNew: true,
+    };
+  }, [user, fetchHistory]);
+
   const respond = useCallback(async (
     notif: ResyncNotification,
     response: 'yes' | 'no' | 'ignore',
+    opts?: { skipClone?: boolean },
   ): Promise<{ yesResult: YesResyncResult | null; error: string | null }> => {
     if (!user) return { yesResult: null, error: 'Not authenticated' };
 
@@ -587,12 +775,12 @@ export function useResyncNotifications() {
     if (respError) return { yesResult: null, error: respError.message };
 
     // ── Reliability bookkeeping (confidence/trust only — NOT timeline) ──
-    // Responder's own counters — always updated, regardless of response type.
-    const responderPatch: Partial<Record<'total_responses' | 'yes_responses' | 'no_responses' | 'ignored_notifications', number>> = { total_responses: 1 };
-    if (response === 'yes') responderPatch.yes_responses = 1;
-    else if (response === 'no') responderPatch.no_responses = 1;
-    else if (response === 'ignore') responderPatch.ignored_notifications = 1;
-    await bumpReliabilityCounters(user.id, responderPatch, { last_response_at: new Date().toISOString() });
+    // Responder counters (total/yes/no/ignored + reliability/trust scores)
+    // are maintained by the handle_resync_response_insert DB TRIGGER on the
+    // resync_responses upsert above — it recomputes reliability_score and
+    // community_trust_score from the raw counters. A client-side bump here
+    // as well double-counted every response and let counters drift ahead of
+    // the scores (found in the community-logic review).
 
     // Reporter's counters — how THEIR report was judged by this responder.
     // ('ignore' is not a judgment on accuracy, so it doesn't count either way.)
@@ -612,116 +800,40 @@ export function useResyncNotifications() {
     // PDF §"APPROVER LOGIC": "When the Approver presses Approve: The system
     // does not calculate a new offset. Instead, the Approver clones the
     // Reporter's synchronization information."
-    if (response === 'yes') {
-      /**
-       * Effective transition time — Confirmation Timestamp Rule (preserved
-       * from V2). estimated_transition_at is ALREADY the correct, complete,
-       * absolute timestamp: the reporter computed it as
-       *   report_created_at - selectedOffsetMinutes
-       * at the moment they submitted the report. It is never adjusted by
-       * the recipient's response delay.
-       */
-      const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
-
-      // ── V2.1: Clone the reporter's offset snapshot ───────────────────
-      // If the report was created under V2.1, the reporter's offset
-      // state/value/alignment live on the joined utility_reports row (we
-      // fetched them in fetchNotifications). For legacy V2 reports these
-      // fields are null — in that case the approver falls back to
-      // NEUTRAL/0/effectiveTransitionAt, which is the safest possible
-      // default (no shift, perfect alignment with the report time).
-      const clonedOffsetState: OffsetState =
-        notif.reporter_offset_state ?? 'NEUTRAL';
-      const clonedOffsetValue: OffsetValue =
-        notif.reporter_offset_value ?? 0;
-      const clonedTimelineAlignment: TimelineAlignment =
-        notif.reporter_timeline_alignment ?? effectiveTransitionAt;
-
-      // ── V2.1: Clone the Generated ON metadata ────────────────────────
-      // The reporter's report already created a Generated ON at submission
-      // time. The approver inherits the SAME Generated ON — they don't get
-      // a fresh one (PDF §"GENERATED ON IS A REAL TIMELINE EVENT": "Never
-      // delete Generated ON later. Never replace it."). The approver's
-      // timeline simply adopts the reporter's Generated ON as their
-      // current state.
-      const generatedOnStartIso = effectiveTransitionAt; // = report time
-      const generatedOnDurationMin: number | null =
-        notif.generated_on_duration_min ?? null;
-      const generatedOnReferenceIso: string | null =
-        notif.generated_on_reference_iso ?? null;
-      const generatedOnReferenceKind: 'completed' | 'active' | null =
-        notif.generated_on_reference_kind ?? null;
-
-      // Persist to resync_history — V2.1: include the cloned offset data
-      // and Generated ON metadata so the Home Screen / Schedule / Debug
-      // Simulator can read them back without re-deriving anything.
-      // F-17: capture the row id so a later revert marks EXACTLY this clone
-      // row instead of the latest row (which may belong to a newer event).
-      let cloneRowId: number | null = null;
-      try {
-        const { data: cloneRow, error: cloneErr } = await supabase.from('resync_history').insert({
-          user_id: user.id,
-          report_id: notif.report_id,
-          reporter_id: notif.reporter_id,
-          reporter_username: notif.reporter_username,
-          reported_state: 'UTILITY_ON', // V2.1: hardcoded
-          effective_transition_at: effectiveTransitionAt,
-          confirmed_at: new Date().toISOString(),
-          source: 'community_resync',
-          // V2.1 cloned offset data:
-          offset_state: clonedOffsetState,
-          offset_value: clonedOffsetValue,
-          timeline_alignment: clonedTimelineAlignment,
-          // V2.1 Generated ON metadata (cloned from report):
-          generated_on_start_iso: generatedOnStartIso,
-          generated_on_duration_min: generatedOnDurationMin,
-          generated_on_reference_iso: generatedOnReferenceIso,
-          generated_on_reference_kind: generatedOnReferenceKind,
-        }).select('id').single();
-        cloneRowId = cloneRow?.id ?? null;
-        if (cloneErr) console.warn('[useResyncNotifications] clone history insert error:', cloneErr.message);
-      } catch (cloneEx) {
-        console.warn('[useResyncNotifications] clone history insert exception (non-fatal):', cloneEx);
+    if (response === 'yes' && !opts?.skipClone) {
+      // ISSUE-FIX (auto-clone): the timeline clone may already have been
+      // applied automatically when the notification arrived — dedup so YES
+      // only records the confirmation (reliability/confidence) instead of
+      // writing a second clone row. Callers that run the application guards
+      // themselves (handleRespond) pass skipClone to keep YES a pure
+      // confirmation when the guards rejected the timeline application
+      // (spec §24 manual-state priority / §25 one-hour window).
+      const existingCloneId = await findExistingCloneRowId(notif);
+      if (existingCloneId != null) {
+        const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
+        yesResult = {
+          effectiveTransitionAt,
+          reportedState: 'UTILITY_ON',
+          reporterName: notif.reporter_username ?? null,
+          offsetState: notif.reporter_offset_state ?? 'NEUTRAL',
+          offsetValue: notif.reporter_offset_value ?? 0,
+          timelineAlignment: notif.reporter_timeline_alignment ?? effectiveTransitionAt,
+          generatedOnStartIso: effectiveTransitionAt,
+          generatedOnDurationMin: notif.generated_on_duration_min ?? null,
+          generatedOnReferenceIso: notif.generated_on_reference_iso ?? null,
+          generatedOnReferenceKind: notif.generated_on_reference_kind ?? null,
+          cloneRowId: existingCloneId,
+          isNew: false,
+        };
+      } else {
+        yesResult = await performClone(notif);
+        await fetchHistory();
       }
-
-      // V2.1: also upsert the user's user_offsets row so the next
-      // useUserPredictions mount reads the cloned offset directly.
-      // The numeric offset_minutes is 0 when the state is PENDING_NEGATIVE
-      // — the actual numeric value will be filled in later by
-      // resolvePendingNegativeOffsets when Growatt turns ON.
-      const numericOffsetForUserRow = typeof clonedOffsetValue === 'number'
-        ? clonedOffsetValue
-        : 0; // PENDING → 0 placeholder, replaced on resolution
-      await supabase
-        .from('user_offsets')
-        .upsert({
-          user_id: user.id,
-          offset_minutes: numericOffsetForUserRow,
-          offset_state: clonedOffsetState,
-          offset_value: clonedOffsetValue,
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'user_id' });
-
-      yesResult = {
-        effectiveTransitionAt,
-        reportedState: 'UTILITY_ON', // V2.1: always ON
-        reporterName: notif.reporter_username ?? null,
-        offsetState: clonedOffsetState,
-        offsetValue: clonedOffsetValue,
-        timelineAlignment: clonedTimelineAlignment,
-        generatedOnStartIso,
-        generatedOnDurationMin,
-        generatedOnReferenceIso,
-        generatedOnReferenceKind,
-        cloneRowId,
-      };
-
-      await fetchHistory();
     }
 
     await fetchNotifications();
     return { yesResult, error: null };
-  }, [user, fetchNotifications, fetchHistory]);
+  }, [user, fetchNotifications, fetchHistory, findExistingCloneRowId, performClone]);
 
   // V2.1: expose a helper so the Home Screen can read the user's CURRENT
   // offset state (most recent resync_history row) without re-fetching.
@@ -752,6 +864,11 @@ export function useResyncNotifications() {
     loading,
     pendingCount,
     respond,
+    // Auto-clone (spec §21): registration + clone primitives for the
+    // component that owns the timeline contexts.
+    registerAutoCloneHandler,
+    findExistingCloneRowId,
+    performClone,
     refresh: () => { fetchNotifications(); fetchHistory(); },
     // V2.1 additions:
     currentOffsetState,

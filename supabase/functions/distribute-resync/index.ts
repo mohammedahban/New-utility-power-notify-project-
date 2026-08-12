@@ -145,15 +145,17 @@ serve(async (req) => {
 
     // ── F-01: one-hour community window (spec §25–§27) ──────────────────────
     // For each follower, find their latest applicable event (own report OR
-    // accepted community clone, not reverted). If that event is within one
-    // hour before the new event, the EARLIEST event wins → suppress this
-    // notification for that follower. If more than one hour has passed, the
-    // new event legitimately replaces the previous clone (spec §26).
+    // accepted community clone). If that event is within one hour before the
+    // new event, the EARLIEST event wins → suppress this notification for
+    // that follower. If more than one hour has passed, the new event
+    // legitimately replaces the previous clone (spec §26).
+    // Spec §29: a REVERT does NOT erase the historical event for window
+    // purposes — reverted rows still anchor the one-hour window, so no
+    // reverted_at filter is applied here.
     const { data: recentEvents } = await supabaseAdmin
       .from('resync_history')
       .select('user_id, effective_transition_at, source, confirmed_at')
       .in('user_id', followerIds)
-      .is('reverted_at', null)
       .gte('effective_transition_at', new Date(reportMs - ONE_HOUR_MS).toISOString())
       .lte('effective_transition_at', new Date(reportMs).toISOString());
 
