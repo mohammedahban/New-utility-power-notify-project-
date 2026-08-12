@@ -13,7 +13,7 @@ import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { useResync } from '../../contexts/ResyncContext';
-import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
+import { useStatusSnapshot, readPreActionStateForSnapshot } from '../../hooks/useStatusSnapshot';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
@@ -522,6 +522,23 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     <View style={psStyles.reasoningBox}><Text style={psStyles.reasoningText}>💡 {reasoningLine}</Text></View>
   ) : null;
 
+  // ISSUE-FIX (disappearing revert button, spec §28): the revert affordance
+  // belongs to the active community-sync BRANCH / stored snapshot — not to
+  // the COMMUNITY_SYNCED atc MODE. The mode legitimately flips to NORMAL
+  // once the Generated ON becomes the active slot (schedule surgery), which
+  // made the button vanish seconds after every app open while the sync was
+  // still in effect. Render it whenever a resync branch or snapshot exists.
+  const showRevert = meta != null || hasSnapshot === true;
+  const RevertBlock = showRevert ? (
+    <>
+      {RevertConfirmBanner}
+      <TouchableOpacity style={psStyles.revertBtn} onPress={handleRevertPress} activeOpacity={0.75}>
+        <Text style={psStyles.revertIcon}>↩</Text>
+        <Text style={psStyles.revertLabel}>{hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt'}</Text>
+      </TouchableOpacity>
+    </>
+  ) : null;
+
   if (atcMode === 'COMMUNITY_SYNCED') {
     const reporterName = meta?.reporterName ?? 'مجهول';
     const reporterRel = meta?.reporterReliability;
@@ -545,11 +562,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           </View>
           <Text style={{ fontSize: 30 }}>👥</Text>
         </View>
-        {RevertConfirmBanner}
-        <TouchableOpacity style={psStyles.revertBtn} onPress={handleRevertPress} activeOpacity={0.75}>
-          <Text style={psStyles.revertIcon}>↩</Text>
-          <Text style={psStyles.revertLabel}>{hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt'}</Text>
-        </TouchableOpacity>
+        {RevertBlock}
         <View style={psStyles.timeRow}>
           {elapsed ? (<View style={psStyles.timeBlock}><Text style={psStyles.timeLabel}>منذ:</Text><Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text></View>) : null}
           {remainLabel ? (<View style={[psStyles.timeBlock, { borderColor: color + '30', borderWidth: 1 }]}><Text style={psStyles.timeLabel}>الوقت المتوقع المتبقي:</Text><Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text></View>) : null}
@@ -572,6 +585,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         <Text style={[psStyles.statusText, { color }]}>{statusText}</Text>
       </View>
       {offsetStateChip}
+      {RevertBlock}
       <View style={psStyles.timeRow}>
         {elapsed ? (<View style={psStyles.timeBlock}><Text style={psStyles.timeLabel}>منذ:</Text><Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text></View>) : null}
         {remainLabel ? (<View style={[psStyles.timeBlock, { borderColor: color + '30', borderWidth: 1 }]}><Text style={psStyles.timeLabel}>متبقي تقريباً:</Text><Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text></View>) : null}
@@ -1126,9 +1140,9 @@ function useStableNextTransition(nt: UserPrediction['nextTransition'] | null | u
 export default function Home() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { profile, signOut } = useAuth();
+  const { user, profile, signOut } = useAuth();
   const { offset, loading: offsetLoading, pendingDSD, clearPendingDSD, saveOffset } = useUserOffset();
-  const { resyncPoint, clearResync, registerSnapshotCallback } = useResync();
+  const { resyncPoint, clearResync, applyResync, registerSnapshotCallback } = useResync();
   const { anchor } = useStateAnchor();
 
   // SPEC-FIX (F13): single shared engine instance — provider lives in
@@ -1164,33 +1178,49 @@ export default function Home() {
   useEffect(() => {
     registerSnapshotCallback(async (_point) => {
       // F-18: snapshot the full offset semantics so revert restores state +
-      // value, not just the numeric minutes.
+      // value, not just the numeric minutes. Read from the source of truth:
+      // the raw offset_minutes column is a 0 placeholder for PENDING rows,
+      // and hook state can be stale right after a realtime echo.
+      const pre = user?.id
+        ? await readPreActionStateForSnapshot(user.id)
+        : { offsetMinutes: offset?.offset_minutes ?? 0, offsetState: (offset as any)?.offset_state ?? null, offsetValue: (offset as any)?.offset_value ?? null, resyncPoint: null };
       await captureSnapshot(
         userPrediction?.currentState ?? 'OFF',
         userPrediction?.currentStateStartIso ?? null,
-        offset?.offset_minutes ?? 0,
-        resyncPoint,
+        pre.offsetMinutes,
+        resyncPoint ?? pre.resyncPoint,
         'community_confirm',
         {
-          offsetState: (offset as any)?.offset_state ?? null,
-          offsetValue: (offset as any)?.offset_value ?? null,
+          offsetState: pre.offsetState,
+          offsetValue: pre.offsetValue,
         },
       );
     });
     return () => registerSnapshotCallback(null);
-  }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint]);
+  }, [registerSnapshotCallback, captureSnapshot, userPrediction, offset, resyncPoint, user?.id]);
 
   const handleRestoreSnapshot = useCallback(async () => {
     if (!snapshot) return;
     try {
-      const targetOffset = snapshot.previousOffsetMinutes;
+      // ISSUE-FIX (revert-to-neutral): restore the EFFECTIVE offset, not the
+      // raw numeric column. For PENDING_NEGATIVE the numeric column is a 0
+      // placeholder and the real semantics live in state/value; restoring
+      // the raw 0 while keeping a POSITIVE/NEGATIVE state (or restoring a
+      // bare 0) made the engine re-derive NEUTRAL 0 — the user saw "revert
+      // to neutral" instead of their true previous offset.
+      const prevVal = snapshot.previousOffsetValue;
+      const prevValNum = prevVal != null && prevVal !== 'PENDING' ? Number(prevVal) : NaN;
+      const isPending = snapshot.previousOffsetState === 'PENDING_NEGATIVE' || prevVal === 'PENDING';
+      const targetOffset = isPending
+        ? 0 // pending keeps the numeric 0 placeholder — resolver fills it at Growatt ON
+        : Number.isFinite(prevValNum) ? prevValNum : snapshot.previousOffsetMinutes;
       // AUDIT-FIX (F-18): restore the FULL offset semantics — a bare numeric
       // restore cannot represent NEUTRAL-with-value or PENDING_NEGATIVE and
       // would silently re-derive the wrong offset_state from the sign.
       if (snapshot.previousOffsetState) {
         await saveOffset(targetOffset, {
           state: snapshot.previousOffsetState,
-          value: snapshot.previousOffsetValue ?? targetOffset,
+          value: prevVal ?? targetOffset,
         });
       } else {
         await saveOffset(targetOffset);
@@ -1223,11 +1253,22 @@ export default function Home() {
           ]);
         } catch (_) {}
       }
-      await clearResync();
+      // ISSUE-FIX (revert completeness, spec §28): "Revert to Previous
+      // State" must restore the state that existed BEFORE the action — if a
+      // previous resync branch was active (e.g. an earlier self-report or
+      // community clone), revert returns to THAT branch instead of wiping
+      // the resync altogether (which dropped the user to the plain Growatt
+      // timeline). The snapshot callback that applyResync fires is wiped by
+      // the clearSnapshot() right after, so revert stays one-shot.
+      if (snapshot.previousResyncPoint) {
+        await applyResync(snapshot.previousResyncPoint);
+      } else {
+        await clearResync();
+      }
       await clearSnapshot();
       if (Platform.OS !== 'web') { Alert.alert('تمت العملية', 'تم استعادة حالتك السابقة بالكامل — الجدول، الخط الزمني، والفارق.'); }
     } catch (error) { console.error('خطأ أثناء محاولة استعادة الحالة الأصلية والـ offset:', error); }
-  }, [snapshot, saveOffset, clearResync, clearSnapshot, profile?.id, resyncPoint?.syncedAtIso]);
+  }, [snapshot, saveOffset, clearResync, applyResync, clearSnapshot, profile?.id, resyncPoint?.syncedAtIso]);
 
   const offsetMs = (offset?.offset_minutes ?? 0) * 60_000;
   const anchorStartIso = (() => {
@@ -1249,11 +1290,53 @@ export default function Home() {
   const onRefresh = useCallback(() => { setRefreshing(true); setTimeout(() => setRefreshing(false), 1200); }, []);
   const loading = offsetLoading || predLoading;
 
+  // ISSUE-FIX (no-snapshot revert): "العودة إلى Growatt" must actually return
+  // the user to the plain Growatt timeline. The old path only cleared the
+  // resync point and left the cloned offset in user_offsets, so the engine
+  // kept shifting the schedule by the clone's value — the sync was NOT
+  // really cancelled. Reset the offset to NEUTRAL 0, mark the active
+  // community clone row reverted, and clear the frozen-offset keys.
+  const handleRevertToGrowatt = useCallback(async () => {
+    try {
+      await saveOffset(0, { state: 'NEUTRAL', value: 0 });
+      try {
+        const uid = user?.id ?? profile?.id ?? '';
+        if (uid) {
+          const { data: lastRow } = await supabase
+            .from('resync_history')
+            .select('id')
+            .eq('user_id', uid)
+            .eq('source', 'community_resync')
+            .is('reverted_at', null)
+            .order('confirmed_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (lastRow?.id != null) {
+            await supabase.from('resync_history').update({ reverted_at: new Date().toISOString() }).eq('id', lastRow.id);
+          }
+        }
+      } catch (e) { console.warn('[handleRevertToGrowatt] history revert failed:', e); }
+      const oldSyncedAt = resyncPoint?.syncedAtIso;
+      if (oldSyncedAt) {
+        try {
+          await Promise.all([
+            AsyncStorage.removeItem(`tmms_frozen_community_offset_${oldSyncedAt}`),
+            AsyncStorage.removeItem(`tmms_frozen_offset_state_${oldSyncedAt}`),
+            AsyncStorage.removeItem(`tmms_frozen_alignment_${oldSyncedAt}`),
+          ]);
+        } catch (_) {}
+      }
+      try { await AsyncStorage.removeItem('tmms_uncertain_zone_entry_iso'); } catch (_) {}
+      await clearResync();
+      if (Platform.OS !== 'web') { Alert.alert('تمت العملية', 'تم إلغاء المزامنة المجتمعية والعودة إلى جدول Growatt.'); }
+    } catch (error) { console.error('خطأ أثناء العودة إلى جدول Growatt:', error); }
+  }, [saveOffset, clearResync, user?.id, profile?.id, resyncPoint?.syncedAtIso]);
+
   const handleRevert = useCallback(() => {
     const confirmMsg = hasSnapshot
       ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك وفارق التوقيت (Offset) السابق تماماً.'
       : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
-    const doRestore = hasSnapshot ? handleRestoreSnapshot : clearResync;
+    const doRestore = hasSnapshot ? handleRestoreSnapshot : handleRevertToGrowatt;
     if (Platform.OS === 'web') { doRestore(); } else {
       Alert.alert(
         hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt',
@@ -1261,7 +1344,7 @@ export default function Home() {
         [{ text: 'إلغاء', style: 'cancel' }, { text: 'تأكيد العودة والاستعادة', style: 'destructive', onPress: () => doRestore() }],
       );
     }
-  }, [hasSnapshot, handleRestoreSnapshot, clearResync]);
+  }, [hasSnapshot, handleRestoreSnapshot, handleRevertToGrowatt]);
 
   const displayName = profile?.username ?? profile?.email?.split('@')[0] ?? '';
 

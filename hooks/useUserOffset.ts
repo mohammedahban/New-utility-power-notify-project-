@@ -56,6 +56,35 @@ export interface PendingDSDCandidate {
   createdAtIso: string;
 }
 
+/**
+ * Effective offset semantics of a user_offsets row.
+ *
+ * The numeric `offset_minutes` column alone is NOT authoritative in V2.1+:
+ * PENDING_NEGATIVE rows store a 0 placeholder there while the real value
+ * lives in `offset_value`, and `offset_value` comes back from PostgREST as
+ * text. Snapshots and reverts must use THIS derivation — mixing the raw
+ * numeric column with the semantic state/value columns is what made
+ * "revert" restore NEUTRAL/0 instead of the true previous offset.
+ */
+export function effectiveOffsetFromRow(row: any): {
+  minutes: number;
+  state: string | null;
+  value: number | string | null;
+} {
+  if (!row) return { minutes: 0, state: null, value: null };
+  const state: string | null = row.offset_state ?? null;
+  const raw = row.offset_value ?? null;
+  const isPending = state === 'PENDING_NEGATIVE' || raw === 'PENDING';
+  if (isPending) return { minutes: 0, state: 'PENDING_NEGATIVE', value: 'PENDING' };
+  const parsed = raw != null ? Number(raw) : NaN;
+  const value = Number.isFinite(parsed) ? parsed : (row.offset_minutes ?? 0);
+  return {
+    minutes: Number.isFinite(Number(value)) ? Number(value) : 0,
+    state: state ?? (Number(value) > 0 ? 'POSITIVE' : Number(value) < 0 ? 'NEGATIVE' : 'NEUTRAL'),
+    value,
+  };
+}
+
 export function useUserOffset() {
   const { user } = useAuth();
   const [offset, setOffset] = useState<OffsetRow | null>(null);

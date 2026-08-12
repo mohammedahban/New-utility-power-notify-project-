@@ -11,7 +11,8 @@ import { useUtilityReports, TimeOption } from '../../hooks/useUtilityReports';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useResync } from '../../contexts/ResyncContext';
 import { UserPredictionProvider, useSharedUserPrediction } from '../../contexts/UserPredictionContext';
-import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
+import { useStatusSnapshot, readPreActionStateForSnapshot } from '../../hooks/useStatusSnapshot';
+import { supabase } from '../../lib/supabase';
 import { AR } from '../../constants/arabic';
 
 // Submit-page time options: only "Now" .. "30 minutes before" are offered —
@@ -200,16 +201,50 @@ function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
         // 1. Snapshot BEFORE any mutation so revert restores the true
         //    pre-clone state (the clone upserts user_offsets; capturing
         //    afterwards would race the F-05 realtime echo — the
-        //    revert-to-neutral bug).
+        //    revert-to-neutral bug). Read the offset row + persisted resync
+        //    point DIRECTLY from the source of truth: on a fresh app open
+        //    the useUserOffset/useResync hooks may still be loading, and
+        //    snapshotting their empty state stores 0/NEUTRAL — revert would
+        //    then "restore" neutral instead of the real previous offset.
+        const { data: authData } = await supabase.auth.getUser();
+        const uid = authData?.user?.id;
+        if (!uid) return;
+        const pre = await readPreActionStateForSnapshot(uid);
+
+        // 1b. Guard pre-check (spec §24 manual priority + §25 one-hour
+        //     earliest-wins) using the PERSISTED resync point as fallback:
+        //     on a fresh app open the context's resyncPoint may still be
+        //     loading, and applyResync's guards would see `null` and wave a
+        //     later in-window event through. If this check rejects, nothing
+        //     is written and no snapshot is created.
+        const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
+        const existingPoint = resyncPoint ?? pre.resyncPoint;
+        if (existingPoint) {
+          const existingSource = existingPoint.source ?? 'community_resync';
+          if (existingSource === 'self_report') {
+            console.log('[AutoClone] skipped — manual self-report has priority (§24)');
+            return;
+          }
+          const existingMs = new Date(existingPoint.syncedAtIso).getTime();
+          const incomingMs = new Date(effectiveTransitionAt).getTime();
+          if (
+            Number.isFinite(existingMs) && Number.isFinite(incomingMs) &&
+            incomingMs > existingMs && incomingMs - existingMs < 60 * 60 * 1000
+          ) {
+            console.log('[AutoClone] skipped — one-hour earliest-wins window (§25)');
+            return;
+          }
+        }
+
         await captureSnapshot(
           userPrediction?.currentState ?? 'OFF',
           userPrediction?.currentStateStartIso ?? null,
-          offset?.offset_minutes ?? 0,
-          resyncPoint ?? null,
+          pre.offsetMinutes,
+          resyncPoint ?? pre.resyncPoint,
           'community_confirm',
           {
-            offsetState: (offset as any)?.offset_state ?? null,
-            offsetValue: (offset as any)?.offset_value ?? null,
+            offsetState: pre.offsetState,
+            offsetValue: pre.offsetValue,
           },
         );
 
@@ -217,7 +252,6 @@ function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
         //    if applyResync rejects, NOTHING is written — the user's own
         //    manual state and offset row stay intact. (The one-hour window
         //    stays anchored by the user's own existing resync_history row.)
-        const effectiveTransitionAt = notif.estimated_transition_at ?? new Date().toISOString();
         const applied = await applyResync({
           syncedState: 'ON',
           syncedAtIso: effectiveTransitionAt,
@@ -257,15 +291,22 @@ function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
   // captures the same full snapshot (state + offset semantics) as the
   // community-screen report path, BEFORE submitting.
   const handleReport = useCallback(async (time: TimeOption) => {
+    // Read the effective offset semantics from the source of truth (the raw
+    // numeric column is a 0 placeholder for PENDING rows).
+    const { data: authData } = await supabase.auth.getUser();
+    const uid = authData?.user?.id;
+    const pre = uid
+      ? await readPreActionStateForSnapshot(uid)
+      : { offsetMinutes: offset?.offset_minutes ?? 0, offsetState: (offset as any)?.offset_state ?? null, offsetValue: (offset as any)?.offset_value ?? null, resyncPoint: null };
     await captureSnapshot(
       userPrediction?.currentState ?? 'OFF',
       userPrediction?.currentStateStartIso ?? null,
-      offset?.offset_minutes ?? 0,
-      resyncPoint ?? null,
+      pre.offsetMinutes,
+      resyncPoint ?? pre.resyncPoint,
       'user_report',
       {
-        offsetState: (offset as any)?.offset_state ?? null,
-        offsetValue: (offset as any)?.offset_value ?? null,
+        offsetState: pre.offsetState,
+        offsetValue: pre.offsetValue,
       },
     );
 

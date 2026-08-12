@@ -792,7 +792,16 @@ export function useUserPredictions(
           AsyncStorage.setItem(frozenOffsetStorageKey(resyncPoint.syncedAtIso), String(computedOffsetMinutes)).catch(() => {});
           AsyncStorage.setItem(frozenOffsetStateStorageKey(resyncPoint.syncedAtIso), derivedState).catch(() => {});
           AsyncStorage.setItem(frozenAlignmentStorageKey(resyncPoint.syncedAtIso), frozenAlignmentRef.current).catch(() => {});
-          onCommunityOffsetComputed?.(computedOffsetMinutes);
+          // ISSUE-FIX (pending clobber): never persist the engine-computed
+          // offset while the community branch is PENDING_NEGATIVE. The real
+          // value is unknown by definition until the REAL Growatt ON (spec
+          // §13: "never predicted"); writing the computed placeholder (0 →
+          // derived NEUTRAL) wiped the pending state from user_offsets and
+          // poisoned later snapshots/reverts with NEUTRAL 0. The backend
+          // resolver is the only writer allowed to resolve a pending.
+          if (resyncPoint.offsetState !== 'PENDING_NEGATIVE' && resyncPoint.offsetValue !== 'PENDING') {
+            onCommunityOffsetComputed?.(computedOffsetMinutes);
+          }
         }
       };
 

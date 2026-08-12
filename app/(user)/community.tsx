@@ -18,7 +18,7 @@ import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../contexts/AuthContext';
 import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
-import { useStatusSnapshot } from '../../hooks/useStatusSnapshot';
+import { useStatusSnapshot, readPreActionStateForSnapshot } from '../../hooks/useStatusSnapshot';
 import { useUserOffset } from '../../hooks/useUserOffset';
 import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { AR } from '../../constants/arabic';
@@ -899,16 +899,20 @@ export default function CommunityScreen() {
     // Capture snapshot BEFORE report is saved so "العودة إلى الحالة الأصلية" can
     // fully restore the pre-report state (offset + resync + state start).
     // F-18: snapshot the FULL offset semantics (state + value), not just the
-    // numeric minutes.
+    // numeric minutes — read them from the source of truth (the raw numeric
+    // column is a 0 placeholder for PENDING rows).
+    const preReport = user?.id
+      ? await readPreActionStateForSnapshot(user.id)
+      : { offsetMinutes: offset?.offset_minutes ?? 0, offsetState: (offset as any)?.offset_state ?? null, offsetValue: (offset as any)?.offset_value ?? null, resyncPoint: null };
     await captureSnapshot(
       userPrediction?.currentState ?? 'OFF',
       userPrediction?.currentStateStartIso ?? null,
-      offset?.offset_minutes ?? 0,
-      resyncPoint ?? null,
+      preReport.offsetMinutes,
+      resyncPoint ?? preReport.resyncPoint,
       'user_report',
       {
-        offsetState: (offset as any)?.offset_state ?? null,
-        offsetValue: (offset as any)?.offset_value ?? null,
+        offsetState: preReport.offsetState,
+        offsetValue: preReport.offsetValue,
       },
     );
 
@@ -951,16 +955,22 @@ export default function CommunityScreen() {
         // notification arrived — YES is confirmation-only now.
         alreadySynced = true;
       } else {
-        // Snapshot BEFORE any mutation (revert-to-neutral fix).
+        // Snapshot BEFORE any mutation (revert-to-neutral fix). Read the
+        // offset row + persisted resync point from the source of truth so
+        // the EFFECTIVE offset semantics are stored — the raw numeric
+        // column alone is a 0 placeholder for PENDING rows.
+        const pre = user?.id
+          ? await readPreActionStateForSnapshot(user.id)
+          : { offsetMinutes: offset?.offset_minutes ?? 0, offsetState: (offset as any)?.offset_state ?? null, offsetValue: (offset as any)?.offset_value ?? null, resyncPoint: null };
         await captureSnapshot(
           userPrediction?.currentState ?? 'OFF',
           userPrediction?.currentStateStartIso ?? null,
-          offset?.offset_minutes ?? 0,
-          resyncPoint ?? null,
+          pre.offsetMinutes,
+          resyncPoint ?? pre.resyncPoint,
           'community_confirm',
           {
-            offsetState: (offset as any)?.offset_state ?? null,
-            offsetValue: (offset as any)?.offset_value ?? null,
+            offsetState: pre.offsetState,
+            offsetValue: pre.offsetValue,
           },
         );
         // Guards FIRST — if they reject, nothing is written at all.
