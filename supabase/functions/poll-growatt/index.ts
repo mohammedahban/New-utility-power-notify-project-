@@ -6,6 +6,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
+import { sendExpoPush } from "../_shared/push.ts";
 
 const GROWATT_TOKEN = Deno.env.get("GROWATT_TOKEN")!;
 const INVERTER_SN   = Deno.env.get("GROWATT_INVERTER_SN")!;
@@ -186,17 +187,7 @@ Deno.serve(async (req) => {
       }));
 
       try {
-        const pushRes = await fetch("https://exp.host/--/api/v2/push/send", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip, deflate",
-          },
-          body: JSON.stringify(messages),
-        });
-        const pushJson = await pushRes.json();
-        console.log("[poll-growatt] Push sent to", adminTokens.length, "admin token(s):", JSON.stringify(pushJson).slice(0, 200));
+        await sendExpoPush(supabase, messages as Array<Record<string, unknown> & { to: string }>, "poll-growatt");
       } catch (err) {
         console.error("[poll-growatt] Push failed:", err);
       }

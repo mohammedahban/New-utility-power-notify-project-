@@ -3,6 +3,7 @@ import { AppState, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Session, User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
+import { serverNowMs } from '../lib/serverTime';
 
 export interface UserProfile {
   id: string;
@@ -204,7 +205,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const maybeRefresh = async (s: Session): Promise<Session | null> => {
       const expiresAt = s.expires_at ?? 0;
-      const nowSec = Math.floor(Date.now() / 1000);
+      const nowSec = Math.floor(serverNowMs() / 1000);
       const needsRefresh = expiresAt - nowSec < 60; // 60s buffer
 
       if (!needsRefresh) return s;
@@ -282,7 +283,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             // We have a session. If the access token is expired, refresh
             // it now; otherwise use as-is.
             const expiresAt = s.expires_at ?? 0;
-            const nowSec = Math.floor(Date.now() / 1000);
+            const nowSec = Math.floor(serverNowMs() / 1000);
             if (expiresAt - nowSec < 60) {
               const { data: rd } = await supabase.auth.refreshSession();
               if (!mounted) return;
@@ -362,7 +363,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             const { data } = await supabase.auth.getSession();
             if (!mounted || !data.session) return;
             const expiresAt = data.session.expires_at ?? 0;
-            const nowSec = Math.floor(Date.now() / 1000);
+            const nowSec = Math.floor(serverNowMs() / 1000);
             if (expiresAt - nowSec < 300) {
               // Token expires in <5min — refresh now.
               const { data: rd, error } = await supabase.auth.refreshSession();

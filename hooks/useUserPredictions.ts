@@ -53,6 +53,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePredictions } from './usePredictions';
 import { supabase } from '../lib/supabase';
+import { serverNowMs } from '../lib/serverTime';
 import {
   applyOffsetToPrediction as _applyOffsetToPrediction,
   fmtYemenTime,
@@ -318,8 +319,25 @@ function recomputeMetaAfterScheduleSurgery(
     return nowMs >= start && nowMs < end;
   });
 
-  const currentState = activeSlot?.state ?? base.currentState;
-  const currentStateStartIso = activeSlot?.startIso ?? base.currentStateStartIso;
+  let currentState = activeSlot?.state ?? base.currentState;
+  let currentStateStartIso = activeSlot?.startIso ?? base.currentStateStartIso;
+
+  // SPEC §16 GAP RULE: when "now" falls in a gap between post-surgery slots
+  // (no active slot), the state must continue from the most recently ENDED
+  // slot instead of falling back to the raw-schedule engine values. An ended
+  // ON (including an expired Generated ON) flips to OFF exactly at its end;
+  // that OFF runs until the next slot begins. The raw engine fallback showed
+  // the sensor's live state (e.g. ON while Growatt is ON) with the sensor's
+  // start time — wrong state and wrong "منذ" base for the personal timeline.
+  if (!activeSlot) {
+    const prevSlot = schedule
+      .filter(s => s.endIso && Number.isFinite(new Date(s.endIso).getTime()) && new Date(s.endIso).getTime() <= nowMs)
+      .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0];
+    if (prevSlot && prevSlot.state === 'ON' && prevSlot.endIso) {
+      currentState = 'OFF';
+      currentStateStartIso = prevSlot.endIso;
+    }
+  }
 
   // Derive nextTransition from the post-surgery schedule
   let nextTransition = base.nextTransition;
@@ -768,7 +786,7 @@ export function useUserPredictions(
     if (!prediction) return null;
     if (!frozenOffsetLoaded) return null;
     try {
-      const nowV22 = Date.now();
+      const nowV22 = serverNowMs();
 
       const syncMeta: _EngineCommunitySyncMeta | null = resyncPoint
         ? {
@@ -1327,7 +1345,7 @@ export function useUserPredictions(
   const scheduledFlipIso = userPrediction?.atc?.scheduledAutoTransitionIso ?? null;
   useEffect(() => {
     if (!scheduledFlipIso) return;
-    const delayMs = new Date(scheduledFlipIso).getTime() - Date.now();
+    const delayMs = new Date(scheduledFlipIso).getTime() - serverNowMs();
     if (Number.isNaN(delayMs) || delayMs <= 0) return;
     const id = setTimeout(() => setTick(t => t + 1), delayMs + 500);
     return () => clearTimeout(id);

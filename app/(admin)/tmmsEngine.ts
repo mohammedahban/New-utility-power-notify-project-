@@ -1,3 +1,5 @@
+import { serverNowMs } from '../../lib/serverTime';
+
 /**
  * tmmsEngine.ts — TMMS V2.3 Final Engine (Fix Patch 2026-07-08)
  *
@@ -997,7 +999,7 @@ export function applyOffsetToPrediction(
     computedOffsetMinutes: number,
     meta: { sign: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'; referenceIso: string | null; referenceKind: string | null },
   ) => void,
-  nowMs: number = Date.now(),
+  nowMs: number = serverNowMs(),
   onAccuracyEvent?: (event: AccuracyLogEvent) => void,
 ): UserPrediction {
   const rawSlots: ScheduleSlot[] = prediction.daySchedule ?? [];

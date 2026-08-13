@@ -20,6 +20,7 @@ import {
 } from '../lib/notifications';
 import { useActivityLog } from '../hooks/useActivityLog';
 import { ONBOARDING_KEY } from './onboarding';
+import { syncServerTime } from '../lib/serverTime';
 
 // Polyfills required for Supabase JS SDK in React Native / Hermes
 if (typeof global.Buffer === 'undefined') {
@@ -155,6 +156,15 @@ function RootNavigator() {
       c2();
     };
   }, [session]);
+
+  // Server-clock sync: the app must not trust the device clock (a wrong phone
+  // clock produced future-dated reports and divergent timelines for the same
+  // account on two devices). Sync at startup, then keep it fresh.
+  useEffect(() => {
+    syncServerTime(true);
+    const id = setInterval(() => { syncServerTime(); }, 5 * 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   return (
     <>

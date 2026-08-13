@@ -6,6 +6,7 @@ import {
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { supabase } from '../../../lib/supabase';
+import { serverNowMs } from '../../../lib/serverTime';
 import { useFollows } from '../../../hooks/useFollows';
 import { useAuth } from '../../../contexts/AuthContext';
 import { getReliabilityBadge } from '../../../hooks/useReliability';
@@ -362,7 +363,7 @@ export default function ReporterDetailScreen() {
         recentReports.map((report) => {
           const isOn = report.reported_state === 'UTILITY_ON';
           const color = isOn ? T.success : T.danger;
-          const minutesAgo = Math.round((Date.now() - new Date(report.created_at).getTime()) / 60000);
+          const minutesAgo = Math.round((serverNowMs() - new Date(report.created_at).getTime()) / 60000);
           const timeAgoLabel = minutesAgo < 60
             ? `منذ ${minutesAgo} دقيقة`
             : minutesAgo < 1440

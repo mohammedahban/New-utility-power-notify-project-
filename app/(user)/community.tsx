@@ -15,6 +15,7 @@ import { useUtilityReports, TimeOption } from '../../hooks/useUtilityReports';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
 import { supabase } from '../../lib/supabase';
+import { serverNowMs } from '../../lib/serverTime';
 import { useAuth } from '../../contexts/AuthContext';
 import { registerPushToken } from '../../lib/notifications';
 import { useResync } from '../../contexts/ResyncContext';
@@ -158,7 +159,7 @@ function NotifCard({ notif, onRespond, onReporterPress }: {
   // V2.2: hardcoded ON — no OFF branch.
   const stateLabel = AR.electricityCameOn;
   const stateEmoji = '⚡';
-  const expiresMin = Math.max(0, Math.round((new Date(notif.expires_at).getTime() - Date.now()) / 60000));
+  const expiresMin = Math.max(0, Math.round((new Date(notif.expires_at).getTime() - serverNowMs()) / 60000));
   const timeLabel = TIME_LABELS_AR[notif.time_option] ?? '';
 
   // V2.2: decode the reporter's offset snapshot for the "you will clone" badge.

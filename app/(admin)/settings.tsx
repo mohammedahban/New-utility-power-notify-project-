@@ -4,7 +4,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { PREFS_SOUND_KEY, PREFS_DURATION_KEY, sendTestNotification, registerPushToken } from '../../lib/notifications';
+import { PREFS_SOUND_KEY, PREFS_DURATION_KEY, sendTestNotification, sendRemoteTestPush, registerPushToken } from '../../lib/notifications';
 import { useAuth } from '../../contexts/AuthContext';
 import * as Notifications from 'expo-notifications';
 import Constants from 'expo-constants';
@@ -167,6 +167,9 @@ export default function AdminSettings() {
   const [alarmDuration, setAlarmDuration] = useState(5);
   const [testingOn, setTestingOn] = useState(false);
   const [testingOff, setTestingOff] = useState(false);
+  const [testingRemote, setTestingRemote] = useState(false);
+  const [remoteTestMsg, setRemoteTestMsg] = useState<string | null>(null);
+  const [remoteTestOk, setRemoteTestOk] = useState(false);
   const [saved, setSaved] = useState(false);
   const [markingAdmin, setMarkingAdmin] = useState(false);
   const [adminTokenStatus, setAdminTokenStatus] = useState<string | null>(null);
@@ -279,6 +282,27 @@ export default function AdminSettings() {
     setTimeout(() => setTestingOff(false), 2000);
   };
 
+  // REAL remote push test — routes through the Expo push service to this
+  // device's registered token (unlike the local tests above, this actually
+  // exercises FCM + the push pipeline and reports the exact ticket result).
+  const handleRemoteTest = async () => {
+    if (Platform.OS === 'web') { Alert.alert(AR.error, AR.notOnWeb); return; }
+    setTestingRemote(true);
+    setRemoteTestMsg(null);
+    try {
+      // Make sure the current token is registered/claimed first so the test
+      // targets THIS device even after a reinstall.
+      await registerPushToken();
+      const res = await sendRemoteTestPush();
+      setRemoteTestOk(res.ok);
+      setRemoteTestMsg(res.message);
+    } catch (e: any) {
+      setRemoteTestOk(false);
+      setRemoteTestMsg(e?.message ?? 'Failed');
+    }
+    setTestingRemote(false);
+  };
+
   return (
     <ScrollView style={styles.container} contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 24 }]} showsVerticalScrollIndicator={false}>
       {saved ? <View style={styles.savedBanner}><Text style={styles.savedText}>{AR.settingsSaved}</Text></View> : null}
@@ -376,6 +400,20 @@ export default function AdminSettings() {
               <Text style={styles.testBtnText}>{testingOn ? AR.sending : AR.testOn}</Text>
             </TouchableOpacity>
           </View>
+          {/* REAL remote push test: the two buttons above fire LOCAL
+              notifications (they never leave the device). This one routes a
+              real push through the Expo push service to this device's
+              registered token and reports the exact ticket result. */}
+          <TouchableOpacity
+            style={[styles.testBtn, { backgroundColor: '#082f49', borderColor: '#0369a1', marginTop: 10, alignSelf: 'stretch' }]}
+            onPress={handleRemoteTest}
+            disabled={testingRemote}
+          >
+            <Text style={styles.testBtnText}>{testingRemote ? AR.sending : AR.testRemote}</Text>
+          </TouchableOpacity>
+          {remoteTestMsg ? (
+            <Text style={[styles.rowDesc, { marginTop: 8, textAlign: 'right', color: remoteTestOk ? '#4ade80' : '#f87171' }]}>{remoteTestMsg}</Text>
+          ) : null}
         </View>
       </View>
     </ScrollView>

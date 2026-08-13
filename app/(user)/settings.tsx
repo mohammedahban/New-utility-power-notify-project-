@@ -9,6 +9,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { useAuth } from '../../contexts/AuthContext';
 import { supabase } from '../../lib/supabase';
+import { sendRemoteTestPush, registerPushToken } from '../../lib/notifications';
 import { AR } from '../../constants/arabic';
 
 const T = {
@@ -37,6 +38,9 @@ export default function UserSettings() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [loadingPrefs, setLoadingPrefs] = useState(true);
   const [testSending, setTestSending] = useState(false);
+  const [remoteSending, setRemoteSending] = useState(false);
+  const [remoteMsg, setRemoteMsg] = useState<string | null>(null);
+  const [remoteOk, setRemoteOk] = useState(false);
   const [testResult, setTestResult] = useState<'idle' | 'sent' | 'error'>('idle');
 
   useEffect(() => {
@@ -163,6 +167,24 @@ export default function UserSettings() {
     setTestSending(false);
     setTimeout(() => setTestResult('idle'), 4000);
   }, [soundEnabled]);
+
+  // REAL remote push test — sends an actual push through the push service to
+  // this device's registered token (the local test above never leaves the
+  // device, so it can't catch delivery/credential problems).
+  const handleRemoteTest = useCallback(async () => {
+    setRemoteSending(true);
+    setRemoteMsg(null);
+    try {
+      await registerPushToken();
+      const res = await sendRemoteTestPush();
+      setRemoteOk(res.ok);
+      setRemoteMsg(res.message);
+    } catch (e: any) {
+      setRemoteOk(false);
+      setRemoteMsg(e?.message ?? 'Failed');
+    }
+    setRemoteSending(false);
+  }, []);
 
   if (loadingPrefs) {
     return (
@@ -305,6 +327,26 @@ export default function UserSettings() {
             )}
           </TouchableOpacity>
           {testResult === 'error' && <Text style={styles.errorHint}>{AR.permDeniedHint}</Text>}
+
+          {/* REAL remote push test: the button above fires a LOCAL
+              notification (never leaves the device). This one routes a real
+              push through the push service to this device's token and shows
+              the exact delivery-ticket result. */}
+          <TouchableOpacity
+            style={[styles.testBtn, { marginTop: 10, backgroundColor: '#082f49', borderColor: '#0369a1' }, remoteSending && { opacity: 0.6 }]}
+            onPress={handleRemoteTest}
+            disabled={remoteSending}
+            activeOpacity={0.8}
+          >
+            {remoteSending ? (
+              <ActivityIndicator color="#fff" size="small" />
+            ) : (
+              <Text style={styles.testBtnText}>{AR.testRemote}</Text>
+            )}
+          </TouchableOpacity>
+          {remoteMsg ? (
+            <Text style={[styles.errorHint, { color: remoteOk ? '#4ade80' : '#f87171' }]}>{remoteMsg}</Text>
+          ) : null}
         </View>
 
         {/* About */}

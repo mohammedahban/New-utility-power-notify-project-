@@ -52,6 +52,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { supabase } from '../lib/supabase';
+import { serverNowMs } from '../lib/serverTime';
 import { useAuth } from '../contexts/AuthContext';
 
 // ── TMMS V2.1: Offset State ─────────────────────────────────────────────────
@@ -758,7 +759,7 @@ export function useResyncNotifications() {
     // Response delay = time since the notification was created
     const delaySec = Math.max(
       0,
-      Math.round((Date.now() - new Date(notif.created_at).getTime()) / 1000),
+      Math.round((serverNowMs() - new Date(notif.created_at).getTime()) / 1000),
     );
 
     // Record the response

@@ -39,6 +39,8 @@ import React, {
 } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from './AuthContext';
+import { supabase } from '../lib/supabase';
+import { serverNowMs } from '../lib/serverTime';
 
 // ── V2.1: Offset State types (mirrored from useResyncNotifications) ────────
 export type OffsetState = 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'PENDING_NEGATIVE';
@@ -125,6 +127,47 @@ const MAX_AGE_MS          = 3 * 60 * 60 * 1000; // 3 hours
 // replace it (earliest wins).
 const ONE_HOUR_MS         = 60 * 60 * 1000;
 
+/**
+ * Reconstruct a ResyncPoint from a resync_history row (the server-side record
+ * written by every self-report / community clone). Used for multi-device
+ * hydration: a second device on the same account rebuilds the exact personal
+ * timeline the first device computed.
+ */
+function resyncPointFromHistoryRow(row: any): ResyncPoint | null {
+  if (!row || row.reverted_at) return null;
+  const rawState: string | null = row.offset_state ?? null;
+  const rawVal = row.offset_value ?? null;
+  const isPending = rawState === 'PENDING_NEGATIVE' || rawVal === 'PENDING';
+  let offsetValue: OffsetValue = 0;
+  if (isPending) {
+    offsetValue = 'PENDING';
+  } else {
+    const n = Number(rawVal);
+    offsetValue = Number.isFinite(n) ? n : 0;
+  }
+  const offsetState: OffsetState = isPending
+    ? 'PENDING_NEGATIVE'
+    : (rawState as OffsetState) ?? (typeof offsetValue === 'number'
+        ? (offsetValue > 0 ? 'POSITIVE' : offsetValue < 0 ? 'NEGATIVE' : 'NEUTRAL')
+        : 'NEUTRAL');
+  return {
+    syncedState: row.reported_state === 'UTILITY_ON' ? 'ON' : 'OFF',
+    syncedAtIso: row.effective_transition_at,
+    appliedAtIso: row.confirmed_at,
+    reporterName: row.reporter_username ?? null,
+    reporterReliability: null,
+    offsetState,
+    offsetValue,
+    timelineAlignment: row.timeline_alignment ?? row.effective_transition_at,
+    generatedOnStartIso: row.generated_on_start_iso ?? undefined,
+    generatedOnDurationMin: row.generated_on_duration_min ?? null,
+    generatedOnReferenceIso: row.generated_on_reference_iso ?? null,
+    generatedOnReferenceKind: row.generated_on_reference_kind ?? null,
+    confirmationTime: row.confirmed_at,
+    source: row.source === 'self_report' ? 'self_report' : 'community_resync',
+  };
+}
+
 export function ResyncProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const [resyncPoint, setResyncPoint] = useState<ResyncPoint | null>(null);
@@ -141,21 +184,57 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
   const storageKey = user ? `${STORAGE_KEY_PREFIX}${user.id}` : null;
 
   // ── Load persisted resync on user/mount ─────────────────────────────────────
+  // MULTI-DEVICE FIX: the resync point was previously hydrated ONLY from
+  // AsyncStorage, so two devices on the SAME account diverged (the device
+  // where the sync was applied had the personal timeline; every other device
+  // showed the plain Growatt one). Now we also consult resync_history — the
+  // server-side record every sync writes — and adopt the newest live point.
   useEffect(() => {
     if (!storageKey) { setResyncPoint(null); return; }
     (async () => {
+      let local: ResyncPoint | null = null;
       try {
         const raw = await AsyncStorage.getItem(storageKey);
         if (raw) {
           const parsed: ResyncPoint = JSON.parse(raw);
-          const ageMs = Date.now() - new Date(parsed.appliedAtIso).getTime();
+          const ageMs = serverNowMs() - new Date(parsed.appliedAtIso).getTime();
           if (ageMs < MAX_AGE_MS) {
-            setResyncPoint(parsed);
+            local = parsed;
           } else {
             await AsyncStorage.removeItem(storageKey);
           }
         }
       } catch (_) {}
+
+      // Server hydration: latest non-reverted history row for this user that
+      // is still inside the 3-hour window (spec §F-04 validity cap).
+      let server: ResyncPoint | null = null;
+      try {
+        const uid = storageKey.slice(STORAGE_KEY_PREFIX.length);
+        const sinceIso = new Date(serverNowMs() - MAX_AGE_MS).toISOString();
+        const { data: rows } = await supabase
+          .from('resync_history')
+          .select('*')
+          .eq('user_id', uid)
+          .is('reverted_at', null)
+          .gte('confirmed_at', sinceIso)
+          .order('confirmed_at', { ascending: false })
+          .limit(1);
+        const row = rows?.[0];
+        if (row) server = resyncPointFromHistoryRow(row);
+      } catch (_) {}
+
+      // Adopt the NEWER of the two (server wins ties — it is the record every
+      // device agrees on).
+      const localMs = local ? new Date(local.appliedAtIso).getTime() : 0;
+      const serverMs = server ? new Date(server.appliedAtIso).getTime() : 0;
+      const winner = server && serverMs >= localMs ? server : local;
+      if (winner) {
+        setResyncPoint(winner);
+        if (winner === server) {
+          try { await AsyncStorage.setItem(storageKey, JSON.stringify(winner)); } catch (_) {}
+        }
+      }
     })();
   }, [storageKey]);
 
@@ -176,7 +255,7 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
 
     const check = async () => {
       if (!resyncPoint) return;
-      const ageMs = Date.now() - new Date(resyncPoint.appliedAtIso).getTime();
+      const ageMs = serverNowMs() - new Date(resyncPoint.appliedAtIso).getTime();
       // Safety-net only: clear after 3-hour max age (F-04)
       if (ageMs >= MAX_AGE_MS) {
         console.log('[ResyncContext] 3-hour safety-net reached — clearing resync');
@@ -260,6 +339,72 @@ export function ResyncProvider({ children }: { children: ReactNode }) {
       await AsyncStorage.removeItem(storageKey);
     } catch (_) {}
   }, [storageKey]);
+
+  // ── MULTI-DEVICE SYNC: same account on a second device ─────────────────────
+  // When THIS account applies a resync on another device, a resync_history row
+  // appears on the server. Applying it here (through the normal guards) keeps
+  // every device of the same account on the same personal timeline. UPDATE
+  // events carry pending-offset resolutions (PENDING → NEGATIVE) across too.
+  const applyResyncRef = useRef(applyResync);
+  applyResyncRef.current = applyResync;
+  const resyncPointRef = useRef(resyncPoint);
+  resyncPointRef.current = resyncPoint;
+
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel(`resync-history-xdev-${user.id}-${Math.random().toString(36).slice(2, 8)}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'resync_history', filter: `user_id=eq.${user.id}` },
+        (payload) => {
+          const point = resyncPointFromHistoryRow(payload.new);
+          if (!point) return;
+          // Skip echoes of what this device already applied. Timestamps arrive
+          // in Postgres format ("+00:00"), while the locally-applied point
+          // carries the JS ISO string ("Z") — compare parsed instants with a
+          // small tolerance, never raw strings. (An unnoticed echo would
+          // re-apply the same point and overwrite the revert snapshot with
+          // the post-sync state.)
+          const cur = resyncPointRef.current;
+          if (cur && cur.source === point.source) {
+            const curMs = new Date(cur.syncedAtIso).getTime();
+            const incMs = new Date(point.syncedAtIso).getTime();
+            if (Number.isFinite(curMs) && Number.isFinite(incMs) && Math.abs(curMs - incMs) < 5_000) return;
+          }
+          applyResyncRef.current(point).catch(() => {});
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'resync_history', filter: `user_id=eq.${user.id}` },
+        (payload) => {
+          const row: any = payload.new;
+          const cur = resyncPointRef.current;
+          if (!cur) return;
+          // Only interested in updates to the row that produced our current
+          // point (pending resolution, or a revert triggered elsewhere).
+          // Compare parsed instants (Postgres "+00:00" vs local "Z" strings
+          // never match literally).
+          const rowMs = new Date(row?.effective_transition_at ?? '').getTime();
+          const curMs = new Date(cur.syncedAtIso).getTime();
+          if (!Number.isFinite(rowMs) || !Number.isFinite(curMs) || Math.abs(rowMs - curMs) >= 5_000) return;
+          if (row.reverted_at) {
+            // Reverted on another device → drop the local point too.
+            clearResync().catch(() => {});
+            return;
+          }
+          const isPendingNow = row.offset_state === 'PENDING_NEGATIVE' || row.offset_value === 'PENDING';
+          const curPending = cur.offsetState === 'PENDING_NEGATIVE' || cur.offsetValue === 'PENDING';
+          if (curPending && !isPendingNow) {
+            const point = resyncPointFromHistoryRow(row);
+            if (point) applyResyncRef.current(point).catch(() => {});
+          }
+        },
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [user, clearResync]);
 
   return (
     <ResyncContext.Provider value={{ resyncPoint, applyResync, clearResync, registerSnapshotCallback }}>

@@ -66,6 +66,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
+import { syncServerTime, serverNowMs } from '../lib/serverTime';
 import { useAuth } from '../contexts/AuthContext';
 import { ResyncPoint, OffsetState, OffsetValue } from '../contexts/ResyncContext';
 
@@ -136,7 +137,7 @@ interface ScheduleSlot {
 // - 'HH:MM' strings (legacy) are interpreted as TODAY at that time; if the
 //   resulting timestamp is more than 12h in the future, we roll it back a
 //   day so a slot that ends e.g. at 02:00 is correctly placed in the past.
-function toMs(value: string | number, nowMs: number = Date.now()): number | null {
+function toMs(value: string | number, nowMs: number = serverNowMs()): number | null {
   if (typeof value === 'number') return value;
   if (typeof value !== 'string') return null;
   if (value.includes('T')) {
@@ -682,8 +683,15 @@ export function useUtilityReports() {
 
     setSubmitting(true);
 
+    // CLOCK-SKEW FIX: never trust the device clock for report timestamps.
+    // A phone set hours/days ahead produced estimated_transition_at values in
+    // the FUTURE — the Generated ON landed ahead of "now", the current state
+    // computed as OFF instead of ON, and the same account diverged across
+    // devices. Refresh the server-clock offset, then use server time.
+    await syncServerTime();
+
     const offsetMin = TIME_OFFSETS_MIN[timeOption];
-    const nowMs = Date.now();
+    const nowMs = serverNowMs();
 
     // estimated_transition_at = the absolute timestamp when electricity came on
     const estimatedTransitionAt = new Date(nowMs - offsetMin * 60 * 1000).toISOString();

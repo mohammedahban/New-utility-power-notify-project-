@@ -230,6 +230,46 @@ export function setupForegroundNotificationHandler(): () => void {
   return () => sub.remove();
 }
 
+// ── Remote Push Self-Test ─────────────────────────────────────────────────────
+// The local test button only proves the OS can show a notification from within
+// the app — it never touches the push service. This calls the test-push edge
+// function, which sends a REAL push through the Expo push service to every
+// token registered for the current user and returns the per-token result.
+export interface RemoteTestResult {
+  ok: boolean;
+  message: string;
+}
+
+export async function sendRemoteTestPush(): Promise<RemoteTestResult> {
+  try {
+    const { data, error } = await supabase.functions.invoke('test-push', { body: {} });
+    if (error) {
+      return { ok: false, message: `خطأ في الاتصال بالخادم: ${error.message}` };
+    }
+    const d = data as any;
+    if (d?.reason === 'no_tokens') {
+      return { ok: false, message: d.message ?? 'لا يوجد رمز إشعارات مسجّل لهذا الجهاز' };
+    }
+    if (d?.ok) {
+      const dead = d.deadTokensRemoved > 0 ? ` (وحُذف ${d.deadTokensRemoved} رمز قديم ميت)` : '';
+      return {
+        ok: true,
+        message: `أُرسل إشعار حقيقي عبر خادم الإشعارات إلى ${d.deliveredToExpo}/${d.sent} رمز${dead} — يجب أن يصل خلال ثوانٍ. إذا لم يصل فالمشكلة في إعدادات الإشعارات/الشبكة على هذا الجهاز.`,
+      };
+    }
+    const firstErr = d?.errors?.[0];
+    if (firstErr?.error === 'DeviceNotRegistered') {
+      return { ok: false, message: 'رمز هذا الجهاز لم يعد صالحاً لدى خادم الإشعارات (حُذف تلقائياً). أعد تشغيل التطبيق ليتسجّل من جديد ثم حاول مجدداً.' };
+    }
+    if (firstErr) {
+      return { ok: false, message: `رفض خادم الإشعارات: ${firstErr.error}${firstErr.message ? ' — ' + firstErr.message : ''}` };
+    }
+    return { ok: false, message: 'فشل الإرسال لسبب غير معروف' };
+  } catch (e: any) {
+    return { ok: false, message: `استثناء: ${e?.message ?? String(e)}` };
+  }
+}
+
 // ── Test Notification ─────────────────────────────────────────────────────────
 export async function sendTestNotification(isOn: boolean): Promise<void> {
   await ensureAndroidChannel();

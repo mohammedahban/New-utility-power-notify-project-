@@ -16,6 +16,7 @@ import { useResync } from '../../contexts/ResyncContext';
 import { useStatusSnapshot, readPreActionStateForSnapshot } from '../../hooks/useStatusSnapshot';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
+import { serverNowMs } from '../../lib/serverTime';
 import { AR } from '../../constants/arabic';
 import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
 
@@ -53,7 +54,7 @@ function useElapsedFromIso(startIso: string | null): string {
   useEffect(() => {
     if (!startIso) { setLabel(''); return; }
     const update = () => {
-      const diff = Date.now() - new Date(startIso).getTime();
+      const diff = serverNowMs() - new Date(startIso).getTime();
       const totalMin = Math.floor(diff / 60000);
       if (totalMin < 1) { setLabel('للتو'); return; }
       const h = Math.floor(totalMin / 60); const m = totalMin % 60;
@@ -117,10 +118,10 @@ function useOverrunLiveClock(overrunMinutes: number, isUncertain: boolean): stri
     }
     // Anchor on first activation — derive from overrunMinutes once
     if (entryMsRef.current === null) {
-      entryMsRef.current = Date.now() - overrunMinutes * 60_000;
+      entryMsRef.current = serverNowMs() - overrunMinutes * 60_000;
     }
     const update = () => {
-      const elapsed = Math.max(0, Date.now() - entryMsRef.current!);
+      const elapsed = Math.max(0, serverNowMs() - entryMsRef.current!);
       const totalSec = Math.floor(elapsed / 1000);
       const h = Math.floor(totalSec / 3600);
       const m = Math.floor((totalSec % 3600) / 60);
@@ -144,9 +145,9 @@ function useOverrunLiveClock(overrunMinutes: number, isUncertain: boolean): stri
 // component re-rendered with a stale midMin (countdown ran too fast/slow vs the
 // real target time). Now remaining = target − Date.now(), recomputed each tick.
 function useCountdownSec(targetIso: string | null) {
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [nowMs, setNowMs] = useState(() => serverNowMs());
   useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    const id = setInterval(() => setNowMs(serverNowMs()), 1000);
     return () => clearInterval(id);
   }, []);
   if (!targetIso) return { h: 0, m: 0, s: 0, total: 0 };
@@ -214,10 +215,10 @@ function GeneratedOnBanner({ prediction }: { prediction: UserPrediction | null }
 const goStyles = StyleSheet.create({
   banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#052e16', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.success, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
-  body: { color: T.textPrimary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 6 },
-  ref: { color: T.textSecondary, fontSize: 10, lineHeight: 15, textAlign: 'right', marginBottom: 4 },
-  note: { color: T.success + 'cc', fontSize: 10, fontStyle: 'italic', textAlign: 'right', fontWeight: '600' },
+  title: { color: T.success, fontSize: 13.5, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
+  body: { color: T.textPrimary, fontSize: 13, lineHeight: 19, textAlign: 'right', marginBottom: 6 },
+  ref: { color: T.textSecondary, fontSize: 11.5, lineHeight: 16, textAlign: 'right', marginBottom: 4 },
+  note: { color: T.success + 'cc', fontSize: 11.5, fontStyle: 'italic', textAlign: 'right', fontWeight: '600' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +235,7 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
   }, []);
   let countdownLabel = 'بانتظار تحوّل Growatt القادم';
   if (resolutionIso) {
-    const ms = new Date(resolutionIso).getTime() - Date.now();
+    const ms = new Date(resolutionIso).getTime() - serverNowMs();
     if (ms > 0) {
       const h = Math.floor(ms / 3600000); const m = Math.floor((ms % 3600000) / 60000); const s = Math.floor((ms % 60000) / 1000);
       countdownLabel = `≈ ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
@@ -258,12 +259,12 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
 const pn2Styles = StyleSheet.create({
   banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#1a0e00', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.warning, fontSize: 12, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
-  body: { color: T.textPrimary, fontSize: 12, lineHeight: 18, textAlign: 'right', marginBottom: 8 },
+  title: { color: T.warning, fontSize: 13.5, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
+  body: { color: T.textPrimary, fontSize: 13, lineHeight: 19, textAlign: 'right', marginBottom: 8 },
   countdownRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 6 },
-  countdownLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
-  countdownValue: { color: T.warning, fontSize: 16, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
-  note: { color: T.warning + 'cc', fontSize: 10, fontStyle: 'italic', textAlign: 'right', fontWeight: '600' },
+  countdownLabel: { color: T.textMuted, fontSize: 11.5, fontWeight: '600' },
+  countdownValue: { color: T.warning, fontSize: 17, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
+  note: { color: T.warning + 'cc', fontSize: 11.5, fontStyle: 'italic', textAlign: 'right', fontWeight: '600' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,8 +287,8 @@ function OffsetStateChip({ prediction }: { prediction: UserPrediction | null }) 
 }
 const osStyles = StyleSheet.create({
   chip: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, alignSelf: 'flex-start', marginBottom: 12 },
-  label: { fontSize: 11, fontWeight: '700' },
-  value: { fontSize: 13, fontWeight: '900' },
+  label: { fontSize: 12.5, fontWeight: '700' },
+  value: { fontSize: 14.5, fontWeight: '900' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,7 +303,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
   const atcMode = prediction?.atc?.mode;
   const scheduledIso = prediction?.atc?.scheduledAutoTransitionIso;
   if (atcMode !== 'POSITIVE_OFFSET_PENDING' || !scheduledIso) return null;
-  const scheduledMs = new Date(scheduledIso).getTime(); const nowMs = Date.now();
+  const scheduledMs = new Date(scheduledIso).getTime(); const nowMs = serverNowMs();
   const totalSecondsLeft = Math.max(0, Math.round((scheduledMs - nowMs) / 1000));
   const hLeft = Math.floor(totalSecondsLeft / 3600); const mLeft = Math.floor((totalSecondsLeft % 3600) / 60); const sLeft = totalSecondsLeft % 60;
   const countdownLabel = totalSecondsLeft > 0 ? `${String(hLeft).padStart(2,'0')}:${String(mLeft).padStart(2,'0')}:${String(sLeft).padStart(2,'0')}` : 'الآن';
@@ -342,18 +343,18 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
 const popStyles = StyleSheet.create({
   banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#001a2e', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.accent + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  title: { color: T.accent, fontSize: 11, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
-  body: { color: T.textPrimary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 8 },
-  sub: { color: T.textSecondary, fontSize: 10, textAlign: 'right', marginTop: 6 },
+  title: { color: T.accent, fontSize: 13, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
+  body: { color: T.textPrimary, fontSize: 14, lineHeight: 21, textAlign: 'right', marginBottom: 8 },
+  sub: { color: T.textSecondary, fontSize: 11.5, textAlign: 'right', marginTop: 6 },
   countdownRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 8 },
-  countdownLabel: { color: T.textMuted, fontSize: 10, fontWeight: '600' },
-  countdownValue: { color: T.accent, fontSize: 18, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
+  countdownLabel: { color: T.textMuted, fontSize: 11.5, fontWeight: '600' },
+  countdownValue: { color: T.accent, fontSize: 19, fontWeight: '900', letterSpacing: 1, fontVariant: ['tabular-nums'] },
   progressTrack: { height: 6, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden', marginBottom: 4 },
   progressFill: { height: 6, backgroundColor: T.accent, borderRadius: 3 },
   progressLabels: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2 },
-  progressLabelRight: { color: T.textMuted, fontSize: 9 },
-  progressLabelLeft: { color: T.accent + 'aa', fontSize: 9 },
-  progressPct: { color: T.accent, fontSize: 10, fontWeight: '700' },
+  progressLabelRight: { color: T.textMuted, fontSize: 10.5 },
+  progressLabelLeft: { color: T.accent + 'aa', fontSize: 10.5 },
+  progressPct: { color: T.accent, fontSize: 11.5, fontWeight: '700' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -384,10 +385,10 @@ function ValidationWindowToast({ prediction }: { prediction: UserPrediction | nu
 }
 const vwStyles = StyleSheet.create({
   toast: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
-  title: { color: T.warning, fontSize: 12, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  body: { color: '#fbbf24dd', fontSize: 11, lineHeight: 17, textAlign: 'right', fontWeight: '600' },
+  title: { color: T.warning, fontSize: 13.5, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  body: { color: '#fbbf24dd', fontSize: 12.5, lineHeight: 18, textAlign: 'right', fontWeight: '600' },
   close: { width: 26, height: 26, borderRadius: 13, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  closeText: { color: T.textMuted, fontSize: 11, fontWeight: '700' },
+  closeText: { color: T.textMuted, fontSize: 12, fontWeight: '700' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -395,7 +396,7 @@ const vwStyles = StyleSheet.create({
 // ─────────────────────────────────────────────────────────────────────────────
 function PendingDSDChip({ pendingDSD, onCancel }: { pendingDSD: PendingDSDCandidate | null; onCancel: () => void }) {
   if (!pendingDSD) return null;
-  const ageMin = Math.round((Date.now() - new Date(pendingDSD.createdAtIso).getTime()) / 60_000);
+  const ageMin = Math.round((serverNowMs() - new Date(pendingDSD.createdAtIso).getTime()) / 60_000);
   const tentative = pendingDSD.tentativeDSD;
   const eventLabel = pendingDSD.eventType === 'UTILITY_ON' ? 'تشغيل' : 'انقطاع';
   return (
@@ -415,11 +416,11 @@ function PendingDSDChip({ pendingDSD, onCancel }: { pendingDSD: PendingDSDCandid
 const pdcStyles = StyleSheet.create({
   chip: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: '#0c1a0c', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 11, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '44' },
   dot: { width: 7, height: 7, borderRadius: 4, backgroundColor: T.success, flexShrink: 0 },
-  title: { color: T.success, fontSize: 11, fontWeight: '800', textAlign: 'right', marginBottom: 3 },
-  body: { color: T.success + 'cc', fontSize: 11, textAlign: 'right' },
-  sub: { color: T.textMuted, fontSize: 10, textAlign: 'right', marginTop: 2 },
+  title: { color: T.success, fontSize: 12.5, fontWeight: '800', textAlign: 'right', marginBottom: 3 },
+  body: { color: T.success + 'cc', fontSize: 12.5, textAlign: 'right' },
+  sub: { color: T.textMuted, fontSize: 11, textAlign: 'right', marginTop: 2 },
   cancelBtn: { width: 24, height: 24, borderRadius: 12, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  cancelText: { color: T.textMuted, fontSize: 10, fontWeight: '700' },
+  cancelText: { color: T.textMuted, fontSize: 11, fontWeight: '700' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -440,7 +441,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
 
   const currentSlot = (() => {
     const slots = prediction?.daySchedule ?? [];
-    const nowMs = Date.now();
+    const nowMs = serverNowMs();
     if (atcMode === 'POSITIVE_OFFSET_PENDING' && slots.length > 0) return slots[0];
     // SPEC-FIX B2: in COMMUNITY_SYNCED the engine's daySchedule is already the
     // community-synced (resynced) timeline — the slot containing "now" is the
@@ -461,7 +462,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     }) ?? null;
   })();
 
-  const remainMinutes = currentSlot?.endIso ? Math.max(0, (new Date(currentSlot.endIso).getTime() - Date.now()) / 60000) : null;
+  const remainMinutes = currentSlot?.endIso ? Math.max(0, (new Date(currentSlot.endIso).getTime() - serverNowMs()) / 60000) : null;
   // SPEC-FIX C2: round total minutes ONCE, then split — the old floor/round
   // mix could show e.g. "1 س و 60 د" when remainMinutes was 119.6.
   const remainTotalMin = remainMinutes !== null ? Math.round(remainMinutes) : null;
@@ -644,53 +645,53 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
 
 const psStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 22, padding: 20, marginBottom: 14, borderWidth: 1.5 },
-  cardTitle: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5, marginBottom: 16, textAlign: 'right' },
+  cardTitle: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2, marginBottom: 16, textAlign: 'right' },
   statusRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 14, marginBottom: 18 },
   statusIcon: { fontSize: 44 },
   statusText: { fontSize: 32, fontWeight: '900', flex: 1, textAlign: 'right', lineHeight: 40 },
   timeRow: { flexDirection: 'row-reverse', gap: 10, marginBottom: 14 },
   timeBlock: { flex: 1, backgroundColor: T.elevated, borderRadius: 14, padding: 14 },
-  timeLabel: { color: T.textMuted, fontSize: 9, fontWeight: '600', textAlign: 'right', marginBottom: 5 },
-  timeValue: { fontSize: 17, fontWeight: '800', textAlign: 'right' },
+  timeLabel: { color: T.textMuted, fontSize: 11.5, fontWeight: '600', textAlign: 'right', marginBottom: 5 },
+  timeValue: { fontSize: 21, fontWeight: '800', textAlign: 'right' },
   durRow: { flexDirection: 'row-reverse', gap: 8, marginTop: 4 },
   durChip: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', gap: 8, backgroundColor: T.elevated, borderRadius: 12, padding: 10, borderWidth: 1 },
-  durChipIcon: { fontSize: 16, flexShrink: 0 },
-  durChipLabel: { color: T.textMuted, fontSize: 9, fontWeight: '600', marginBottom: 2, textAlign: 'right' },
-  durChipValue: { fontSize: 12, fontWeight: '800', textAlign: 'right' },
+  durChipIcon: { fontSize: 17, flexShrink: 0 },
+  durChipLabel: { color: T.textMuted, fontSize: 11, fontWeight: '600', marginBottom: 2, textAlign: 'right' },
+  durChipValue: { fontSize: 14.5, fontWeight: '800', textAlign: 'right' },
   communityBanner: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, backgroundColor: '#001a2e', borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1 },
-  communityBannerTitle: { color: T.accent, fontSize: 12, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
+  communityBannerTitle: { color: T.accent, fontSize: 13.5, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
   communityBannerRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 4 },
-  communityBannerReporter: { color: T.textSecondary, fontSize: 13, textAlign: 'right' },
-  communityBannerTime: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
-  communityBannerNote: { color: T.warning + 'aa', fontSize: 10, fontStyle: 'italic', marginTop: 6, textAlign: 'right', lineHeight: 15 },
+  communityBannerReporter: { color: T.textSecondary, fontSize: 14.5, textAlign: 'right' },
+  communityBannerTime: { color: T.textMuted, fontSize: 12.5, textAlign: 'right' },
+  communityBannerNote: { color: T.warning + 'aa', fontSize: 11.5, fontStyle: 'italic', marginTop: 6, textAlign: 'right', lineHeight: 16 },
   reliabilityChip: { backgroundColor: T.success + '20', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: T.success + '44' },
-  reliabilityChipText: { color: T.success, fontSize: 10, fontWeight: '700' },
+  reliabilityChipText: { color: T.success, fontSize: 11.5, fontWeight: '700' },
   revertBtn: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: '#0f172a', borderRadius: 12, paddingVertical: 11, paddingHorizontal: 16, marginBottom: 14, borderWidth: 1.5, borderColor: T.accent + '55', alignSelf: 'stretch' },
-  revertIcon: { color: T.accent, fontSize: 16, fontWeight: '700' },
-  revertLabel: { color: T.accent, fontSize: 13, fontWeight: '700' },
+  revertIcon: { color: T.accent, fontSize: 17, fontWeight: '700' },
+  revertLabel: { color: T.accent, fontSize: 14.5, fontWeight: '700' },
   revertConfirmBox: { backgroundColor: '#0a1929', borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.danger + '55' },
-  revertConfirmText: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 12 },
+  revertConfirmText: { color: T.textSecondary, fontSize: 14, lineHeight: 21, textAlign: 'right', marginBottom: 12 },
   revertConfirmBtns: { flexDirection: 'row-reverse', gap: 10 },
   revertConfirmBtn: { flex: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1 },
   revertConfirmBtnCancel: { backgroundColor: T.elevated, borderColor: T.border },
-  revertConfirmBtnCancelText: { color: T.textSecondary, fontSize: 13, fontWeight: '700' },
+  revertConfirmBtnCancelText: { color: T.textSecondary, fontSize: 14, fontWeight: '700' },
   revertConfirmBtnOk: { backgroundColor: '#1a0505', borderColor: T.danger + '55' },
-  revertConfirmBtnOkText: { color: T.danger, fontSize: 13, fontWeight: '800' },
+  revertConfirmBtnOkText: { color: T.danger, fontSize: 14, fontWeight: '800' },
   atcBadge: { borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1 },
-  atcBadgeLine: { fontSize: 13, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
-  atcBodyLine: { fontSize: 11, textAlign: 'right', marginBottom: 4, lineHeight: 16 },
-  atcSubLine: { color: T.accent, fontSize: 11, textAlign: 'right' },
+  atcBadgeLine: { fontSize: 14.5, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
+  atcBodyLine: { fontSize: 12.5, textAlign: 'right', marginBottom: 4, lineHeight: 18 },
+  atcSubLine: { color: T.accent, fontSize: 12.5, textAlign: 'right' },
   exceededBadge: { backgroundColor: '#2d1a00', borderRadius: 10, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: T.warning + '66' },
   exceededRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 8 },
   exceededIcon: { fontSize: 22, flexShrink: 0 },
-  exceededLabel: { color: T.warning, fontSize: 10, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
-  exceededValue: { color: T.warning, fontSize: 20, fontWeight: '900', textAlign: 'right' },
+  exceededLabel: { color: T.warning, fontSize: 11.5, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
+  exceededValue: { color: T.warning, fontSize: 22, fontWeight: '900', textAlign: 'right' },
   liveClockRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1a0a00', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8 },
-  liveClockLabel: { color: T.warning + '99', fontSize: 10, fontWeight: '600' },
+  liveClockLabel: { color: T.warning + '99', fontSize: 11.5, fontWeight: '600' },
   liveClockValue: { color: T.warning, fontSize: 22, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 2 },
-  deductionNote: { color: T.warning + 'cc', fontSize: 11, fontWeight: '600', textAlign: 'right', fontStyle: 'italic' },
+  deductionNote: { color: T.warning + 'cc', fontSize: 12.5, fontWeight: '600', textAlign: 'right', fontStyle: 'italic' },
   reasoningBox: { backgroundColor: T.elevated, borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.border },
-  reasoningText: { color: T.textSecondary, fontSize: 11, lineHeight: 17, textAlign: 'right', fontWeight: '500' },
+  reasoningText: { color: T.textSecondary, fontSize: 12.5, lineHeight: 19, textAlign: 'right', fontWeight: '500' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -721,7 +722,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     if (isHolding && atcMode === 'POSITIVE_OFFSET_PENDING' && !nt && prediction?.atc?.scheduledAutoTransitionIso) {
       const scheduledIso = prediction.atc.scheduledAutoTransitionIso;
       const scheduledMs = new Date(scheduledIso).getTime();
-      const minFromNow = Math.max(0, (scheduledMs - Date.now()) / 60_000);
+      const minFromNow = Math.max(0, (scheduledMs - serverNowMs()) / 60_000);
       return { type: (prediction.currentState === 'ON' ? 'UTILITY_OFF' : 'UTILITY_ON') as 'UTILITY_ON' | 'UTILITY_OFF', rangeStartIso: scheduledIso, rangeEndIso: scheduledIso, rangeLabel: fmtTimeAr(scheduledIso), minFromNowMin: minFromNow, maxFromNowMin: minFromNow, waitLabel: '', inRangeWindow: minFromNow <= 0 };
     }
     // SPEC-FIX B5: while holding (UNCERTAIN_ZONE / WAITING_FOR_GROWATT /
@@ -787,7 +788,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   const confColor = confPct >= 80 ? T.success : confPct >= 55 ? T.warning : T.danger;
   const showCrisisAwareChip = prediction.isUnstable;
   const slots = prediction.daySchedule ?? [];
-  const nextIdx = slots.findIndex(s => { const state: 'ON' | 'OFF' = isNextOn ? 'ON' : 'OFF'; return s.state === state && new Date(s.startIso).getTime() > Date.now(); });
+  const nextIdx = slots.findIndex(s => { const state: 'ON' | 'OFF' = isNextOn ? 'ON' : 'OFF'; return s.state === state && new Date(s.startIso).getTime() > serverNowMs(); });
   const afterNext = nextIdx >= 0 && nextIdx + 1 < slots.length ? slots[nextIdx + 1] : null;
 
   return (
@@ -837,35 +838,35 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 const utStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 22, padding: 20, marginBottom: 14, borderWidth: 1.5 },
   headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
-  cardTitle: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5 },
+  cardTitle: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2 },
   confBadge: { borderRadius: 20, paddingHorizontal: 12, paddingVertical: 5, borderWidth: 1 },
-  confText: { fontSize: 12, fontWeight: '700' },
+  confText: { fontSize: 13, fontWeight: '700' },
   rangeWindowBadge: { borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1.5, marginBottom: 14, alignItems: 'center' },
-  rangeWindowText: { fontSize: 15, fontWeight: '800', textAlign: 'center', marginBottom: 4 },
-  rangeWindowSub: { fontSize: 11, textAlign: 'center' },
+  rangeWindowText: { fontSize: 16, fontWeight: '800', textAlign: 'center', marginBottom: 4 },
+  rangeWindowSub: { fontSize: 12.5, textAlign: 'center' },
   rangeBox: { backgroundColor: T.elevated, borderRadius: 18, padding: 20, marginBottom: 16, borderWidth: 1, alignItems: 'center' },
   rangeBoxLabel: { fontSize: 14, fontWeight: '600', marginBottom: 14, textAlign: 'center' },
   rangeTimeStack: { alignItems: 'center', gap: 8 },
   rangeTime: { fontSize: 32, fontWeight: '900', textAlign: 'center', letterSpacing: -0.5, writingDirection: 'ltr' },
   rangeSep: { fontSize: 14, fontWeight: '600', color: T.textMuted },
   countdownSection: { alignItems: 'center', marginBottom: 14 },
-  countdownLabel: { color: T.textMuted, fontSize: 11, marginBottom: 10 },
+  countdownLabel: { color: T.textMuted, fontSize: 12.5, marginBottom: 10 },
   cdUnit: { alignItems: 'center', minWidth: 44 },
   cdVal: { fontSize: 34, fontWeight: '900', letterSpacing: -1 },
-  cdSub: { color: T.textMuted, fontSize: 10, marginTop: -2 },
+  cdSub: { color: T.textMuted, fontSize: 11.5, marginTop: -2 },
   cdColon: { fontSize: 30, fontWeight: '900', marginBottom: 8 },
   progressTrack: { width: '100%', height: 3, backgroundColor: T.elevated, borderRadius: 2, overflow: 'hidden' },
   progressFill: { height: 3, borderRadius: 2 },
   afterNextBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 12 },
-  afterNextLabel: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1, marginBottom: 6, textAlign: 'right' },
-  afterNextVal: { fontSize: 13, fontWeight: '700', textAlign: 'right' },
+  afterNextLabel: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 0.8, marginBottom: 6, textAlign: 'right' },
+  afterNextVal: { fontSize: 14.5, fontWeight: '700', textAlign: 'right' },
   holdBox: { flexDirection: 'row-reverse', gap: 12, alignItems: 'flex-start', backgroundColor: T.elevated, borderRadius: 14, padding: 14, marginBottom: 12 },
-  holdTitle: { fontSize: 15, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  holdBody: { color: T.textMuted, fontSize: 12, lineHeight: 18, textAlign: 'right' },
+  holdTitle: { fontSize: 16, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
+  holdBody: { color: T.textMuted, fontSize: 13, lineHeight: 19, textAlign: 'right' },
   communityPrioBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.accent + '44' },
-  communityPrioText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right' },
+  communityPrioText: { color: T.accent, fontSize: 12.5, fontWeight: '600', textAlign: 'right' },
   crisisAwareChip: { backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.warning + '44' },
-  crisisAwareChipText: { color: T.warning, fontSize: 11, fontWeight: '600', textAlign: 'right', lineHeight: 16 },
+  crisisAwareChipText: { color: T.warning, fontSize: 12.5, fontWeight: '600', textAlign: 'right', lineHeight: 18 },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -884,7 +885,7 @@ function TodayTimeline({ prediction, anchorStartIso }: { prediction: UserPredict
   if (resyncChanged) { stableStartMapRef.current = {}; stableEndMapRef.current = {}; lastResyncRef.current = currentResyncIso; }
 
   const slots = prediction?.daySchedule ?? [];
-  const nowMs = Date.now();
+  const nowMs = serverNowMs();
   const atcMode = prediction?.atc?.mode;
   const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
   // SPEC-FIX (UNCERTAIN_ZONE timeline hold): while the engine is HOLDING the
@@ -973,7 +974,7 @@ function TodayTimeline({ prediction, anchorStartIso }: { prediction: UserPredict
 }
 const tlStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
-  title: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5, marginBottom: 16, textAlign: 'right' },
+  title: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2, marginBottom: 16, textAlign: 'right' },
   row: { flexDirection: 'row-reverse', gap: 14, paddingBottom: 16, marginBottom: 16 },
   rowBorder: { borderBottomWidth: 1, borderBottomColor: T.elevated },
   timelineCol: { width: 16, alignItems: 'center', position: 'relative', paddingTop: 3 },
@@ -982,19 +983,19 @@ const tlStyles = StyleSheet.create({
   content: { flex: 1 },
   contentFaded: { opacity: 0.65 },
   topRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, marginBottom: 5, flexWrap: 'wrap' },
-  stateText: { fontSize: 16, fontWeight: '800', flex: 1, textAlign: 'right' },
+  stateText: { fontSize: 17, fontWeight: '800', flex: 1, textAlign: 'right' },
   nowChip: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
-  nowChipText: { fontSize: 9, fontWeight: '800', letterSpacing: 1 },
+  nowChipText: { fontSize: 10.5, fontWeight: '800', letterSpacing: 1 },
   estChip: { backgroundColor: T.elevated, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  estChipText: { color: T.textMuted, fontSize: 9, fontStyle: 'italic' },
+  estChipText: { color: T.textMuted, fontSize: 10.5, fontStyle: 'italic' },
   syncChip: { backgroundColor: '#001a2e', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  syncChipText: { fontSize: 10 },
+  syncChipText: { fontSize: 11.5 },
   genOnChip: { backgroundColor: '#052e16', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.success + '44' },
-  genOnChipText: { color: T.success, fontSize: 9, fontWeight: '700' },
+  genOnChipText: { color: T.success, fontSize: 10.5, fontWeight: '700' },
   pendingChip: { backgroundColor: '#1a0e00', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.warning + '44' },
-  pendingChipText: { color: T.warning, fontSize: 9, fontWeight: '700' },
-  timeText: { color: T.textSecondary, fontSize: 13, fontWeight: '600', textAlign: 'right', marginBottom: 2 },
-  durText: { fontSize: 11, fontWeight: '600', textAlign: 'right' },
+  pendingChipText: { color: T.warning, fontSize: 10.5, fontWeight: '700' },
+  timeText: { color: T.textSecondary, fontSize: 14.5, fontWeight: '600', textAlign: 'right', marginBottom: 2 },
+  durText: { fontSize: 12.5, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1035,7 +1036,7 @@ function CommunityActivity({ pendingAlerts, onViewAll, userId, onReporterPress }
       )}
       {recentReports.length > 0 ? recentReports.map((r, i) => {
         const isOn = r.reported_state === 'UTILITY_ON'; const color = isOn ? T.success : T.danger;
-        const minutesAgo = Math.round((Date.now() - new Date(r.created_at).getTime()) / 60000);
+        const minutesAgo = Math.round((serverNowMs() - new Date(r.created_at).getTime()) / 60000);
         const timeLabel = minutesAgo < 60 ? `منذ ${minutesAgo} دقيقة` : `منذ ${Math.round(minutesAgo / 60)} ساعة`;
         return (
           <View key={r.id} style={caStyles.reportRow}>
@@ -1055,20 +1056,20 @@ function CommunityActivity({ pendingAlerts, onViewAll, userId, onReporterPress }
 const caStyles = StyleSheet.create({
   card: { backgroundColor: T.surface, borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
   header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
-  title: { color: T.textMuted, fontSize: 10, fontWeight: '700', letterSpacing: 1.5 },
-  openBtn: { color: T.accent, fontSize: 13, fontWeight: '700' },
+  title: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2 },
+  openBtn: { color: T.accent, fontSize: 14, fontWeight: '700' },
   alertBanner: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: '#001a2e', borderRadius: 12, padding: 12, marginBottom: 12, gap: 8, borderWidth: 1, borderColor: T.accent + '44' },
   alertDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: T.accent },
-  alertText: { color: T.textSecondary, fontSize: 12, flex: 1, textAlign: 'right' },
+  alertText: { color: T.textSecondary, fontSize: 13, flex: 1, textAlign: 'right' },
   alertArrow: { color: T.accent, fontWeight: '700' },
   reportRow: { flexDirection: 'row-reverse', alignItems: 'flex-start', paddingVertical: 10, borderTopWidth: 1, borderTopColor: T.elevated, gap: 10 },
   reportLeft: { flex: 1 },
-  reportState: { fontSize: 14, fontWeight: '700', textAlign: 'right', marginBottom: 3 },
-  reportUser: { color: T.textMuted, fontSize: 11, textAlign: 'right' },
+  reportState: { fontSize: 15, fontWeight: '700', textAlign: 'right', marginBottom: 3 },
+  reportUser: { color: T.textMuted, fontSize: 12.5, textAlign: 'right' },
   reportMeta: { alignItems: 'flex-end', gap: 3 },
-  timeAgo: { color: T.textMuted, fontSize: 10 },
-  yesCount: { color: T.success, fontSize: 10, fontWeight: '600' },
-  emptyText: { color: T.textMuted, fontSize: 12, textAlign: 'center', paddingVertical: 8 },
+  timeAgo: { color: T.textMuted, fontSize: 11.5 },
+  yesCount: { color: T.success, fontSize: 11.5, fontWeight: '600' },
+  emptyText: { color: T.textMuted, fontSize: 13, textAlign: 'center', paddingVertical: 8 },
 });
 
 function ParticipationNudge({ userId }: { userId?: string }) {
@@ -1077,7 +1078,7 @@ function ParticipationNudge({ userId }: { userId?: string }) {
     if (!userId) return;
     (async () => {
       try {
-        const cyclesAgo = new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString();
+        const cyclesAgo = new Date(serverNowMs() - 36 * 60 * 60 * 1000).toISOString();
         const { count } = await supabase.from('utility_reports').select('*', { count: 'exact', head: true }).eq('reporter_id', userId).gte('created_at', cyclesAgo);
         if ((count ?? 0) === 0) setShow(true);
       } catch (_) {}
@@ -1096,10 +1097,10 @@ function ParticipationNudge({ userId }: { userId?: string }) {
 }
 const pnStyles = StyleSheet.create({
   banner: { backgroundColor: '#001a2e', borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: T.accent + '44', flexDirection: 'row-reverse', gap: 10 },
-  title: { color: T.accent, fontSize: 13, fontWeight: '800', textAlign: 'right', marginBottom: 6 },
-  body: { color: T.textSecondary, fontSize: 12, lineHeight: 20, textAlign: 'right' },
+  title: { color: T.accent, fontSize: 14.5, fontWeight: '800', textAlign: 'right', marginBottom: 6 },
+  body: { color: T.textSecondary, fontSize: 13, lineHeight: 21, textAlign: 'right' },
   dismissBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  dismissText: { color: T.textMuted, fontSize: 12 },
+  dismissText: { color: T.textMuted, fontSize: 13 },
 });
 
 function StabilityBar({ score, label }: { score: number; label: string }) {
@@ -1117,8 +1118,8 @@ function StabilityBar({ score, label }: { score: number; label: string }) {
 const sbStyles = StyleSheet.create({
   wrap: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: T.border },
   row: { flexDirection: 'row-reverse', justifyContent: 'space-between', marginBottom: 8 },
-  label: { color: T.textMuted, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
-  score: { fontSize: 12, fontWeight: '700' },
+  label: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 0.8 },
+  score: { fontSize: 13.5, fontWeight: '700' },
   track: { height: 5, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden' },
   fill: { height: 5, borderRadius: 3 },
 });
@@ -1281,7 +1282,21 @@ export default function Home() {
     if (isSyncedOnCurrent && userPrediction?.isResynced && userPrediction.resyncedAtIso) return userPrediction.resyncedAtIso;
     const atcMode = userPrediction?.atc?.mode;
     if (atcMode === 'POSITIVE_OFFSET_PENDING') return userPrediction?.currentStateStartIso ?? null;
-    if (anchor && userPrediction && anchor.state === userPrediction.currentState) return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
+    // ISSUE-FIX (منذ after a Generated ON ends): the raw-Growatt anchor is
+    // only meaningful for a PLAIN manual-offset user. When a personal
+    // timeline is active (community resync / Generated ON), the engine's
+    // currentStateStartIso already carries the correct personal start —
+    // per spec §16 the OFF begins exactly where the Generated ON ended.
+    // Shifting the RAW Growatt anchor here (which matches the displayed
+    // state whenever Growatt happens to be in the same ON/OFF state)
+    // restarted "منذ" from the real sensor transition — hours off in both
+    // directions (Growatt OFF with Generated ON already ended, and Growatt
+    // ON with Generated ON already ended).
+    const hasPersonalTimeline =
+      !!resyncPoint ||
+      !!(userPrediction as any)?.generatedOnInfo ||
+      !!(userPrediction as any)?.isResynced;
+    if (!hasPersonalTimeline && anchor && userPrediction && anchor.state === userPrediction.currentState) return new Date(new Date(anchor.startIso).getTime() + offsetMs).toISOString();
     return userPrediction?.currentStateStartIso ?? null;
   })();
 

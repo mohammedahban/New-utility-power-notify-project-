@@ -22,6 +22,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../contexts/AuthContext';
 import type { ResyncPoint } from '../contexts/ResyncContext';
 import { supabase } from '../lib/supabase';
+import { serverNowMs } from '../lib/serverTime';
 import { effectiveOffsetFromRow } from './useUserOffset';
 
 const SNAPSHOT_KEY_PREFIX = 'status_snapshot_v2_';
@@ -64,7 +65,7 @@ export async function readPreActionStateForSnapshot(userId: string): Promise<{
     const raw = await AsyncStorage.getItem(`community_resync_point_v2_${userId}`);
     if (raw) {
       const parsed: ResyncPoint = JSON.parse(raw);
-      const ageMs = Date.now() - new Date(parsed.appliedAtIso).getTime();
+      const ageMs = serverNowMs() - new Date(parsed.appliedAtIso).getTime();
       if (Number.isFinite(ageMs) && ageMs < 3 * 60 * 60 * 1000) resyncPoint = parsed;
     }
   } catch (_) { /* non-fatal */ }
@@ -193,7 +194,7 @@ export function useStatusSnapshot() {
       const raw = await AsyncStorage.getItem(storageKey);
       if (raw) {
         const prev: StatusSnapshot = JSON.parse(raw);
-        if (prev?.createdAt && Date.now() - new Date(prev.createdAt).getTime() < 15_000) {
+        if (prev?.createdAt && serverNowMs() - new Date(prev.createdAt).getTime() < 15_000) {
           if (extra?.resyncHistoryRowId != null && prev.resyncHistoryRowId == null) {
             const merged: StatusSnapshot = { ...prev, resyncHistoryRowId: extra.resyncHistoryRowId };
             setSnapshot(merged);

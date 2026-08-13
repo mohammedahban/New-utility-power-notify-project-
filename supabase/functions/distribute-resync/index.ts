@@ -1,6 +1,7 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { corsHeaders } from '../_shared/cors.ts';
+import { sendExpoPush } from '../_shared/push.ts';
 
 /**
  * distribute-resync — fan out a reporter's ON report to accepted followers.
@@ -287,11 +288,13 @@ serve(async (req) => {
     });
 
     if (pushMessages.length > 0) {
-      await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(pushMessages),
-      });
+      // Ticket-checked send: logs per-token results and deletes
+      // DeviceNotRegistered tokens so silent delivery failures surface.
+      await sendExpoPush(
+        supabaseAdmin,
+        pushMessages as Array<Record<string, unknown> & { to: string }>,
+        'distribute-resync',
+      );
     }
 
     // 6. Reporter reliability: increment total_reports

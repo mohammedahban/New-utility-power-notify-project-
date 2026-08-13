@@ -473,6 +473,7 @@ export const AR = {
   testOn: '⚡  اختبار: شغّالة',
   testOff: '🔴  اختبار: طافية',
   sending: 'جارٍ الإرسال…',
+  testRemote: '📡  اختبار إشعار فعلي عبر الخادم',
   settingsSaved: '✓  تم حفظ الإعدادات',
   signOutAdmin: 'تسجيل الخروج',
 

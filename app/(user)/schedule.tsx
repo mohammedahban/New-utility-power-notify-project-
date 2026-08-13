@@ -10,6 +10,7 @@ import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useResync } from '../../contexts/ResyncContext';
 import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
+import { serverNowMs } from '../../lib/serverTime';
 import { AR } from '../../constants/arabic';
 
 const T = {
@@ -357,7 +358,7 @@ export default function ScheduleScreen() {
   }
 
   const allSlots = userPrediction?.daySchedule ?? [];
-  const nowMs = Date.now();
+  const nowMs = serverNowMs();
 
   // For POSITIVE_OFFSET_PENDING: the synthetic slot (at index 0) is the active slot.
   // For isReconciledFlip: the first ON slot in the schedule whose startIso is
