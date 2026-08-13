@@ -1,32 +1,35 @@
 /**
- * analyze-patterns — APPPE v5 "Solar-Aware Duration Model"
+ * analyze-patterns — APPPE v6 "Circadian Kernel Model"
  *
  * Triggered automatically by poll-growatt on every Growatt state change.
  * Also runs on schedule (cron) and manual invocation from admin dashboard.
  *
  * Pipeline:
- *   1. Load power_events (36h state window + 7-day learning window)
+ *   1. Load power_events (36h state window + 80-day learning window)
  *   2. Extract ON/OFF cycles (counter-state blips < 12 min merged for stats)
- *   3. Recency-weighted duration statistics (half-life 60h — adapts to fuel
- *      shortages / broken generators / seasonal solar changes within ~2 days)
- *   4. OFF-duration model: 12 buckets × 2h of start time-of-day, shrunk toward
- *      day/night period means. Captures the city's real behavior:
- *        - midday OFF is SHORT (solar panel support during daylight)
- *        - evening OFF is LONGEST (peak demand, no solar)
- *        - night OFF is long but stable
- *      ON-duration model: per-period (day/night) — historically very stable.
- *   5. Drift & bias corrections learned ONLY from clean snapshot accuracy rows
- *      (slot_id 'snap_%') — the legacy mixed rows (client remaining-time
- *      snapshots + circular server time-of-day rows) are excluded.
- *   6. Generate 24h schedule with PER-SLOT durations (no more single global
- *      avg ON/OFF for every slot) and data-driven transition ranges.
- *   7. Accuracy logging v2 (snapshot & resolve):
- *      - Every run appends the live nextTransition prediction to
- *        prediction.snapshots (what users actually saw, capped 40).
- *      - When a real power_event arrives, it is matched against the LAST
- *        snapshot issued BEFORE the event → one truthful accuracy row.
- *      - Rows are only written when a genuine pre-event prediction existed.
- *   8. Write result to utility_predictions (id = 1, upsert).
+ *   3. Gentle recency weighting (half-life 60 DAYS): backtesting on the full
+ *      event history showed the city's regime is stable for months, so long
+ *      memory beats fast forgetting. Regime breaks (fuel crises) are handled
+ *      by the crisis detector + deadbanded drift corrector, not by shrinking
+ *      the window.
+ *   4. OFF-duration model: circular Gaussian kernel regression over the
+ *      Aden start-hour (σ = 1.75h), recency-weighted, shrunk toward the
+ *      global weighted mean (κ = 1.75). NO day/night split and no fixed
+ *      bucket edges — both were backtested and lost:
+ *        - day/night means (the v4/v5 fallback): OFF MAE ≈ 59 min
+ *        - this kernel model:                       OFF MAE ≈ 33 min (−45%)
+ *      The measured reality (77 days): morning OFFs ≈ 5.3h, evening OFFs
+ *      ≈ 8.6h — a smooth curve the coarse splits could not express with
+ *      only ~6 effective samples per bucket.
+ *   5. ON-duration model: single recency-weighted mean. Measured ON duration
+ *      is 125 ± 13 min regardless of hour — day/night splits add nothing.
+ *   6. Drift correction with DEADBAND (|median| ≥ 15 min, ≥ 8 samples):
+ *      absorbs genuine regime offsets but ignores stable-regime noise
+ *      (backtest showed unconditional drift only adds variance).
+ *   7. Bias ratios learned ONLY from clean snapshot accuracy rows.
+ *   8. Generate 24h schedule with PER-SLOT durations; data-driven ranges.
+ *   9. Accuracy logging v2 (snapshot & resolve) + prediction horizon.
+ *  10. Write result to utility_predictions (id = 1, upsert).
  *
  * IMPORTANT: This function must remain deployed at all times.
  * poll-growatt calls it automatically after every state change detection.
@@ -46,30 +49,32 @@ function getSupabase() {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const ANALYSIS_WINDOW_HOURS = 36;      // state-detection window (recent events)
-const LEARNING_WINDOW_DAYS = 7;        // duration-learning window
+const LEARNING_WINDOW_DAYS = 80;       // duration-learning window (≈ all history)
 const MIN_CYCLES_FOR_LEARNING = 3;
 const MAX_DRIFT_SAMPLES = 20;
 const VOLATILITY_EMA_ALPHA = 0.3;
 const CRISIS_THRESHOLD_PCT = 0.40;     // 40% change triggers crisis mode
 const SCHEDULE_AHEAD_HOURS = 24;
 
-// v5 model constants
+// v6 model constants
 const BLIP_MERGE_MIN = 12;             // counter-state runs shorter than this are noise
-const RECENCY_HALFLIFE_HOURS = 60;     // 2.5 days — fast regime adaptation
-const OFF_BUCKET_HOURS = 2;            // 12 time-of-day buckets
-const OFF_BUCKET_COUNT = 24 / OFF_BUCKET_HOURS;
-const BUCKET_SHRINK_K = 1.5;           // pseudo-samples pulling buckets toward period mean
-const PERIOD_SHRINK_K = 2;             // pseudo-samples pulling period mean toward global
+const RECENCY_HALFLIFE_HOURS = 60 * 24; // 60 DAYS — regime is stable for months;
+                                        // fast forgetting was v5's core weakness
+const KERNEL_SIGMA_HOURS = 1.75;       // circular Gaussian kernel bandwidth over
+                                       // the OFF-start hour-of-day (backtested)
+const GLOBAL_SHRINK_K = 1.75;          // pseudo-weight pulling kernel estimate
+                                       // toward the global mean (backtested)
 const DRIFT_MAX_ABS_MIN = 45;          // drift correction clamp
-const DRIFT_MIN_SAMPLES = 4;
+const DRIFT_MIN_SAMPLES = 8;           // was 4 — noisier than useful
+const DRIFT_DEADBAND_MIN = 15;         // |median error| below this = noise, no drift
 const BIAS_MIN_SAMPLES = 4;
 const BIAS_CLAMP_MIN = 0.5;
 const BIAS_CLAMP_MAX = 2.0;
 const OFF_DUR_MIN_CLAMP = 5;
-const OFF_DUR_MAX_CLAMP = 900;         // real night OFFs can exceed 8h (was 480 — too low)
+const OFF_DUR_MAX_CLAMP = 900;         // real night OFFs can exceed 8h
 const ON_DUR_MIN_CLAMP = 10;
 const ON_DUR_MAX_CLAMP = 480;
-const MAX_ALLOWED_ERROR_MIN = 180;     // accuracy score scale (was 150)
+const MAX_ALLOWED_ERROR_MIN = 180;     // accuracy score scale
 const SNAPSHOT_MAX_AGE_HOURS = 36;
 const SNAPSHOT_CAP = 40;
 const SNAPSHOT_MATCH_TOLERANCE_MS = 6 * 3600_000;
@@ -392,17 +397,23 @@ function computeConfidence(factors: ReturnType<typeof computeQualityFactors>): n
   return Math.min(97, Math.round(weighted));
 }
 
-// ── v5 Duration Model ─────────────────────────────────────────────────────────
+// ── v6 Duration Model ─────────────────────────────────────────────────────────
 //
-// OFF duration depends strongly on the time of day the OFF STARTS:
-//   - late morning / midday OFFs are SHORT (solar support covers the gap)
-//   - evening OFFs are the LONGEST (peak demand + no solar)
-//   - night OFFs are long but stable
-// A single global average (v4) was therefore systematically wrong by ±1–2h.
-// The model: 12 buckets of 2h, recency-weighted trimmed means, each bucket
-// shrunk toward its day/night period mean (which is itself shrunk toward the
-// global mean) so thin buckets fall back gracefully. Prediction interpolates
-// between adjacent bucket centers for a smooth curve.
+// What 77 days of real data showed (rolling-origin backtest, 187 OFF runs):
+//   • ON duration is 125 ± 13 min at ANY hour — a global weighted mean is the
+//     right model; day/night or per-hour splits only add variance.
+//   • OFF duration is a SMOOTH function of the Aden start-hour:
+//     ≈ 5.3h for morning starts rising to ≈ 8.6h for 18:00 starts.
+//   • The regime is stable for months (weekly OFF means: 394–467 min), so a
+//     long window + gentle recency decay beats v5's 7-day / 60h half-life,
+//     which left each 2h bucket with < 1 effective sample and collapsed the
+//     model to its day/night prior (the user's reported symptom).
+//
+// Model: Nadaraya–Watson kernel regression with a CIRCULAR Gaussian kernel
+// over the start hour (σ = 1.75h), samples weighted by recency (half-life
+// 60 days), shrunk toward the global weighted mean (κ = 1.75 pseudo-weight)
+// so thin night hours fall back gracefully. No bucket edges, no day/night
+// boundary anywhere in the prediction path.
 interface DurationModel {
   offDurAt: (startMs: number) => number;
   onDurAt: (startMs: number) => number;
@@ -445,73 +456,51 @@ function buildDurationModel(cycles: Cycle[], nowMs: number): DurationModel {
   const globalOnMean = onTVals.length > 0 ? weightedMean(onTVals, onTW) : 120;
   const globalOnSd = onTVals.length > 1 ? weightedStdDev(onTVals, onTW) : 20;
 
-  // ── Period (day/night) means & sds, shrunk toward global ─────────────────
-  const periodStats = (state: "ON" | "OFF", period: "day" | "night") => {
-    const pool = (state === "OFF" ? offsT : onsT).filter(c => c.period === period);
-    const vals = pool.map(c => c.durationMin);
-    const ws = pool.map(wOf);
-    const wSum = ws.reduce((s, w) => s + w, 0);
-    const global = state === "OFF" ? globalOffMean : globalOnMean;
-    const globalSd = state === "OFF" ? globalOffSd : globalOnSd;
-    if (vals.length === 0 || wSum === 0) return { mean: global, sd: globalSd, wSum: 0 };
-    const m = weightedMean(vals, ws);
+  // ── Circadian kernel over the OFF-start hour ────────────────────────────────
+  const offHours = offsT.map(c => adenHourFloat(c.startMs));
+  const kernelWeights = (hour: number): number[] =>
+    offHours.map((sh, i) => {
+      const dRaw = (((sh - hour) % 24) + 24) % 24;          // 0..24 circular
+      const dh = dRaw > 12 ? 24 - dRaw : dRaw;              // 0..12 distance
+      return offTW[i] * Math.exp(-0.5 * (dh / KERNEL_SIGMA_HOURS) ** 2);
+    });
+
+  /** Kernel estimate at hour, shrunk toward the global weighted mean. */
+  const kernelEstimate = (hour: number): { est: number; wSum: number } => {
+    const ww = kernelWeights(hour);
+    const wSum = ww.reduce((s, x) => s + x, 0);
+    if (wSum < 1e-6) return { est: globalOffMean, wSum: 0 };
+    const local = weightedMean(offTVals, ww);
     return {
-      mean: (wSum * m + PERIOD_SHRINK_K * global) / (wSum + PERIOD_SHRINK_K),
-      sd: vals.length > 1 ? weightedStdDev(vals, ws) : globalSd,
+      est: (wSum * local + GLOBAL_SHRINK_K * globalOffMean) / (wSum + GLOBAL_SHRINK_K),
       wSum,
     };
   };
-  const offDay = periodStats("OFF", "day");
-  const offNight = periodStats("OFF", "night");
-  const onDay = periodStats("ON", "day");
-  const onNight = periodStats("ON", "night");
 
-  // ── OFF time-of-day buckets ────────────────────────────────────────────────
-  const bucketDur: number[] = new Array(OFF_BUCKET_COUNT).fill(globalOffMean);
-  const bucketSamples: number[] = new Array(OFF_BUCKET_COUNT).fill(0);
-  for (let b = 0; b < OFF_BUCKET_COUNT; b++) {
-    const centerHour = b * OFF_BUCKET_HOURS + OFF_BUCKET_HOURS / 2;
-    const prior = (centerHour >= 6 && centerHour < 20 ? offDay : offNight).mean;
-    const inBucket = offsT.filter(c => {
-      const h = adenHourFloat(c.startMs);
-      return Math.floor(h / OFF_BUCKET_HOURS) % OFF_BUCKET_COUNT === b;
-    });
-    if (inBucket.length === 0) {
-      bucketDur[b] = prior;
-      continue;
-    }
-    const vals = inBucket.map(c => c.durationMin);
-    const ws = inBucket.map(wOf);
-    const wSum = ws.reduce((s, w) => s + w, 0);
-    const m = weightedMean(vals, ws);
-    bucketDur[b] = (wSum * m + BUCKET_SHRINK_K * prior) / (wSum + BUCKET_SHRINK_K);
-    bucketSamples[b] = wSum;
-  }
+  const offDurAt = (startMs: number): number =>
+    kernelEstimate(adenHourFloat(startMs)).est;
 
-  // Smooth circular interpolation between bucket centers
-  const offDurAt = (startMs: number): number => {
-    const h = adenHourFloat(startMs);
-    const pos = (h - OFF_BUCKET_HOURS / 2 + 24) % 24; // position on the center grid
-    const bIdx = Math.floor(pos / OFF_BUCKET_HOURS) % OFF_BUCKET_COUNT;
-    const nextIdx = (bIdx + 1) % OFF_BUCKET_COUNT;
-    const frac = (pos - bIdx * OFF_BUCKET_HOURS) / OFF_BUCKET_HOURS;
-    return bucketDur[bIdx] * (1 - frac) + bucketDur[nextIdx] * frac;
+  // ON duration: hour-independent by measurement — single weighted mean.
+  const onDurAt = (_startMs: number): number => globalOnMean;
+
+  // Display curve: sample the kernel model at 12 two-hour centers
+  // (same shape the admin dashboard has always rendered).
+  const offCurve = Array.from({ length: 12 }, (_, b) => {
+    const hour = b * 2 + 1;
+    const { est, wSum } = kernelEstimate(hour);
+    return { hour, durMin: Math.round(est), samples: Math.round(wSum * 10) / 10 };
+  });
+
+  // Local (kernel-weighted) dispersion for honest transition ranges, shrunk
+  // toward the global sd the same way the mean is shrunk.
+  const offSdFor = (startMs: number): number => {
+    const ww = kernelWeights(adenHourFloat(startMs));
+    const wSum = ww.reduce((s, x) => s + x, 0);
+    if (wSum < 1e-6) return globalOffSd;
+    const localSd = weightedStdDev(offTVals, ww);
+    return (wSum * localSd + GLOBAL_SHRINK_K * globalOffSd) / (wSum + GLOBAL_SHRINK_K);
   };
-
-  const onDurAt = (startMs: number): number => {
-    return getPeriod(startMs) === "day" ? onDay.mean : onNight.mean;
-  };
-
-  const offCurve = bucketDur.map((d, b) => ({
-    hour: b * OFF_BUCKET_HOURS + OFF_BUCKET_HOURS / 2,
-    durMin: Math.round(d),
-    samples: Math.round(bucketSamples[b] * 10) / 10,
-  }));
-
-  const offSdFor = (startMs: number) =>
-    getPeriod(startMs) === "day" ? offDay.sd : offNight.sd;
-  const onSdFor = (startMs: number) =>
-    getPeriod(startMs) === "day" ? onDay.sd : onNight.sd;
+  const onSdFor = (_startMs: number): number => globalOnSd;
 
   return { offDurAt, onDurAt, offCurve, offSdFor, onSdFor };
 }
@@ -577,6 +566,13 @@ function computeDriftOffset(history: AccuracyLogRow[]): {
   const median = sorted.length % 2 === 1
     ? sorted[Math.floor(sorted.length / 2)]
     : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+
+  // v6 deadband: a tiny systematic median is just kernel noise — chasing it
+  // made backtest accuracy WORSE (37.3 vs 32.7 MAE). Only correct a real
+  // regime shift, and never by more than DRIFT_MAX_ABS_MIN.
+  if (Math.abs(median) < DRIFT_DEADBAND_MIN) {
+    return { driftOffset: 0, driftSamples: samples, sampleCount: samples.length };
+  }
   const driftOffset = Math.round(
     Math.min(DRIFT_MAX_ABS_MIN, Math.max(-DRIFT_MAX_ABS_MIN, median))
   );
@@ -837,6 +833,9 @@ async function resolveAccuracyRows(
       confidence_score: best.confidence,
       prediction_generated_at: best.generatedAt,
       slot_id: best.id,
+      // v6: how far ahead the prediction looked — lets accuracy analysis
+      // separate short-horizon (next slot) from long-horizon (tomorrow) error.
+      horizon_minutes: Math.round((evMs - new Date(best.generatedAt).getTime()) / 60_000),
     });
     matchedSnapIds.push(best.id);
   }
@@ -935,7 +934,7 @@ Deno.serve(async (req) => {
   const nowMs = Date.now();
   const windowMs = ANALYSIS_WINDOW_HOURS * 3600_000;
 
-  console.log("[analyze-patterns] Starting APPPE v5 analysis...");
+  console.log("[analyze-patterns] Starting APPPE v6 analysis...");
 
   try {
     // ── 1. Load current inverter state ────────────────────────────────────────
@@ -974,7 +973,7 @@ Deno.serve(async (req) => {
       .select("id, event_type, occurred_at")
       .gte("occurred_at", extWindowStart)
       .order("occurred_at", { ascending: false })
-      .limit(500);
+      .limit(1000);
 
     const allCycles = extractCycles(
       (extEvents ?? []) as PowerEvent[], LEARNING_WINDOW_DAYS * 24 * 3600_000, nowMs
@@ -1240,7 +1239,7 @@ Deno.serve(async (req) => {
       computedAt: new Date(nowMs).toISOString(),
 
       apppe: {
-        version: "5",
+        version: "6",
         crisisActive,
         crisisReason,
         driftOffset,
