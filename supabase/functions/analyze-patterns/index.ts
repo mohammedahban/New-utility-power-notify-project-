@@ -26,6 +26,11 @@
  *   6. Drift correction with DEADBAND (|median| ≥ 15 min, ≥ 8 samples):
  *      absorbs genuine regime offsets but ignores stable-regime noise
  *      (backtest showed unconditional drift only adds variance).
+ *   6b. SHOCK detector (v6.1): sudden fuel/weather/breakdown regime breaks.
+ *      In-run layer extends the CURRENT outage the moment it exceeds its
+ *      hour-matched band (expected + max(90min, 1.75*sd)); persistent layer
+ *      shifts all future OFFs when 2 of the last 3 completed runs break the
+ *      pattern (median residual, clamped ±240 min). Auto-clears on recovery.
  *   7. Bias ratios learned ONLY from clean snapshot accuracy rows.
  *   8. Generate 24h schedule with PER-SLOT durations; data-driven ranges.
  *   9. Accuracy logging v2 (snapshot & resolve) + prediction horizon.
@@ -67,6 +72,13 @@ const GLOBAL_SHRINK_K = 1.75;          // pseudo-weight pulling kernel estimate
 const DRIFT_MAX_ABS_MIN = 45;          // drift correction clamp
 const DRIFT_MIN_SAMPLES = 8;           // was 4 — noisier than useful
 const DRIFT_DEADBAND_MIN = 15;         // |median error| below this = noise, no drift
+// v6.1 shock detector — fuel shortages / cloudy days / breakdowns
+const SHOCK_SD_MULT = 1.75;            // flag when |resid| > max(SHOCK_MIN_RESID_MIN, 1.75*localSd)
+const SHOCK_MIN_RESID_MIN = 90;
+const SHOCK_LOOKBACK = 3;              // completed OFF runs examined for a persistent shift
+const SHOCK_MIN_FLAGGED = 2;           // of the last 3 → persistent regime break
+const SHOCK_MAX_SHIFT_MIN = 240;
+const SHOCK_INRUN_BUFFER_MIN = 45;     // extension granularity while an anomalous run continues
 const BIAS_MIN_SAMPLES = 4;
 const BIAS_CLAMP_MIN = 0.5;
 const BIAS_CLAMP_MAX = 2.0;
@@ -505,6 +517,76 @@ function buildDurationModel(cycles: Cycle[], nowMs: number): DurationModel {
   return { offDurAt, onDurAt, offCurve, offSdFor, onSdFor };
 }
 
+// ── v6.1 Shock detector (fuel shortage / cloudy day / breakdown) ─────────────
+//
+// Two layers, both measured against the HOUR-MATCHED kernel expectation
+// (not raw means — a long evening OFF is normal, a long morning OFF is not):
+//
+//  1. IN-RUN (fastest possible): the still-active OFF run has already lasted
+//     longer than expected + max(90min, 1.75*localSd). On 77 days of history
+//     this fired on only 8 of 186 runs — including all three real anomaly
+//     days (Jun 6, Jun 28 15.3h, Jul 31 16.1h) — catching them 2.5–8 hours
+//     before they ended. While active, the current slot is extended in
+//     45-min steps, self-correcting every analysis run until power returns.
+//
+//  2. PERSISTENT SHIFT: 2 of the last 3 completed OFF runs deviated beyond
+//     the same threshold → regime break, not a single bad day. Future OFF
+//     predictions are shifted by the median residual (clamped ±240 min).
+//     Auto-clears as soon as new runs return to normal. Single extreme days
+//     (Jul 31: +565 min residual) do NOT trigger this — they are handled by
+//     the in-run layer and must not poison the following day's predictions.
+interface ShockResult {
+  shockActive: boolean;
+  shockKind: "none" | "inrun" | "persistent";
+  shiftOffMin: number;
+  reason: string | null;
+}
+
+function detectShock(cycles: Cycle[], model: DurationModel): ShockResult {
+  const none: ShockResult = { shockActive: false, shockKind: "none", shiftOffMin: 0, reason: null };
+  const completedOff = cycles.filter(c => !c.censored && c.state === "OFF");
+  if (completedOff.length < 10) return none;
+
+  // 1) In-run: is the CURRENT OFF run already far beyond its expectation?
+  const last = cycles.length > 0 ? cycles[cycles.length - 1] : null;
+  if (last && last.censored && last.state === "OFF") {
+    const expected = model.offDurAt(last.startMs);
+    const sd = model.offSdFor(last.startMs);
+    const threshold = expected + Math.max(SHOCK_MIN_RESID_MIN, SHOCK_SD_MULT * sd);
+    if (last.durationMin > threshold) {
+      return {
+        shockActive: true,
+        shockKind: "inrun",
+        shiftOffMin: 0,
+        reason: `Current outage at ${Math.round(last.durationMin)} min vs typical ` +
+          `${Math.round(expected)} min for its start hour — extended-outage mode`,
+      };
+    }
+  }
+
+  // 2) Persistent: 2 of last 3 completed OFF runs beyond their hour-matched band
+  const recent = completedOff.slice(-SHOCK_LOOKBACK);
+  const flagged: number[] = [];
+  for (const c of recent) {
+    const resid = c.durationMin - model.offDurAt(c.startMs);
+    const sd = model.offSdFor(c.startMs);
+    if (Math.abs(resid) > Math.max(SHOCK_MIN_RESID_MIN, SHOCK_SD_MULT * sd)) flagged.push(resid);
+  }
+  if (flagged.length >= SHOCK_MIN_FLAGGED) {
+    const s = [...flagged].sort((a, b) => a - b);
+    const med = s.length % 2 === 1 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+    const shift = Math.round(Math.min(SHOCK_MAX_SHIFT_MIN, Math.max(-SHOCK_MAX_SHIFT_MIN, med)));
+    return {
+      shockActive: true,
+      shockKind: "persistent",
+      shiftOffMin: shift,
+      reason: `${flagged.length} of last ${recent.length} outages broke the pattern — ` +
+        `regime shift ${shift > 0 ? "+" : ""}${shift} min applied`,
+    };
+  }
+  return none;
+}
+
 // ── Bias Engine (v5: clean snapshot rows only) ────────────────────────────────
 interface BiasResult {
   biasRatioOn: number;
@@ -602,14 +684,22 @@ function generateDaySchedule(
   nowMs: number,
   crisisActive: boolean,
   crisisShift: { on: number; off: number },
+  shock: ShockResult,
 ): ScheduleSlot[] {
   const slots: ScheduleSlot[] = [];
   const endMs = nowMs + SCHEDULE_AHEAD_HOURS * 3600_000;
 
+  // A persistent shock shift takes precedence over the (slower) crisis shift —
+  // it is measured against hour-matched expectations, so it is both faster
+  // and more precise. They never stack.
+  const effOffShift = shock.shockKind === "persistent"
+    ? shock.shiftOffMin
+    : (crisisActive ? crisisShift.off : 0);
+
   const durFor = (state: "ON" | "OFF", startMs: number): number => {
     const base = state === "ON" ? model.onDurAt(startMs) : model.offDurAt(startMs);
     const corrected = base * (state === "ON" ? biasResult.biasRatioOn : biasResult.biasRatioOff) +
-      (crisisActive ? (state === "ON" ? crisisShift.on : crisisShift.off) : 0);
+      (state === "ON" ? (crisisActive ? crisisShift.on : 0) : effOffShift);
     return state === "ON"
       ? Math.max(ON_DUR_MIN_CLAMP, Math.min(ON_DUR_MAX_CLAMP, corrected))
       : Math.max(OFF_DUR_MIN_CLAMP, Math.min(OFF_DUR_MAX_CLAMP, corrected));
@@ -623,7 +713,14 @@ function generateDaySchedule(
 
   while (slotStartMs < endMs && iterCount < MAX_ITER) {
     iterCount++;
-    const dur = durFor(state, slotStartMs);
+    let dur = durFor(state, slotStartMs);
+    // In-run shock: the CURRENT OFF has already outlived its expectation.
+    // Extend in 45-min (or 0.5*sd) steps from NOW — self-corrects every run.
+    if (iterCount === 1 && shock.shockKind === "inrun" && state === "OFF") {
+      const elapsed = (nowMs - slotStartMs) / 60_000;
+      dur = Math.min(OFF_DUR_MAX_CLAMP,
+        elapsed + Math.max(SHOCK_INRUN_BUFFER_MIN, 0.5 * model.offSdFor(slotStartMs)));
+    }
     // Drift correction applies ONCE, to the end of the current (first) slot —
     // it compensates the systematic phase error measured on past transitions.
     // The chain then carries the correction forward naturally.
@@ -1055,6 +1152,10 @@ Deno.serve(async (req) => {
     // ── 12. Solar-aware duration model ────────────────────────────────────────
     const model = buildDurationModel(allCycles, nowMs);
 
+    // ── 12b. Shock detector (fuel shortage / cloudy day / breakdown) ─────────
+    const shock = detectShock(allCycles, model);
+    console.log(`[analyze-patterns] Shock: ${shock.shockActive} (${shock.shockKind}), shift=${shock.shiftOffMin}min`);
+
     // ── 13. Current state start time ─────────────────────────────────────────
     const sortedEvents = [...events].sort(
       (a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime()
@@ -1078,6 +1179,7 @@ Deno.serve(async (req) => {
       nowMs,
       crisisActive,
       crisisShift,
+      shock,
     );
 
     console.log(`[analyze-patterns] Generated ${daySchedule.length} schedule slots`);
@@ -1187,6 +1289,16 @@ Deno.serve(async (req) => {
     if (crisisActive && crisisReason) {
       reasoning.push(`⚠️ وضع الأزمة: ${crisisReason}`);
     }
+    if (shock.shockActive && shock.shockKind === "inrun") {
+      reasoning.push(
+        "⚠️ انقطاع ممتد: تجاوزت مدة الانقطاع الحالية النمط المعتاد لهذا الوقت — تم تمديد التوقع تلقائياً"
+      );
+    } else if (shock.shockActive && shock.shockKind === "persistent") {
+      reasoning.push(
+        `⚠️ كشف تغيّر مفاجئ في النمط (نقص وقود / طقس غائم / عطل): ` +
+        `تم تعديل توقعات الانقطاع بمقدار ${shock.shiftOffMin > 0 ? "+" : ""}${shock.shiftOffMin} دقيقة`
+      );
+    }
     if (driftOffset !== 0) {
       reasoning.push(`انحراف التوقيت المُصحَّح: ${driftOffset > 0 ? "+" : ""}${driftOffset} دقيقة`);
     }
@@ -1239,9 +1351,13 @@ Deno.serve(async (req) => {
       computedAt: new Date(nowMs).toISOString(),
 
       apppe: {
-        version: "6",
+        version: "6.1",
         crisisActive,
         crisisReason,
+        shockActive: shock.shockActive,
+        shockKind: shock.shockKind,
+        shockShiftOffMin: shock.shiftOffMin,
+        shockReason: shock.reason,
         driftOffset,
         driftSampleCount,
         biasRatio: biasResult.biasRatioOn, // primary bias ratio (ON)
@@ -1283,7 +1399,7 @@ Deno.serve(async (req) => {
     console.log(
       `[analyze-patterns] Done. state=${currentState} confidence=${confidence}% ` +
       `slots=${daySchedule.length} drift=${driftOffset}min crisis=${crisisActive} ` +
-      `snapshots=${snapshots.length}`
+      `shock=${shock.shockKind} snapshots=${snapshots.length}`
     );
 
     return new Response(
@@ -1295,6 +1411,9 @@ Deno.serve(async (req) => {
         slotsGenerated: daySchedule.length,
         driftOffset,
         crisisActive,
+        shockActive: shock.shockActive,
+        shockKind: shock.shockKind,
+        shockShiftOffMin: shock.shiftOffMin,
         biasRatioOn: biasResult.biasRatioOn,
         biasRatioOff: biasResult.biasRatioOff,
         biasSampleCount: biasResult.sampleCount,
