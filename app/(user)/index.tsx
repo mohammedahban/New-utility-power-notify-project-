@@ -3,12 +3,13 @@ import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   RefreshControl, ActivityIndicator, Animated, Platform, Alert,
 } from 'react-native';
+import Svg, { Circle, Defs, LinearGradient as SvgLinearGradient, Stop } from 'react-native-svg';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
 import { useUserOffset } from '../../hooks/useUserOffset';
-import { UserPrediction, ScheduleStateMode, ShiftedScheduleSlot } from '../../hooks/useUserPredictions';
+import { UserPrediction } from '../../hooks/useUserPredictions';
 import { useSharedUserPrediction } from '../../contexts/UserPredictionContext';
 import { useResyncNotifications } from '../../hooks/useResyncNotifications';
 import { useMyReliability, getReliabilityBadge } from '../../hooks/useReliability';
@@ -17,14 +18,17 @@ import { useStatusSnapshot, readPreActionStateForSnapshot } from '../../hooks/us
 import { useStateAnchor } from '../../hooks/useStateAnchor';
 import { supabase } from '../../lib/supabase';
 import { serverNowMs } from '../../lib/serverTime';
-import { AR } from '../../constants/arabic';
 import type { PendingDSDCandidate } from '../../hooks/useUserOffset';
 
+// ── Theme (screenshot-inspired deep navy / coral / mint) ────────────────────
 const T = {
-  bg: '#060d1a', surface: '#0d1526', elevated: '#162035',
-  border: '#1e2d45', primary: '#3b82f6', accent: '#38bdf8',
-  textPrimary: '#f1f5f9', textSecondary: '#94a3b8', textMuted: '#4a5e7a',
-  success: '#22c55e', warning: '#f59e0b', danger: '#ef4444',
+  bg: '#080e1a', surface: '#111a2c', elevated: '#1a2540',
+  border: '#233252', primary: '#3b82f6', accent: '#4aa8ff',
+  textPrimary: '#f2f6fc', textSecondary: '#9aa8c0', textMuted: '#5b6b86',
+  success: '#2fe6a7', warning: '#f5b64a', danger: '#ff6f6f',
+};
+const TINT = {
+  successBg: '#0a2418', warningBg: '#2a1c07', accentBg: '#0a1e33', dangerBg: '#2a1014',
 };
 
 function translateCrisisReason(reason: string): string {
@@ -46,7 +50,16 @@ function fmtOverrunAr(min: number): string {
   return m === 0 ? hLabel : `${hLabel} و ${m} دقيقة`;
 }
 
-
+// ── Header mode pill (purely presentational map of the engine's atc mode) ───
+const MODE_PILL: Record<string, { label: string; color: string }> = {
+  NORMAL: { label: 'الوضع الآن — مؤكد', color: T.success },
+  COMMUNITY_SYNCED: { label: 'الوضع الآن — مزامنة مجتمعية', color: T.accent },
+  PREDICTION_RANGE: { label: 'الوضع الآن — نطاق توقع', color: T.accent },
+  UNCERTAIN_ZONE: { label: 'الوضع الآن — غير مؤكد', color: T.warning },
+  WAITING_FOR_GROWATT: { label: 'الوضع الآن — بانتظار الحساس', color: T.warning },
+  GRACE_MODE: { label: 'الوضع الآن — فترة سماح', color: T.warning },
+  POSITIVE_OFFSET_PENDING: { label: 'الوضع الآن — تغيير مجدول', color: T.accent },
+};
 
 // ── Stable elapsed timer ──────────────────────────────────────────────────────
 function useElapsedFromIso(startIso: string | null): string {
@@ -94,7 +107,7 @@ function GrowattOnToast({ visible, onDismiss }: { visible: boolean; onDismiss: (
 const gtStyles = StyleSheet.create({
   toast: {
     position: 'absolute', top: 56, left: 16, right: 16, zIndex: 999,
-    backgroundColor: '#052e16', borderRadius: 14, padding: 14,
+    backgroundColor: TINT.successBg, borderRadius: 14, padding: 14,
     borderWidth: 1.5, borderColor: T.success + '88',
     shadowColor: T.success, shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3, shadowRadius: 8, elevation: 8,
@@ -191,6 +204,48 @@ function durationWordsAr(label: string | null | undefined): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// STATUS RING — circular gauge around the live state (screenshot hero)
+// progress=null renders a dimmed full ring (no reliable window to measure).
+// ─────────────────────────────────────────────────────────────────────────────
+function StatusRing({ progress, color, size = 224, stroke = 16, children }: {
+  progress: number | null; color: string; size?: number; stroke?: number; children?: React.ReactNode;
+}) {
+  const r = (size - stroke * 2) / 2;
+  const c = 2 * Math.PI * r;
+  const p = progress === null ? 1 : Math.max(0, Math.min(1, progress));
+  const dimmed = progress === null;
+  return (
+    <View style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }}>
+      <Svg width={size} height={size}>
+        <Defs>
+          <SvgLinearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+            <Stop offset="0" stopColor={color} stopOpacity="1" />
+            <Stop offset="1" stopColor={color} stopOpacity="0.45" />
+          </SvgLinearGradient>
+        </Defs>
+        <Circle cx={size / 2} cy={size / 2} r={r} stroke={T.elevated} strokeWidth={stroke} fill="none" />
+        {/* soft glow behind the arc */}
+        <Circle
+          cx={size / 2} cy={size / 2} r={r} stroke={color} strokeWidth={stroke + 14} fill="none"
+          strokeDasharray={`${c} ${c}`} strokeDashoffset={c * (1 - p)}
+          strokeLinecap="round" rotation={-90} origin={`${size / 2}, ${size / 2}`}
+          opacity={dimmed ? 0.05 : 0.13}
+        />
+        <Circle
+          cx={size / 2} cy={size / 2} r={r} stroke="url(#ringGrad)" strokeWidth={stroke} fill="none"
+          strokeDasharray={`${c} ${c}`} strokeDashoffset={c * (1 - p)}
+          strokeLinecap="round" rotation={-90} origin={`${size / 2}, ${size / 2}`}
+          opacity={dimmed ? 0.22 : 1}
+        />
+      </Svg>
+      <View style={{ position: 'absolute', alignItems: 'center', justifyContent: 'center', paddingHorizontal: stroke + 8 }}>
+        {children}
+      </View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GENERATED ON BANNER
 // ─────────────────────────────────────────────────────────────────────────────
 function GeneratedOnBanner({ prediction }: { prediction: UserPrediction | null }) {
@@ -213,7 +268,7 @@ function GeneratedOnBanner({ prediction }: { prediction: UserPrediction | null }
   );
 }
 const goStyles = StyleSheet.create({
-  banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#052e16', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '66' },
+  banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: TINT.successBg, borderRadius: 18, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   title: { color: T.success, fontSize: 13.5, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
   body: { color: T.textPrimary, fontSize: 13, lineHeight: 19, textAlign: 'right', marginBottom: 6 },
@@ -227,12 +282,13 @@ const goStyles = StyleSheet.create({
 function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | null }) {
   const isPending = prediction?.isPendingNegative ?? false;
   const resolutionIso = prediction?.pendingNegativeResolutionIso ?? null;
-  if (!isPending) return null;
   const [tick, setTick] = useState(0);
   useEffect(() => {
+    if (!isPending) return;
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [isPending]);
+  if (!isPending) return null;
   let countdownLabel = 'بانتظار تحوّل Growatt القادم';
   if (resolutionIso) {
     const ms = new Date(resolutionIso).getTime() - serverNowMs();
@@ -257,7 +313,7 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
   );
 }
 const pn2Styles = StyleSheet.create({
-  banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#1a0e00', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
+  banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: TINT.warningBg, borderRadius: 18, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   title: { color: T.warning, fontSize: 13.5, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
   body: { color: T.textPrimary, fontSize: 13, lineHeight: 19, textAlign: 'right', marginBottom: 8 },
@@ -286,7 +342,7 @@ function OffsetStateChip({ prediction }: { prediction: UserPrediction | null }) 
   );
 }
 const osStyles = StyleSheet.create({
-  chip: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, alignSelf: 'flex-start', marginBottom: 12 },
+  chip: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 7, borderWidth: 1, alignSelf: 'flex-start', marginBottom: 14 },
   label: { fontSize: 12.5, fontWeight: '700' },
   value: { fontSize: 14.5, fontWeight: '900' },
 });
@@ -341,7 +397,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
   );
 }
 const popStyles = StyleSheet.create({
-  banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: '#001a2e', borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.accent + '66' },
+  banner: { flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, backgroundColor: TINT.accentBg, borderRadius: 18, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.accent + '66' },
   iconWrap: { width: 38, height: 38, borderRadius: 19, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   title: { color: T.accent, fontSize: 13, fontWeight: '800', letterSpacing: 0.5, textAlign: 'right', marginBottom: 5, textShadowColor: 'rgba(0,0,0,0.5)', textShadowOffset: {width: 0, height: 1}, textShadowRadius: 2 },
   body: { color: T.textPrimary, fontSize: 14, lineHeight: 21, textAlign: 'right', marginBottom: 8 },
@@ -384,7 +440,7 @@ function ValidationWindowToast({ prediction }: { prediction: UserPrediction | nu
   );
 }
 const vwStyles = StyleSheet.create({
-  toast: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
+  toast: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: TINT.warningBg, borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.warning + '66' },
   title: { color: T.warning, fontSize: 13.5, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
   body: { color: '#fbbf24dd', fontSize: 12.5, lineHeight: 18, textAlign: 'right', fontWeight: '600' },
   close: { width: 26, height: 26, borderRadius: 13, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -414,7 +470,7 @@ function PendingDSDChip({ pendingDSD, onCancel }: { pendingDSD: PendingDSDCandid
   );
 }
 const pdcStyles = StyleSheet.create({
-  chip: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: '#0c1a0c', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 11, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '44' },
+  chip: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: TINT.successBg, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 11, marginBottom: 12, borderWidth: 1.5, borderColor: T.success + '44' },
   dot: { width: 7, height: 7, borderRadius: 4, backgroundColor: T.success, flexShrink: 0 },
   title: { color: T.success, fontSize: 12.5, fontWeight: '800', textAlign: 'right', marginBottom: 3 },
   body: { color: T.success + 'cc', fontSize: 12.5, textAlign: 'right' },
@@ -424,7 +480,7 @@ const pdcStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PERSONAL STATUS CARD
+// PERSONAL STATUS CARD — hero ring + live stats (all engine logic unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, hasSnapshot, reasoningLine }: {
   prediction: UserPrediction | null; anchorStartIso: string | null;
@@ -488,6 +544,19 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   }, []);
   const pulseOpacity = animColor.interpolate({ inputRange: [0, 1], outputRange: [0.65, 1] });
 
+  // ── Ring progress (presentational only): elapsed share of the current
+  // predicted window. Null when the window can't be measured (e.g. holding
+  // OFF in UNCERTAIN_ZONE) → the ring renders dimmed and the line hides.
+  const elapsedMin = anchorStartIso ? Math.max(0, (serverNowMs() - new Date(anchorStartIso).getTime()) / 60000) : null;
+  const totalWindowMin = (elapsedMin !== null && remainTotalMin !== null) ? elapsedMin + remainTotalMin : null;
+  const ringProgress = totalWindowMin && totalWindowMin > 0 ? Math.max(0, Math.min(1, (elapsedMin as number) / totalWindowMin)) : null;
+  const ringPct = ringProgress !== null ? Math.round(ringProgress * 100) : null;
+  const expectedLabel = isOn ? prediction?.expectedOnDurationLabel : prediction?.expectedOffDurationLabel;
+  const expectedWords = expectedLabel ? durationWordsAr(expectedLabel) : null;
+  const modePill = MODE_PILL[atcMode] ?? MODE_PILL.NORMAL;
+  const windowDays = prediction?.dataWindowHours ? Math.max(1, Math.round(prediction.dataWindowHours / 24)) : null;
+  const isSynced = atcMode === 'COMMUNITY_SYNCED';
+
   const RevertConfirmBanner = revertConfirmVisible ? (
     <View style={psStyles.revertConfirmBox}>
       <Text style={psStyles.revertConfirmText}>{hasSnapshot ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.' : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.'}</Text>
@@ -502,20 +571,24 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     </View>
   ) : null;
 
+  // ── "من سجلك" typical durations (unchanged data, dotted-chip styling) ──
   const DurationsBlock = (prediction?.expectedOnDurationLabel || prediction?.expectedOffDurationLabel) ? (
-    <View style={psStyles.durRow}>
-      {prediction?.expectedOnDurationLabel ? (
-        <View style={[psStyles.durChip, { borderColor: T.success + '44' }]}>
-          <View style={{ flex: 1 }}><Text style={psStyles.durChipLabel}>عادةً تستمر الكهرباء:</Text><Text style={[psStyles.durChipValue, { color: T.success }]}>{durationWordsAr(prediction.expectedOnDurationLabel)}</Text></View>
-          <Text style={psStyles.durChipIcon}>🟢</Text>
-        </View>
-      ) : null}
-      {prediction?.expectedOffDurationLabel ? (
-        <View style={[psStyles.durChip, { borderColor: T.danger + '44' }]}>
-          <View style={{ flex: 1 }}><Text style={psStyles.durChipLabel}>عادةً يستمر الانقطاع:</Text><Text style={[psStyles.durChipValue, { color: T.danger }]}>{durationWordsAr(prediction.expectedOffDurationLabel)}</Text></View>
-          <Text style={psStyles.durChipIcon}>🔴</Text>
-        </View>
-      ) : null}
+    <View style={psStyles.durSection}>
+      <Text style={psStyles.durSectionTitle}>{windowDays ? `من سجلك خلال آخر ${windowDays} يوماً:` : 'من سجلك:'}</Text>
+      <View style={psStyles.durRow}>
+        {prediction?.expectedOffDurationLabel ? (
+          <View style={psStyles.durChip}>
+            <View style={{ flex: 1 }}><Text style={psStyles.durChipLabel}>الانقطاع يستمر عادةً</Text><Text style={[psStyles.durChipValue, { color: T.danger }]}>{durationWordsAr(prediction.expectedOffDurationLabel)}</Text></View>
+            <View style={[psStyles.durDot, { backgroundColor: T.danger }]} />
+          </View>
+        ) : null}
+        {prediction?.expectedOnDurationLabel ? (
+          <View style={psStyles.durChip}>
+            <View style={{ flex: 1 }}><Text style={psStyles.durChipLabel}>الكهرباء تستمر عادةً</Text><Text style={[psStyles.durChipValue, { color: T.success }]}>{durationWordsAr(prediction.expectedOnDurationLabel)}</Text></View>
+            <View style={[psStyles.durDot, { backgroundColor: T.success }]} />
+          </View>
+        ) : null}
+      </View>
     </View>
   ) : null;
 
@@ -540,22 +613,44 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     </>
   ) : null;
 
-  if (atcMode === 'COMMUNITY_SYNCED') {
-    const reporterName = meta?.reporterName ?? 'مجهول';
-    const reporterRel = meta?.reporterReliability;
-    return (
-      <View style={[psStyles.card, { borderColor: color + '50' }]}>
-        <Text style={psStyles.cardTitle}>⚡ حالتي الكهربائية</Text>
-        <View style={psStyles.statusRow}>
-          <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{isOn ? '⚡' : '🔴'}</Animated.Text>
-          <Text style={[psStyles.statusText, { color }]}>{isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}</Text>
+  const reporterName = meta?.reporterName ?? 'مجهول';
+  const reporterRel = meta?.reporterReliability;
+
+  return (
+    <View style={[psStyles.card, { borderColor: color + (isSynced ? '50' : '30') }]}>
+      {/* header: title right, live mode pill left */}
+      <View style={psStyles.cardHeaderRow}>
+        <View style={[psStyles.modePill, { borderColor: modePill.color + '55', backgroundColor: modePill.color + '14' }]}>
+          <View style={[psStyles.modePillDot, { backgroundColor: modePill.color }]} />
+          <Text style={[psStyles.modePillText, { color: modePill.color }]}>{modePill.label}</Text>
         </View>
-        {offsetStateChip}
+        <Text style={psStyles.cardTitle}>⚡ حالة الكهرباء</Text>
+      </View>
+
+      {/* hero ring */}
+      <View style={psStyles.ringWrap}>
+        <StatusRing progress={ringProgress} color={color}>
+          <Animated.View style={[psStyles.ringDot, { backgroundColor: color, opacity: pulseOpacity }]} />
+          <Text style={[psStyles.ringStatus, { color }]}>{isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}</Text>
+          {elapsed ? <Text style={psStyles.ringElapsed}>منذ {elapsed}</Text> : null}
+        </StatusRing>
+      </View>
+
+      {ringPct !== null && (
+        <Text style={psStyles.ringPctLine}>
+          قطعت <Text style={{ color, fontWeight: '900' }}>{ringPct}%</Text> من مدة {isOn ? 'التشغيل' : 'الانقطاع'} المعتادة{expectedWords ? ` (${expectedWords} تقريباً)` : ''}
+        </Text>
+      )}
+
+      {offsetStateChip}
+
+      {/* community sync banner (COMMUNITY_SYNCED only) — content unchanged */}
+      {isSynced && (
         <View style={[psStyles.communityBanner, { borderColor: T.accent + '44' }]}>
           <View style={{ flex: 1 }}>
             <Text style={psStyles.communityBannerTitle}>تمت مزامنة الحالة عبر المجتمع 🤝</Text>
             <View style={psStyles.communityBannerRow}>
-              {reporterRel !== null && (<View style={psStyles.reliabilityChip}><Text style={psStyles.reliabilityChipText}>موثوقية {reporterRel}%</Text></View>)}
+              {reporterRel !== null && reporterRel !== undefined && (<View style={psStyles.reliabilityChip}><Text style={psStyles.reliabilityChipText}>موثوقية {reporterRel}%</Text></View>)}
               <Text style={psStyles.communityBannerReporter}>المُبلِّغ: <Text style={{ color: T.accent, fontWeight: '800' }}>{reporterName}</Text></Text>
             </View>
             {meta?.syncedAtIso && (<Text style={psStyles.communityBannerTime}>تم تأكيد هذه الحالة منذ: {syncElapsed || 'للتو'}</Text>)}
@@ -563,43 +658,29 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           </View>
           <Text style={{ fontSize: 30 }}>👥</Text>
         </View>
-        {RevertBlock}
-        <View style={psStyles.timeRow}>
-          {elapsed ? (<View style={psStyles.timeBlock}><Text style={psStyles.timeLabel}>منذ:</Text><Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text></View>) : null}
-          {remainLabel ? (<View style={[psStyles.timeBlock, { borderColor: color + '30', borderWidth: 1 }]}><Text style={psStyles.timeLabel}>الوقت المتوقع المتبقي:</Text><Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text></View>) : null}
-        </View>
-        {DurationsBlock}{ReasoningBlock}
-      </View>
-    );
-  }
+      )}
 
-  const icon = isOn ? '⚡' : '🔴';
-  const statusText = isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية';
-  const showATCBadge = atcMode !== 'NORMAL';
-  const tMode = prediction?.atc?.transitionMode ?? 'AUTO';
-
-  return (
-    <View style={[psStyles.card, { borderColor: color + '30' }]}>
-      <Text style={psStyles.cardTitle}>⚡ حالتي الكهربائية</Text>
-      <View style={psStyles.statusRow}>
-        <Animated.Text style={[psStyles.statusIcon, { opacity: pulseOpacity }]}>{icon}</Animated.Text>
-        <Text style={[psStyles.statusText, { color }]}>{statusText}</Text>
-      </View>
-      {offsetStateChip}
       {RevertBlock}
-      <View style={psStyles.timeRow}>
-        {elapsed ? (<View style={psStyles.timeBlock}><Text style={psStyles.timeLabel}>منذ:</Text><Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text></View>) : null}
-        {remainLabel ? (<View style={[psStyles.timeBlock, { borderColor: color + '30', borderWidth: 1 }]}><Text style={psStyles.timeLabel}>متبقي تقريباً:</Text><Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text></View>) : null}
-      </View>
 
-      {showATCBadge && (() => {
-        const isUncertain = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT';
+      {/* elapsed / remaining stat cards */}
+      {(elapsed || remainLabel) ? (
+        <View style={psStyles.timeRow}>
+          {elapsed ? (<View style={psStyles.timeBlock}><Text style={psStyles.timeLabel}>منذ (وقت فعلي)</Text><Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text></View>) : null}
+          {remainLabel ? (<View style={[psStyles.timeBlock, psStyles.timeBlockDashed, { borderColor: color + '77' }]}><Text style={psStyles.timeLabel}>{isSynced ? 'الوقت المتوقع المتبقي:' : 'متبقي (تقديري)'}</Text><Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text></View>) : null}
+        </View>
+      ) : null}
+
+      {/* ATC mode badge (never in COMMUNITY_SYNCED) — content unchanged */}
+      {!isSynced && (() => {
+        const showATCBadge = atcMode !== 'NORMAL';
+        if (!showATCBadge) return null;
+        const tMode = prediction?.atc?.transitionMode ?? 'AUTO';
         const configs: Record<string, { icon: string; bg: string; border: string; textColor: string }> = {
-          PREDICTION_RANGE: { icon: '🔮', bg: '#0a1a2e', border: T.accent + '55', textColor: T.accent },
-          UNCERTAIN_ZONE:       { icon: '⚠',  bg: '#1a0e00', border: T.warning + '55', textColor: T.warning },
-          WAITING_FOR_GROWATT:  { icon: '⏳', bg: '#1a0e00', border: T.warning + '55', textColor: T.warning },
-          GRACE_MODE: { icon: '⏳', bg: '#0a1a2e', border: T.warning + '44', textColor: T.warning },
-          POSITIVE_OFFSET_PENDING: { icon: '⏰', bg: '#001a2e', border: T.accent + '55', textColor: T.accent },
+          PREDICTION_RANGE: { icon: '🔮', bg: TINT.accentBg, border: T.accent + '55', textColor: T.accent },
+          UNCERTAIN_ZONE:       { icon: '⚠',  bg: TINT.warningBg, border: T.warning + '55', textColor: T.warning },
+          WAITING_FOR_GROWATT:  { icon: '⏳', bg: TINT.warningBg, border: T.warning + '55', textColor: T.warning },
+          GRACE_MODE: { icon: '⏳', bg: TINT.accentBg, border: T.warning + '44', textColor: T.warning },
+          POSITIVE_OFFSET_PENDING: { icon: '⏰', bg: TINT.accentBg, border: T.accent + '55', textColor: T.accent },
         };
         const cfg = configs[atcMode];
         if (!cfg) return null;
@@ -638,27 +719,37 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
           </View>
         );
       })()}
+
       {DurationsBlock}{ReasoningBlock}
     </View>
   );
 }
 
 const psStyles = StyleSheet.create({
-  card: { backgroundColor: T.surface, borderRadius: 22, padding: 20, marginBottom: 14, borderWidth: 1.5 },
-  cardTitle: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2, marginBottom: 16, textAlign: 'right' },
-  statusRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 14, marginBottom: 18 },
-  statusIcon: { fontSize: 44 },
-  statusText: { fontSize: 32, fontWeight: '900', flex: 1, textAlign: 'right', lineHeight: 40 },
-  timeRow: { flexDirection: 'row-reverse', gap: 10, marginBottom: 14 },
-  timeBlock: { flex: 1, backgroundColor: T.elevated, borderRadius: 14, padding: 14 },
+  card: { backgroundColor: T.surface, borderRadius: 26, padding: 20, marginBottom: 14, borderWidth: 1.5 },
+  cardHeaderRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8 },
+  cardTitle: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2, textAlign: 'right' },
+  modePill: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, borderRadius: 20, paddingHorizontal: 11, paddingVertical: 5, borderWidth: 1 },
+  modePillDot: { width: 6, height: 6, borderRadius: 3 },
+  modePillText: { fontSize: 11, fontWeight: '800' },
+  ringWrap: { alignItems: 'center', marginTop: 6, marginBottom: 4 },
+  ringDot: { width: 10, height: 10, borderRadius: 5, marginBottom: 10 },
+  ringStatus: { fontSize: 27, fontWeight: '900', textAlign: 'center', lineHeight: 34 },
+  ringElapsed: { color: T.textSecondary, fontSize: 13.5, fontWeight: '600', textAlign: 'center', marginTop: 6 },
+  ringPctLine: { color: T.textSecondary, fontSize: 12.5, fontWeight: '600', textAlign: 'center', marginTop: 10, marginBottom: 2 },
+  timeRow: { flexDirection: 'row-reverse', gap: 10, marginBottom: 14, marginTop: 4 },
+  timeBlock: { flex: 1, backgroundColor: T.elevated, borderRadius: 16, padding: 14, borderWidth: 1, borderColor: 'transparent' },
+  timeBlockDashed: { backgroundColor: T.surface, borderStyle: 'dashed' },
   timeLabel: { color: T.textMuted, fontSize: 11.5, fontWeight: '600', textAlign: 'right', marginBottom: 5 },
   timeValue: { fontSize: 21, fontWeight: '800', textAlign: 'right' },
-  durRow: { flexDirection: 'row-reverse', gap: 8, marginTop: 4 },
-  durChip: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', gap: 8, backgroundColor: T.elevated, borderRadius: 12, padding: 10, borderWidth: 1 },
-  durChipIcon: { fontSize: 17, flexShrink: 0 },
-  durChipLabel: { color: T.textMuted, fontSize: 11, fontWeight: '600', marginBottom: 2, textAlign: 'right' },
-  durChipValue: { fontSize: 14.5, fontWeight: '800', textAlign: 'right' },
-  communityBanner: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, backgroundColor: '#001a2e', borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1 },
+  durSection: { marginTop: 6 },
+  durSectionTitle: { color: T.textMuted, fontSize: 11.5, fontWeight: '700', textAlign: 'right', marginBottom: 8 },
+  durRow: { flexDirection: 'row-reverse', gap: 8 },
+  durChip: { flex: 1, flexDirection: 'row-reverse', alignItems: 'center', gap: 10, backgroundColor: T.elevated, borderRadius: 14, padding: 12, borderWidth: 1, borderColor: T.border },
+  durDot: { width: 8, height: 8, borderRadius: 4, flexShrink: 0 },
+  durChipLabel: { color: T.textMuted, fontSize: 11, fontWeight: '600', marginBottom: 3, textAlign: 'right' },
+  durChipValue: { fontSize: 15, fontWeight: '800', textAlign: 'right' },
+  communityBanner: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12, backgroundColor: TINT.accentBg, borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1 },
   communityBannerTitle: { color: T.accent, fontSize: 13.5, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
   communityBannerRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 8, marginBottom: 4 },
   communityBannerReporter: { color: T.textSecondary, fontSize: 14.5, textAlign: 'right' },
@@ -666,7 +757,7 @@ const psStyles = StyleSheet.create({
   communityBannerNote: { color: T.warning + 'aa', fontSize: 11.5, fontStyle: 'italic', marginTop: 6, textAlign: 'right', lineHeight: 16 },
   reliabilityChip: { backgroundColor: T.success + '20', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: T.success + '44' },
   reliabilityChipText: { color: T.success, fontSize: 11.5, fontWeight: '700' },
-  revertBtn: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: '#0f172a', borderRadius: 12, paddingVertical: 11, paddingHorizontal: 16, marginBottom: 14, borderWidth: 1.5, borderColor: T.accent + '55', alignSelf: 'stretch' },
+  revertBtn: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: TINT.accentBg, borderRadius: 14, paddingVertical: 11, paddingHorizontal: 16, marginBottom: 14, borderWidth: 1.5, borderColor: T.accent + '55', alignSelf: 'stretch' },
   revertIcon: { color: T.accent, fontSize: 17, fontWeight: '700' },
   revertLabel: { color: T.accent, fontSize: 14.5, fontWeight: '700' },
   revertConfirmBox: { backgroundColor: '#0a1929', borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1.5, borderColor: T.danger + '55' },
@@ -675,27 +766,27 @@ const psStyles = StyleSheet.create({
   revertConfirmBtn: { flex: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1 },
   revertConfirmBtnCancel: { backgroundColor: T.elevated, borderColor: T.border },
   revertConfirmBtnCancelText: { color: T.textSecondary, fontSize: 14, fontWeight: '700' },
-  revertConfirmBtnOk: { backgroundColor: '#1a0505', borderColor: T.danger + '55' },
+  revertConfirmBtnOk: { backgroundColor: TINT.dangerBg, borderColor: T.danger + '55' },
   revertConfirmBtnOkText: { color: T.danger, fontSize: 14, fontWeight: '800' },
-  atcBadge: { borderRadius: 12, padding: 12, marginBottom: 12, borderWidth: 1 },
+  atcBadge: { borderRadius: 14, padding: 12, marginBottom: 12, borderWidth: 1 },
   atcBadgeLine: { fontSize: 14.5, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
   atcBodyLine: { fontSize: 12.5, textAlign: 'right', marginBottom: 4, lineHeight: 18 },
   atcSubLine: { color: T.accent, fontSize: 12.5, textAlign: 'right' },
-  exceededBadge: { backgroundColor: '#2d1a00', borderRadius: 10, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: T.warning + '66' },
+  exceededBadge: { backgroundColor: '#2d1a00', borderRadius: 12, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: T.warning + '66' },
   exceededRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 8 },
   exceededIcon: { fontSize: 22, flexShrink: 0 },
   exceededLabel: { color: T.warning, fontSize: 11.5, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
   exceededValue: { color: T.warning, fontSize: 22, fontWeight: '900', textAlign: 'right' },
-  liveClockRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1a0a00', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8 },
+  liveClockRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1a0a00', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8 },
   liveClockLabel: { color: T.warning + '99', fontSize: 11.5, fontWeight: '600' },
   liveClockValue: { color: T.warning, fontSize: 22, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 2 },
   deductionNote: { color: T.warning + 'cc', fontSize: 12.5, fontWeight: '600', textAlign: 'right', fontStyle: 'italic' },
-  reasoningBox: { backgroundColor: T.elevated, borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.border },
+  reasoningBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.border },
   reasoningText: { color: T.textSecondary, fontSize: 12.5, lineHeight: 19, textAlign: 'right', fontWeight: '500' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UPCOMING TRANSITION CARD
+// UPCOMING TRANSITION CARD — dashed estimate card (screenshot style)
 // ─────────────────────────────────────────────────────────────────────────────
 function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
@@ -746,7 +837,9 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     const cfg = modeConfigs[atcMode] ?? modeConfigs.UNCERTAIN_ZONE;
     return (
       <View style={[utStyles.card, { borderColor: cfg.borderColor }]}>
-        <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+        <View style={utStyles.headerRow}>
+          <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
+        </View>
         <View style={utStyles.holdBox}>
           <View style={{ flex: 1 }}>
             <Text style={[utStyles.holdTitle, { color: cfg.iconColor }]}>{cfg.icon} {cfg.title}</Text>
@@ -772,7 +865,9 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   if (!nt) {
     return (
       <View style={[utStyles.card, { borderColor: T.warning + '44' }]}>
-        <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+        <View style={utStyles.headerRow}>
+          <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
+        </View>
         <View style={utStyles.holdBox}>
           <Text style={utStyles.holdTitle}>⚠️ لا يوجد توقع متاح حالياً</Text>
           <Text style={utStyles.holdBody}>يستمر التطبيق في التعلم من أنماط الكهرباء. حاول مجدداً خلال دقائق.</Text>
@@ -790,12 +885,17 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   const slots = prediction.daySchedule ?? [];
   const nextIdx = slots.findIndex(s => { const state: 'ON' | 'OFF' = isNextOn ? 'ON' : 'OFF'; return s.state === state && new Date(s.startIso).getTime() > serverNowMs(); });
   const afterNext = nextIdx >= 0 && nextIdx + 1 < slots.length ? slots[nextIdx + 1] : null;
+  const cycles = prediction.cyclesAnalyzed ?? 0;
+  const windowDays = Math.max(1, Math.round((prediction.dataWindowHours ?? 24) / 24));
 
   return (
-    <View style={[utStyles.card, { borderColor: color + '30' }]}>
+    <View style={[utStyles.card, { borderColor: color + '55' }]}>
       <View style={utStyles.headerRow}>
         <View style={[utStyles.confBadge, { backgroundColor: confColor + '20', borderColor: confColor + '44' }]}><Text style={[utStyles.confText, { color: confColor }]}>{confText}</Text></View>
-        <Text style={utStyles.cardTitle}>⚡ التغيير المتوقع القادم</Text>
+        <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
+      </View>
+      <View style={utStyles.approxPill}>
+        <Text style={utStyles.approxPillText}>⏱ تقدير تقريبي — ليس موعداً مؤكداً</Text>
       </View>
       {showCrisisAwareChip && (<View style={utStyles.crisisAwareChip}><Text style={utStyles.crisisAwareChipText}>⚠️ محرك التوقع يتكيّف مع تغيّر النمط — قد تتأثر دقة التوقع</Text></View>)}
       {nt.inRangeWindow && (
@@ -804,18 +904,16 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
           <Text style={[utStyles.rangeWindowSub, { color: color + 'aa' }]}>قد يحدث التغيير في أي لحظة</Text>
         </View>
       )}
-      <View style={[utStyles.rangeBox, { borderColor: color + '25' }]}>
-        <Text style={[utStyles.rangeBoxLabel, { color }]}>{isNextOn ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}</Text>
-        <View style={utStyles.rangeTimeStack} dir="ltr">
-          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeStartIso) || (nt as any).earliestFormatted || '—'}</Text>
-          <Text style={[utStyles.rangeSep, { color: color + '88' }]}>و</Text>
-          <Text style={[utStyles.rangeTime, { color }]}>{fmtTimeAr(nt.rangeEndIso) || (nt as any).latestFormatted || '—'}</Text>
-        </View>
+      <Text style={[utStyles.rangeBoxLabel, { color: T.textSecondary }]}>{isNextOn ? 'يُرجَّح أن تشتغل الكهرباء خلال هذا النطاق:' : 'يُرجَّح أن تنطفئ الكهرباء خلال هذا النطاق:'}</Text>
+      <View style={utStyles.rangeTimesRow}>
+        <Text style={[utStyles.rangeTimeBig, { color }]}>{fmtTimeAr(nt.rangeStartIso) || (nt as any).earliestFormatted || '—'}</Text>
+        <Text style={utStyles.rangeTo}>إلى</Text>
+        <Text style={[utStyles.rangeTimeBig, { color }]}>{fmtTimeAr(nt.rangeEndIso) || (nt as any).latestFormatted || '—'}</Text>
       </View>
       {!nt.inRangeWindow && (
         <View style={utStyles.countdownSection}>
-          <Text style={utStyles.countdownLabel}>⏳ يبدأ نطاق التوقع بعد</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginBottom: 10 }}>
+          <Text style={utStyles.countdownLabel}>يبدأ النطاق بعد حوالي</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginBottom: 12 }}>
             {h > 0 && (<><View style={utStyles.cdUnit}><Text style={[utStyles.cdVal, { color }]}>{String(h).padStart(2, '0')}</Text><Text style={utStyles.cdSub}>س</Text></View><Text style={[utStyles.cdColon, { color }]}>:</Text></>)}
             <View style={utStyles.cdUnit}><Text style={[utStyles.cdVal, { color }]}>{String(m).padStart(2, '0')}</Text><Text style={utStyles.cdSub}>د</Text></View>
             <Text style={[utStyles.cdColon, { color }]}>:</Text>
@@ -824,178 +922,69 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
           <View style={utStyles.progressTrack}>
             <Animated.View style={[utStyles.progressFill, { backgroundColor: color, width: animProg.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] }) }]} />
           </View>
+          <View style={utStyles.progressLabelsRow}>
+            <Text style={[utStyles.progressEdge, { color: color + 'cc' }]}>نطاق التوقع</Text>
+            <Text style={utStyles.progressEdge}>الآن</Text>
+          </View>
         </View>
       )}
       {afterNext && afterNext.endIso && (
         <View style={utStyles.afterNextBox}>
-          <Text style={utStyles.afterNextLabel}>التغيير المتوقع بعد ذلك</Text>
-          <Text style={[utStyles.afterNextVal, { color: afterNext.state === 'ON' ? T.success : T.danger }]}>{afterNext.state === 'ON' ? '🟢 تشغيل الكهرباء' : '🔴 انقطاع الكهرباء'}{'  '}{fmtTimeAr(afterNext.startIso)} — {fmtTimeAr(afterNext.endIso)}</Text>
+          <View style={utStyles.afterNextHeaderRow}>
+            <View style={[utStyles.afterNextDot, { backgroundColor: afterNext.state === 'ON' ? T.success : T.danger }]} />
+            <Text style={utStyles.afterNextLabel}>{afterNext.state === 'ON' ? 'التشغيل التالي المتوقع' : 'الانقطاع التالي المتوقع'}</Text>
+          </View>
+          <Text style={[utStyles.afterNextVal, { color: afterNext.state === 'ON' ? T.success : T.danger }]}>حوالي {fmtTimeAr(afterNext.startIso)} — {fmtTimeAr(afterNext.endIso)}</Text>
         </View>
+      )}
+      {cycles > 0 && (
+        <Text style={utStyles.footerNote}>التوقع مبني على تحليل {cycles} دورة خلال آخر {windowDays} يوماً. قد تتقدّم الكهرباء أو تتأخّر عن هذا النطاق، فلا تعتمد عليه في الأمور الحرجة.</Text>
       )}
     </View>
   );
 }
 const utStyles = StyleSheet.create({
-  card: { backgroundColor: T.surface, borderRadius: 22, padding: 20, marginBottom: 14, borderWidth: 1.5 },
-  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  card: { backgroundColor: T.surface, borderRadius: 26, padding: 20, marginBottom: 14, borderWidth: 1.5, borderStyle: 'dashed' },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
   cardTitle: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2 },
   confBadge: { borderRadius: 20, paddingHorizontal: 12, paddingVertical: 5, borderWidth: 1 },
   confText: { fontSize: 13, fontWeight: '700' },
-  rangeWindowBadge: { borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1.5, marginBottom: 14, alignItems: 'center' },
+  approxPill: { alignSelf: 'flex-start', backgroundColor: TINT.warningBg, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.warning + '55', marginBottom: 14 },
+  approxPillText: { color: T.warning, fontSize: 11.5, fontWeight: '800' },
+  rangeWindowBadge: { borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1.5, marginBottom: 14, alignItems: 'center' },
   rangeWindowText: { fontSize: 16, fontWeight: '800', textAlign: 'center', marginBottom: 4 },
   rangeWindowSub: { fontSize: 12.5, textAlign: 'center' },
-  rangeBox: { backgroundColor: T.elevated, borderRadius: 18, padding: 20, marginBottom: 16, borderWidth: 1, alignItems: 'center' },
-  rangeBoxLabel: { fontSize: 14, fontWeight: '600', marginBottom: 14, textAlign: 'center' },
+  rangeBox: { backgroundColor: T.elevated, borderRadius: 18, padding: 20, marginTop: 12, borderWidth: 1, borderColor: T.border, alignItems: 'center' },
+  rangeBoxLabel: { fontSize: 13.5, fontWeight: '600', marginBottom: 12, textAlign: 'center' },
   rangeTimeStack: { alignItems: 'center', gap: 8 },
   rangeTime: { fontSize: 32, fontWeight: '900', textAlign: 'center', letterSpacing: -0.5, writingDirection: 'ltr' },
+  rangeTimesRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 18 },
+  rangeTimeBig: { fontSize: 34, fontWeight: '900', letterSpacing: -0.5, writingDirection: 'ltr' },
+  rangeTo: { color: T.textMuted, fontSize: 15, fontWeight: '700' },
   rangeSep: { fontSize: 14, fontWeight: '600', color: T.textMuted },
-  countdownSection: { alignItems: 'center', marginBottom: 14 },
-  countdownLabel: { color: T.textMuted, fontSize: 12.5, marginBottom: 10 },
+  countdownSection: { alignItems: 'center', marginBottom: 6 },
+  countdownLabel: { color: T.textMuted, fontSize: 12.5, fontWeight: '600', marginBottom: 10 },
   cdUnit: { alignItems: 'center', minWidth: 44 },
   cdVal: { fontSize: 34, fontWeight: '900', letterSpacing: -1 },
   cdSub: { color: T.textMuted, fontSize: 11.5, marginTop: -2 },
   cdColon: { fontSize: 30, fontWeight: '900', marginBottom: 8 },
-  progressTrack: { width: '100%', height: 3, backgroundColor: T.elevated, borderRadius: 2, overflow: 'hidden' },
-  progressFill: { height: 3, borderRadius: 2 },
-  afterNextBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 12 },
-  afterNextLabel: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 0.8, marginBottom: 6, textAlign: 'right' },
-  afterNextVal: { fontSize: 14.5, fontWeight: '700', textAlign: 'right' },
-  holdBox: { flexDirection: 'row-reverse', gap: 12, alignItems: 'flex-start', backgroundColor: T.elevated, borderRadius: 14, padding: 14, marginBottom: 12 },
+  progressTrack: { width: '100%', height: 5, backgroundColor: T.elevated, borderRadius: 3, overflow: 'hidden' },
+  progressFill: { height: 5, borderRadius: 3 },
+  progressLabelsRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', width: '100%', marginTop: 6 },
+  progressEdge: { color: T.textMuted, fontSize: 10.5, fontWeight: '700' },
+  afterNextBox: { backgroundColor: T.elevated, borderRadius: 14, padding: 13, marginTop: 10, borderWidth: 1, borderColor: T.border },
+  afterNextHeaderRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 7, marginBottom: 5 },
+  afterNextDot: { width: 8, height: 8, borderRadius: 4 },
+  afterNextLabel: { color: T.textSecondary, fontSize: 12.5, fontWeight: '700' },
+  afterNextVal: { fontSize: 16.5, fontWeight: '800', textAlign: 'right' },
+  footerNote: { color: T.textMuted, fontSize: 11, lineHeight: 17, textAlign: 'center', marginTop: 14 },
+  holdBox: { flexDirection: 'row-reverse', gap: 12, alignItems: 'flex-start', backgroundColor: T.elevated, borderRadius: 16, padding: 14, marginTop: 4 },
   holdTitle: { fontSize: 16, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
-  holdBody: { color: T.textMuted, fontSize: 13, lineHeight: 19, textAlign: 'right' },
-  communityPrioBox: { backgroundColor: '#001a2e', borderRadius: 10, padding: 10, marginTop: 8, borderWidth: 1, borderColor: T.accent + '44' },
+  holdBody: { color: T.textSecondary, fontSize: 13, lineHeight: 19, textAlign: 'right' },
+  communityPrioBox: { backgroundColor: TINT.accentBg, borderRadius: 12, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
   communityPrioText: { color: T.accent, fontSize: 12.5, fontWeight: '600', textAlign: 'right' },
-  crisisAwareChip: { backgroundColor: '#1a0e00', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.warning + '44' },
+  crisisAwareChip: { backgroundColor: TINT.warningBg, borderRadius: 12, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.warning + '44' },
   crisisAwareChipText: { color: T.warning, fontSize: 12.5, fontWeight: '600', textAlign: 'right', lineHeight: 18 },
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TODAY TIMELINE
-// ─────────────────────────────────────────────────────────────────────────────
-function TodayTimeline({ prediction, anchorStartIso }: { prediction: UserPrediction | null; anchorStartIso: string | null }) {
-  const stableStartMapRef = useRef<Record<string, string>>({});
-  const stableEndMapRef = useRef<Record<string, string>>({});
-  const lastOffsetRef = useRef<number | null>(null);
-  const lastResyncRef = useRef<string | null>(null);
-  const currentOffset = prediction?.offsetMinutes ?? 0;
-  const currentResyncIso = prediction?.resyncedAtIso ?? null;
-  if (lastOffsetRef.current !== null && lastOffsetRef.current !== currentOffset) { stableStartMapRef.current = {}; stableEndMapRef.current = {}; }
-  lastOffsetRef.current = currentOffset;
-  const resyncChanged = lastResyncRef.current !== currentResyncIso;
-  if (resyncChanged) { stableStartMapRef.current = {}; stableEndMapRef.current = {}; lastResyncRef.current = currentResyncIso; }
-
-  const slots = prediction?.daySchedule ?? [];
-  const nowMs = serverNowMs();
-  const atcMode = prediction?.atc?.mode;
-  const isPositiveOffsetPending = atcMode === 'POSITIVE_OFFSET_PENDING';
-  // SPEC-FIX (UNCERTAIN_ZONE timeline hold): while the engine is HOLDING the
-  // OFF state (UNCERTAIN_ZONE / WAITING_FOR_GROWATT — the predicted OFF slot
-  // has been consumed but the Growatt sensor has NOT confirmed the ON yet),
-  // the wall clock already sits inside the predicted ON window. The timeline
-  // must NEVER promote that ON slot to "now" — it keeps showing OFF as the
-  // current row for the whole UNCERTAIN_ZONE period and only turns ON when
-  // the sensor actually flips OFF→ON (the engine result then changes and this
-  // flag clears).
-  const holdsOff = (prediction?.isHoldingState ?? false)
-    && prediction?.currentState === 'OFF'
-    && !!atcMode && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING';
-  const activeIdx = (() => {
-    if (holdsOff) return -1; // no wall-clock slot is "current" while holding OFF
-    if (isPositiveOffsetPending && slots.length > 0) return 0;
-    return slots.findIndex(s => { const start = new Date(s.startIso).getTime(); const end = s.endIso ? new Date(s.endIso).getTime() : Infinity; return nowMs >= start && nowMs < end; });
-  })();
-
-  // While holding OFF, keep slots whose window has not fully passed so the
-  // in-window predicted ON slot stays visible as an upcoming (estimated) row.
-  const startIdx = holdsOff
-    ? slots.findIndex(s => { const end = s.endIso ? new Date(s.endIso).getTime() : Infinity; return end > nowMs; })
-    : activeIdx >= 0 ? activeIdx : slots.findIndex(s => new Date(s.startIso).getTime() > nowMs);
-
-  const fmtHoldStart = (iso: string) => new Date(iso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true }).replace('AM', ' ص').replace('PM', ' م');
-  const heldStartIso = prediction?.currentStateStartIso ?? new Date(nowMs).toISOString();
-  const heldOffSlot: ShiftedScheduleSlot | null = holdsOff ? {
-    state: 'OFF',
-    startIso: heldStartIso,
-    endIso: '',
-    startFormatted: fmtHoldStart(heldStartIso),
-    endFormatted: '',
-    shiftedStartFormatted: fmtHoldStart(heldStartIso),
-    shiftedEndFormatted: '',
-    durationLabel: '',
-    zone: 'DAY',
-    isEstimated: false,
-  } : null;
-
-  const baseSlots = startIdx >= 0 ? slots.slice(startIdx, startIdx + 4) : slots.slice(0, 4);
-  const displaySlots = (heldOffSlot ? [heldOffSlot, ...baseSlots] : baseSlots).slice(0, 4);
-  if (displaySlots.length === 0) return null;
-
-  return (
-    <View style={tlStyles.card}>
-      <Text style={tlStyles.title}>جدول اليوم</Text>
-      {displaySlots.map((slot, i) => {
-        const isActive = i === 0 && (activeIdx >= 0 || holdsOff);
-        const isOn = slot.state === 'ON'; const color = isOn ? T.success : T.danger;
-        const slotKey = `${slot.state}|${Math.round(new Date(slot.startIso).getTime() / 60_000)}`;
-        let currentStartF: string;
-        if (isActive && isPositiveOffsetPending && anchorStartIso) {
-          currentStartF = new Date(anchorStartIso).toLocaleString('en-US', { timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true }).replace('AM', ' ص').replace('PM', ' م');
-        } else { currentStartF = slot.shiftedStartFormatted ?? slot.startFormatted; }
-        if (!stableStartMapRef.current[slotKey] && currentStartF) stableStartMapRef.current[slotKey] = currentStartF;
-        const startF = isActive && isPositiveOffsetPending && anchorStartIso ? currentStartF : (stableStartMapRef.current[slotKey] ?? currentStartF);
-        const currentEndF = slot.shiftedEndFormatted ?? slot.endFormatted;
-        if (!stableEndMapRef.current[slotKey] && currentEndF) stableEndMapRef.current[slotKey] = currentEndF;
-        const endF = stableEndMapRef.current[slotKey] ?? currentEndF;
-        const isFuture = !isActive && (holdsOff || new Date(slot.startIso).getTime() > nowMs);
-        return (
-          <View key={i} style={[tlStyles.row, i < displaySlots.length - 1 && tlStyles.rowBorder]}>
-            <View style={tlStyles.timelineCol}>
-              {i < displaySlots.length - 1 && (<View style={[tlStyles.line, { backgroundColor: color + '40' }]} />)}
-              <View style={[tlStyles.dot, { backgroundColor: color, opacity: isFuture && !isActive ? 0.5 : 1 }]} />
-            </View>
-            <View style={[tlStyles.content, isFuture && !isActive && tlStyles.contentFaded]}>
-              <View style={tlStyles.topRow}>
-                {isActive && (<View style={[tlStyles.nowChip, { backgroundColor: color + '20', borderColor: color + '66' }]}><Text style={[tlStyles.nowChipText, { color }]}>الآن</Text></View>)}
-                {isActive && holdsOff && (<View style={tlStyles.pendingChip}><Text style={tlStyles.pendingChipText}>⏳ بانتظار تأكيد الحساس</Text></View>)}
-                {slot.isEstimated && !isActive && (<View style={tlStyles.estChip}><Text style={tlStyles.estChipText}>تقديري</Text></View>)}
-                {slot.isResynced && (<View style={tlStyles.syncChip}><Text style={tlStyles.syncChipText}>👥</Text></View>)}
-                {(slot as any).isGeneratedOn && (<View style={tlStyles.genOnChip}><Text style={tlStyles.genOnChipText}>⚡ مُولّدة</Text></View>)}
-                {(slot as any).isEstimatedPendingOffset && (<View style={tlStyles.pendingChip}><Text style={tlStyles.pendingChipText}>تقديري معلَّق</Text></View>)}
-                <Text style={[tlStyles.stateText, { color }]}>{isOn ? 'الكهرباء شغالة' : 'الكهرباء طافية'}</Text>
-              </View>
-              <Text style={tlStyles.timeText}>{startF}{endF ? ` → ${endF}` : ' → …'}</Text>
-              {slot.durationLabel && (<Text style={[tlStyles.durText, { color: color + 'aa' }]}>{slot.durationLabel}</Text>)}
-            </View>
-          </View>
-        );
-      })}
-    </View>
-  );
-}
-const tlStyles = StyleSheet.create({
-  card: { backgroundColor: T.surface, borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
-  title: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2, marginBottom: 16, textAlign: 'right' },
-  row: { flexDirection: 'row-reverse', gap: 14, paddingBottom: 16, marginBottom: 16 },
-  rowBorder: { borderBottomWidth: 1, borderBottomColor: T.elevated },
-  timelineCol: { width: 16, alignItems: 'center', position: 'relative', paddingTop: 3 },
-  dot: { width: 12, height: 12, borderRadius: 6, zIndex: 1 },
-  line: { position: 'absolute', top: 14, bottom: -16, left: '50%', width: 2, marginLeft: -1 },
-  content: { flex: 1 },
-  contentFaded: { opacity: 0.65 },
-  topRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, marginBottom: 5, flexWrap: 'wrap' },
-  stateText: { fontSize: 17, fontWeight: '800', flex: 1, textAlign: 'right' },
-  nowChip: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
-  nowChipText: { fontSize: 10.5, fontWeight: '800', letterSpacing: 1 },
-  estChip: { backgroundColor: T.elevated, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  estChipText: { color: T.textMuted, fontSize: 10.5, fontStyle: 'italic' },
-  syncChip: { backgroundColor: '#001a2e', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  syncChipText: { fontSize: 11.5 },
-  genOnChip: { backgroundColor: '#052e16', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.success + '44' },
-  genOnChipText: { color: T.success, fontSize: 10.5, fontWeight: '700' },
-  pendingChip: { backgroundColor: '#1a0e00', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: T.warning + '44' },
-  pendingChipText: { color: T.warning, fontSize: 10.5, fontWeight: '700' },
-  timeText: { color: T.textSecondary, fontSize: 14.5, fontWeight: '600', textAlign: 'right', marginBottom: 2 },
-  durText: { fontSize: 12.5, fontWeight: '600', textAlign: 'right' },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1054,11 +1043,11 @@ function CommunityActivity({ pendingAlerts, onViewAll, userId, onReporterPress }
   );
 }
 const caStyles = StyleSheet.create({
-  card: { backgroundColor: T.surface, borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
+  card: { backgroundColor: T.surface, borderRadius: 22, padding: 18, marginBottom: 14, borderWidth: 1, borderColor: T.border },
   header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
   title: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2 },
   openBtn: { color: T.accent, fontSize: 14, fontWeight: '700' },
-  alertBanner: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: '#001a2e', borderRadius: 12, padding: 12, marginBottom: 12, gap: 8, borderWidth: 1, borderColor: T.accent + '44' },
+  alertBanner: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: TINT.accentBg, borderRadius: 12, padding: 12, marginBottom: 12, gap: 8, borderWidth: 1, borderColor: T.accent + '44' },
   alertDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: T.accent },
   alertText: { color: T.textSecondary, fontSize: 13, flex: 1, textAlign: 'right' },
   alertArrow: { color: T.accent, fontWeight: '700' },
@@ -1096,7 +1085,7 @@ function ParticipationNudge({ userId }: { userId?: string }) {
   );
 }
 const pnStyles = StyleSheet.create({
-  banner: { backgroundColor: '#001a2e', borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: T.accent + '44', flexDirection: 'row-reverse', gap: 10 },
+  banner: { backgroundColor: TINT.accentBg, borderRadius: 18, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: T.accent + '44', flexDirection: 'row-reverse', gap: 10 },
   title: { color: T.accent, fontSize: 14.5, fontWeight: '800', textAlign: 'right', marginBottom: 6 },
   body: { color: T.textSecondary, fontSize: 13, lineHeight: 21, textAlign: 'right' },
   dismissBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: T.elevated, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -1116,7 +1105,7 @@ function StabilityBar({ score, label }: { score: number; label: string }) {
   );
 }
 const sbStyles = StyleSheet.create({
-  wrap: { backgroundColor: T.surface, borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: T.border },
+  wrap: { backgroundColor: T.surface, borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: T.border },
   row: { flexDirection: 'row-reverse', justifyContent: 'space-between', marginBottom: 8 },
   label: { color: T.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 0.8 },
   score: { fontSize: 13.5, fontWeight: '700' },
@@ -1382,25 +1371,24 @@ export default function Home() {
         showsVerticalScrollIndicator={false}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={T.accent} />}
       >
-        {/* Header */}
+        {/* Header — title right, actions left */}
         <View style={styles.header}>
+          <View style={styles.headerTitleWrap}>
+            <Text style={styles.headerTitle}>⚡ حالة الكهرباء</Text>
+            <Text style={styles.headerSub}>أهلاً، {displayName} 👋 · {new Date().toLocaleDateString('ar-SA', { weekday: 'long', month: 'long', day: 'numeric' })}</Text>
+          </View>
           <View style={styles.headerBtns}>
-            <TouchableOpacity style={styles.signOutBtn} onPress={() => signOut()} activeOpacity={0.8}>
-              <Text style={styles.signOutIcon}>⏻</Text>
-              <Text style={styles.signOutLabel}>خروج</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.iconBtn} onPress={() => router.push('/(user)/settings')}>
-              <Text style={styles.iconBtnText}>⚙️</Text>
-            </TouchableOpacity>
             {myScore && (
               <View style={styles.reliabilityPill}>
                 <Text style={[styles.reliabilityText, { color: getReliabilityBadge(myScore.reliability_score).color }]}>{myScore.reliability_score}%</Text>
               </View>
             )}
-          </View>
-          <View>
-            <Text style={styles.greeting}>أهلاً، {displayName} 👋</Text>
-            <Text style={styles.date}>{new Date().toLocaleDateString('ar-SA', { weekday: 'long', month: 'long', day: 'numeric' })}</Text>
+            <TouchableOpacity style={styles.iconBtn} onPress={() => router.push('/(user)/settings')}>
+              <Text style={styles.iconBtnText}>⚙️</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.signOutBtn} onPress={() => signOut()} activeOpacity={0.8}>
+              <Text style={styles.signOutIcon}>⏻</Text>
+            </TouchableOpacity>
           </View>
         </View>
 
@@ -1429,7 +1417,6 @@ export default function Home() {
         <PersonalStatusCard prediction={stablePrediction} anchorStartIso={anchorStartIso} onRevertToGrowatt={handleRevert} hasSnapshot={hasSnapshot} reasoningLine={stablePrediction?.reasoning?.[0] ?? undefined} />
         <UpcomingTransitionCard prediction={stablePrediction} />
         {stablePrediction && (<StabilityBar score={stablePrediction.stabilityScore} label={stablePrediction.stabilityLabel} />)}
-        <TodayTimeline prediction={stablePrediction} anchorStartIso={anchorStartIso} />
         <CommunityActivity pendingAlerts={pendingCount} onViewAll={() => router.push('/(user)/community')} userId={profile?.id} onReporterPress={(rid) => router.push(`/(user)/reporter/${rid}` as any)} />
       </ScrollView>
     </View>
@@ -1439,21 +1426,21 @@ export default function Home() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: T.bg },
   content: { paddingHorizontal: 16 },
-  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 },
-  greeting: { color: T.textPrimary, fontSize: 20, fontWeight: '800', textAlign: 'right' },
-  date: { color: T.textMuted, fontSize: 12, marginTop: 2, textAlign: 'right' },
-  headerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  header: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18, gap: 10 },
+  headerTitleWrap: { flex: 1 },
+  headerTitle: { color: T.textPrimary, fontSize: 22, fontWeight: '900', textAlign: 'right' },
+  headerSub: { color: T.textMuted, fontSize: 12, marginTop: 4, textAlign: 'right' },
+  headerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: 2 },
   reliabilityPill: { backgroundColor: T.elevated, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.border },
   reliabilityText: { fontSize: 12, fontWeight: '800' },
   iconBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: T.surface, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: T.border },
   iconBtnText: { fontSize: 18 },
-  signOutBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#1a0505', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: '#ef444430' },
-  signOutIcon: { fontSize: 14 },
-  signOutLabel: { color: '#ef4444', fontSize: 12, fontWeight: '700' },
-  crisisBanner: { backgroundColor: '#1a0e00', borderRadius: 14, padding: 14, marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, borderWidth: 1.5, borderColor: '#92400e' },
+  signOutBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: TINT.dangerBg, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: T.danger + '30' },
+  signOutIcon: { fontSize: 14, color: T.danger },
+  crisisBanner: { backgroundColor: TINT.warningBg, borderRadius: 16, padding: 14, marginBottom: 14, flexDirection: 'row-reverse', alignItems: 'flex-start', gap: 12, borderWidth: 1.5, borderColor: '#92400e' },
   crisisIconWrap: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#451a03', alignItems: 'center', justifyContent: 'center' },
-  crisisTitle: { color: '#f59e0b', fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
+  crisisTitle: { color: T.warning, fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 4, textAlign: 'right' },
   crisisBody: { color: '#fbbf24', fontSize: 12, lineHeight: 19, textAlign: 'right' },
-  historyDiagBadge: { backgroundColor: '#0c1a2e', borderRadius: 10, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.accent + '55' },
+  historyDiagBadge: { backgroundColor: TINT.accentBg, borderRadius: 12, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.accent + '55' },
   historyDiagText: { color: T.accent, fontSize: 11, fontWeight: '600', textAlign: 'right', lineHeight: 16 },
 });
