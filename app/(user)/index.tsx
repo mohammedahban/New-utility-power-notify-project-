@@ -101,7 +101,7 @@ function GrowattOnToast({ visible, onDismiss }: { visible: boolean; onDismiss: (
   if (!visible) return null;
   return (
     <Animated.View style={[gtStyles.toast, { opacity }]}>
-      <Text style={gtStyles.text}>⚡ Growatt تحوّل إلى تشغيل — تم تحديث جدولك</Text>
+      <Text style={gtStyles.text}>⚡ الحساس تحوّل إلى تشغيل — تم تحديث جدولك</Text>
     </Animated.View>
   );
 }
@@ -388,7 +388,7 @@ function PositiveOffsetPendingBanner({ prediction }: { prediction: UserPredictio
           <View style={[popStyles.progressFill, { width: `${Math.round(progressPct * 100)}%` }]} />
         </View>
         <View style={popStyles.progressLabels}>
-          <Text style={popStyles.progressLabelRight}>تحويل Growatt</Text>
+          <Text style={popStyles.progressLabelRight}>تحويل الحساس الرئيسي </Text>
           <Text style={popStyles.progressPct}>{Math.round(progressPct * 100)}%</Text>
           <Text style={popStyles.progressLabelLeft}>وقتك المجدول</Text>
         </View>
