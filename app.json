@@ -22,8 +22,28 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "permissions": ["ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"],
-      "usesCleartextTraffic": true
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ],
+      "usesCleartextTraffic": true,
+      "blockedPermissions": [
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR",
+        "android.permission.READ_CONTACTS",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "com.android.vending.CHECK_LICENSE"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -48,7 +68,9 @@
         {
           "icon": "./assets/images/logo.png",
           "color": "#22c55e",
-          "sounds": ["./assets/sounds/alarm.wav"],
+          "sounds": [
+            "./assets/sounds/alarm.wav"
+          ],
           "androidMode": "default",
           "androidCollapsedTitle": "متى تلصي؟عدن"
         }
