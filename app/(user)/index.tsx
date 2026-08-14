@@ -296,7 +296,7 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
     if (ms > 0) {
       const h = Math.floor(ms / 3600000); const m = Math.floor((ms % 3600000) / 60000); const s = Math.floor((ms % 60000) / 1000);
       countdownLabel = `≈ ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    } else { countdownLabel = 'الآن — بانتظار Growatt'; }
+    } else { countdownLabel = 'الآن — بانتظار تقريرك او تقرير احد المتابعين '; }
   }
   return (
     <View style={pn2Styles.banner}>
@@ -464,7 +464,7 @@ function PendingDSDChip({ pendingDSD, onCancel }: { pendingDSD: PendingDSDCandid
       <View style={{ flex: 1 }}>
         <Text style={pdcStyles.title}>⏳ معايرة DSD بانتظار Growatt</Text>
         <Text style={pdcStyles.body}>بلاغ {eventLabel} · فارق مؤقت: {tentative}د · منذ {ageMin} دقيقة</Text>
-        <Text style={pdcStyles.sub}>سيتم تأكيد الفارق تلقائياً عند وصول إشارة Growatt</Text>
+        <Text style={pdcStyles.sub}>سيتم تأكيد الفارق تلقائياً عند وصول إشارة الحساس الرئيسي </Text>
       </View>
       <View style={pdcStyles.dot} />
     </View>
@@ -609,7 +609,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
       {RevertConfirmBanner}
       <TouchableOpacity style={psStyles.revertBtn} onPress={handleRevertPress} activeOpacity={0.75}>
         <Text style={psStyles.revertIcon}>↩</Text>
-        <Text style={psStyles.revertLabel}>{hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt'}</Text>
+        <Text style={psStyles.revertLabel}>{hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى الحساس الرئيسي '}</Text>
       </TouchableOpacity>
     </>
   ) : null;
@@ -716,7 +716,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
             {isUncertain && tMode === 'MANUAL' && (
               <Text style={[psStyles.atcBodyLine, { color: cfg.textColor + 'aa' }]}>وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة</Text>
             )}
-            <Text style={psStyles.atcSubLine}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن</Text>
+            <Text style={psStyles.atcSubLine}> 👥 بلاغات المجتمع ذات أولوية مرتفعة,في اي لحظة سوف تستغل الكهرباء لذلك قدم تقرير أثناء حدوث ذلك </Text>
           </View>
         );
       })()}
@@ -1333,18 +1333,18 @@ export default function Home() {
       }
       try { await AsyncStorage.removeItem('tmms_uncertain_zone_entry_iso'); } catch (_) {}
       await clearResync();
-      if (Platform.OS !== 'web') { Alert.alert('تمت العملية', 'تم إلغاء المزامنة المجتمعية والعودة إلى جدول Growatt.'); }
-    } catch (error) { console.error('خطأ أثناء العودة إلى جدول Growatt:', error); }
+      if (Platform.OS !== 'web') { Alert.alert('تمت العملية', 'تم إلغاء المزامنة المجتمعية والعودة إلى جدول الحساس الرئيسي .'); }
+    } catch (error) { console.error('خطأ أثناء العودة إلى جدول الحساس الرئيسي :', error); }
   }, [saveOffset, clearResync, user?.id, profile?.id, resyncPoint?.syncedAtIso]);
 
   const handleRevert = useCallback(() => {
     const confirmMsg = hasSnapshot
       ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك وفارق التوقيت (Offset) السابق تماماً.'
-      : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
+      : 'هل تريد العودة إلى جدول الحساس الرئيسي ؟ سيتم إلغاء المزامنة المجتمعية الحالية.';
     const doRestore = hasSnapshot ? handleRestoreSnapshot : handleRevertToGrowatt;
     if (Platform.OS === 'web') { doRestore(); } else {
       Alert.alert(
-        hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى Growatt',
+        hasSnapshot ? 'العودة إلى الحالة الأصلية' : 'العودة إلى الحساس الرئيسي ',
         confirmMsg,
         [{ text: 'إلغاء', style: 'cancel' }, { text: 'تأكيد العودة والاستعادة', style: 'destructive', onPress: () => doRestore() }],
       );
@@ -1409,10 +1409,7 @@ export default function Home() {
           return (<View style={styles.historyDiagBadge}><Text style={styles.historyDiagText}>🛡️ تم تجاهل {filtered} صفّاً ملوّثاً من سجلّ الدقّة لمحرك التوقّع</Text></View>);
         })()}
 
-        // <ParticipationNudge userId={profile?.id} />
-        // <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
-        // <GeneratedOnBanner prediction={stablePrediction} />
-        // <PendingNegativeBanner prediction={stablePrediction} />
+        <ParticipationNudge userId={profile?.id} />
         <PositiveOffsetPendingBanner prediction={stablePrediction} />
         <ValidationWindowToast prediction={stablePrediction} />
         <PersonalStatusCard prediction={stablePrediction} anchorStartIso={anchorStartIso} onRevertToGrowatt={handleRevert} hasSnapshot={hasSnapshot} reasoningLine={stablePrediction?.reasoning?.[0] ?? undefined} />
