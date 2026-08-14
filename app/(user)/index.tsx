@@ -1410,7 +1410,7 @@ export default function Home() {
 
         <ParticipationNudge userId={profile?.id} />
         <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
-        <GeneratedOnBanner prediction={stablePrediction} />
+        // <GeneratedOnBanner prediction={stablePrediction} />
         <PendingNegativeBanner prediction={stablePrediction} />
         <PositiveOffsetPendingBanner prediction={stablePrediction} />
         <ValidationWindowToast prediction={stablePrediction} />
