@@ -334,7 +334,7 @@ function OffsetStateChip({ prediction }: { prediction: UserPrediction | null }) 
   const stateColor: Record<string, string> = { POSITIVE: T.success, NEGATIVE: T.warning, NEUTRAL: T.textMuted, PENDING_NEGATIVE: T.warning };
   const color = stateColor[state] ?? T.textMuted;
   const label = stateLabelAr[state] ?? state;
-  const valueLabel = value === 'PENDING' || state === 'PENDING_NEGATIVE' ? 'بانتظار Growatt' : (typeof value === 'number' ? `${value > 0 ? '+' : ''}${value}د` : '');
+  const valueLabel = value === 'PENDING' || state === 'PENDING_NEGATIVE' ? 'بانتظار الحساس الرئيسي ' : (typeof value === 'number' ? `${value > 0 ? '+' : ''}${value}د` : '');
   return (
     <View style={[osStyles.chip, { borderColor: color + '55', backgroundColor: color + '12' }]}>
       <Text style={[osStyles.label, { color }]}>{label}</Text>
@@ -532,7 +532,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
     if (Platform.OS === 'web') { setRevertConfirmVisible(true); } else { onRevertToGrowatt?.(); }
   }, [onRevertToGrowatt]);
 
-  const isUncertain = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT';
+  const isUncertain = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'الانتظار للحساس الرئيسي ';
   const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
   const overrunLiveClock = useOverrunLiveClock(overrunMin, isUncertain);
 
