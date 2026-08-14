@@ -290,7 +290,7 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
     return () => clearInterval(id);
   }, [isPending]);
   if (!isPending) return null;
-  let countdownLabel = 'بانتظار تحوّل Growatt القادم';
+  let countdownLabel = 'بانتظار تحوّل الحساس الرئيسي القادم';
   if (resolutionIso) {
     const ms = new Date(resolutionIso).getTime() - serverNowMs();
     if (ms > 0) {
@@ -303,7 +303,7 @@ function PendingNegativeBanner({ prediction }: { prediction: UserPrediction | nu
       <View style={pn2Styles.iconWrap}><Text style={{ fontSize: 22 }}>⏳</Text></View>
       <View style={{ flex: 1 }}>
         <Text style={pn2Styles.title}>فارق معلَّق (Pending Negative)</Text>
-        <Text style={pn2Styles.body}>بلاغك أو بلاغ المُبلِّغ وصل في النصف الثاني من فترة الانطفاء المتوقّعة. الفارق الزمني سيُحسب تلقائياً بمجرد أن يتحوّل Growatt إلى تشغيل.</Text>
+        <Text style={pn2Styles.body}>بلاغك أو بلاغ المُبلِّغ وصل في النصف الثاني من فترة الانطفاء المتوقّعة. الفارق الزمني سيُحسب تلقائياً بمجرد أن يتحوّل الحساس الرئيسي إلى تشغيل.</Text>
         <View style={pn2Styles.countdownRow}>
           <Text style={pn2Styles.countdownLabel}>توقّع الحل:</Text>
           <Text style={pn2Styles.countdownValue}>{countdownLabel}</Text>
