@@ -462,7 +462,7 @@ function PendingDSDChip({ pendingDSD, onCancel }: { pendingDSD: PendingDSDCandid
         <Text style={pdcStyles.cancelText}>✕</Text>
       </TouchableOpacity>
       <View style={{ flex: 1 }}>
-        <Text style={pdcStyles.title}>⏳ معايرة DSD بانتظار Growatt</Text>
+        <Text style={pdcStyles.title}>⏳ معايرة DSD بانتظار الحساس الرئيسي </Text>
         <Text style={pdcStyles.body}>بلاغ {eventLabel} · فارق مؤقت: {tentative}د · منذ {ageMin} دقيقة</Text>
         <Text style={pdcStyles.sub}>سيتم تأكيد الفارق تلقائياً عند وصول إشارة الحساس الرئيسي </Text>
       </View>
@@ -560,7 +560,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
 
   const RevertConfirmBanner = revertConfirmVisible ? (
     <View style={psStyles.revertConfirmBox}>
-      <Text style={psStyles.revertConfirmText}>{hasSnapshot ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.' : 'هل تريد العودة إلى جدول Growatt؟ سيتم إلغاء المزامنة المجتمعية الحالية.'}</Text>
+      <Text style={psStyles.revertConfirmText}>{hasSnapshot ? 'هل تريد العودة إلى الحالة الأصلية قبل هذا البلاغ؟ سيتم استعادة جدولك السابق تماماً.' : 'هل تريد العودة إلى جدول الحساس الرئيسي ؟ سيتم إلغاء المزامنة المجتمعية الحالية.'}</Text>
       <View style={psStyles.revertConfirmBtns}>
         <TouchableOpacity style={[psStyles.revertConfirmBtn, psStyles.revertConfirmBtnCancel]} onPress={() => setRevertConfirmVisible(false)} activeOpacity={0.8}>
           <Text style={psStyles.revertConfirmBtnCancelText}>إلغاء</Text>
