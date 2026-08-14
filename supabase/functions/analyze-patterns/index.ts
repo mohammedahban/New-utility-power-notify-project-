@@ -1041,11 +1041,27 @@ Deno.serve(async (req) => {
       .eq("id", 1)
       .maybeSingle();
 
-    const currentState: "ON" | "OFF" = invState?.utility_on ? "ON" : "OFF";
+    // STALE-STATE FIX: when poll-growatt triggers this function it passes the
+    // just-detected transition ({trigger:"poll-growatt", eventType, occurredAt})
+    // in the POST body. That event is FIRST-HAND and newer than anything in
+    // inverter_state — trust it as the authoritative current state. This makes
+    // the analysis immune to any read/upsert ordering race; cron and manual
+    // invocations carry no eventType and fall back to inverter_state as before.
+    let bodyEventType: string | null = null;
+    try {
+      const body = await req.json();
+      if (body && (body.eventType === "UTILITY_ON" || body.eventType === "UTILITY_OFF")) {
+        bodyEventType = body.eventType;
+      }
+    } catch (_) { /* empty/invalid body — cron & manual calls */ }
+
+    const currentState: "ON" | "OFF" = bodyEventType !== null
+      ? (bodyEventType === "UTILITY_ON" ? "ON" : "OFF")
+      : (invState?.utility_on ? "ON" : "OFF");
     const lastTransitionAt = invState?.last_polled ?? null;
     const inverterOffline = invState?.inverter_offline ?? false;
 
-    console.log(`[analyze-patterns] Current state: ${currentState}, offline: ${inverterOffline}`);
+    console.log(`[analyze-patterns] Current state: ${currentState} (source: ${bodyEventType !== null ? "poll-growatt event" : "inverter_state"}), offline: ${inverterOffline}`);
 
     // ── 2. Load power events (analysis window) ────────────────────────────────
     const windowStart = new Date(nowMs - windowMs).toISOString();

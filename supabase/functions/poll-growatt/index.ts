@@ -118,6 +118,21 @@ Deno.serve(async (req) => {
       status_text: statusText,
     });
 
+    // STALE-STATE FIX: publish the NEW state to inverter_state BEFORE
+    // triggering analyze-patterns below. analyze-patterns derives
+    // currentState from inverter_state.utility_on, and the full upsert at
+    // the end of this handler runs only AFTER the (awaited) analyze call —
+    // without this early upsert every event-triggered analysis computed the
+    // PRE-transition state and users only saw the flip at the next 15-min
+    // cron run. This early write is idempotent: the final upsert below
+    // rewrites the same state plus the fresh power readings.
+    await supabase.from("inverter_state").upsert({
+      id: 1,
+      utility_on: utilityIsOn,
+      inverter_offline: false,
+      last_polled: now,
+    });
+
     // ── Send push to admin tokens ───────────────────────────────────────────
     // Primary: tokens flagged is_admin=true
     // Fallback: look up all user_ids with role='admin' in user_profiles,
