@@ -716,7 +716,7 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
             {isUncertain && tMode === 'MANUAL' && (
               <Text style={[psStyles.atcBodyLine, { color: cfg.textColor + 'aa' }]}>وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة</Text>
             )}
-            <Text style={psStyles.atcSubLine}> 👥 بلاغات المجتمع ذات أولوية مرتفعة,في اي لحظة سوف تستغل الكهرباء لذلك قدم تقرير أثناء حدوث ذلك </Text>
+            <Text style={psStyles.atcSubLine}> 👥 بلاغات المجتمع ذات أولوية مرتفعة,في اي لحظة سوف تشتغل الكهرباء لذلك قدم تقرير أثناء حدوث ذلك </Text>
           </View>
         );
       })()}
