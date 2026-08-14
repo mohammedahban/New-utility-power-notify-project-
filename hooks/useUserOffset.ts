@@ -85,6 +85,21 @@ export function effectiveOffsetFromRow(row: any): {
   };
 }
 
+/**
+ * Normalize a raw user_offsets row so `offset_minutes` ALWAYS carries the
+ * effective numeric offset. The raw column is only a 0 placeholder for
+ * PENDING_NEGATIVE rows, and a legacy/buggy writer can leave it at 0 while
+ * offset_state/offset_value hold the real semantics (e.g. POSITIVE/"48").
+ * Every consumer (engine provider, Home offsetMs, Schedule, History) reads
+ * `offset.offset_minutes` directly, so the row is normalized once here at
+ * the single entry point instead of patching each reader.
+ */
+function normalizeOffsetRow<T extends any>(row: T): T {
+  if (!row) return row;
+  const eff = effectiveOffsetFromRow(row);
+  return { ...(row as any), offset_minutes: eff.minutes };
+}
+
 export function useUserOffset() {
   const { user } = useAuth();
   const [offset, setOffset] = useState<OffsetRow | null>(null);
@@ -99,7 +114,7 @@ export function useUserOffset() {
       .select('*')
       .eq('user_id', user.id)
       .maybeSingle();
-    if (data) setOffset(data);
+    if (data) setOffset(normalizeOffsetRow(data));
     setLoading(false);
   }, [user]);
 
@@ -128,7 +143,7 @@ export function useUserOffset() {
           if (payload.eventType === 'DELETE') {
             setOffset(null);
           } else if (payload.new) {
-            setOffset(payload.new as OffsetRow);
+            setOffset(normalizeOffsetRow(payload.new as OffsetRow));
           }
         },
       )
@@ -171,7 +186,7 @@ export function useUserOffset() {
       .upsert(upsertData, { onConflict: 'user_id' })
       .select()
       .single();
-    if (data) setOffset(data);
+    if (data) setOffset(normalizeOffsetRow(data));
   }, [user]);
 
   const clearOffset = useCallback(async () => {

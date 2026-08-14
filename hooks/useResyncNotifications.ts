@@ -719,9 +719,24 @@ export function useResyncNotifications() {
     // The numeric offset_minutes is 0 when the state is PENDING_NEGATIVE
     // — the actual numeric value will be filled in later by the backend
     // resolve-pending trigger when Growatt turns ON.
-    const numericOffsetForUserRow = typeof clonedOffsetValue === 'number'
+    //
+    // BUG-FIX (cloned offset lost): reporter_offset_value is a TEXT column
+    // on utility_reports, so PostgREST hands it to us as a STRING ("48"),
+    // not a number. The old `typeof === 'number'` guard therefore fell
+    // through to 0 for EVERY real clone — the follower stored
+    // offset_minutes: 0 while offset_state/offset_value said POSITIVE/"48",
+    // and the next cycle ran on offset 0 instead of the cloned offset.
+    // Parse robustly: accept numbers AND numeric strings; only a genuine
+    // PENDING (or unparseable legacy value) keeps the 0 placeholder.
+    const parsedClonedOffset = typeof clonedOffsetValue === 'number'
       ? clonedOffsetValue
-      : 0; // PENDING → 0 placeholder, replaced on resolution
+      : Number(clonedOffsetValue);
+    const isPendingClone =
+      clonedOffsetState === 'PENDING_NEGATIVE' || clonedOffsetValue === 'PENDING';
+    const numericOffsetForUserRow =
+      !isPendingClone && Number.isFinite(parsedClonedOffset)
+        ? parsedClonedOffset
+        : 0; // PENDING → 0 placeholder, replaced on resolution
     await supabase
       .from('user_offsets')
       .upsert({

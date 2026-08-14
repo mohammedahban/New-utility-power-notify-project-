@@ -752,9 +752,17 @@ export function useUserPredictions(
             inheritsReferenceLifecycle: data.generated_on_reference_kind === 'active',
           };
         }
+        // resync_history.offset_value is a TEXT column → PostgREST returns
+        // "48" as a string. Normalize to a real number so offset chips/labels
+        // and any downstream arithmetic see the actual cloned value.
+        const rawOffsetValue = data.offset_value ?? null;
+        const parsedOffsetValue: OffsetValue | null =
+          rawOffsetValue == null ? null
+          : rawOffsetValue === 'PENDING' ? 'PENDING'
+          : (Number.isFinite(Number(rawOffsetValue)) ? Number(rawOffsetValue) : null);
         setV21Meta({
           offsetState: (data.offset_state as OffsetState) ?? null,
-          offsetValue: (data.offset_value as OffsetValue) ?? null,
+          offsetValue: parsedOffsetValue,
           timelineAlignment: data.timeline_alignment ?? null,
           generatedOn: genOn,
         });

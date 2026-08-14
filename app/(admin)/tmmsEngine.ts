@@ -1089,7 +1089,16 @@ export function applyOffsetToPrediction(
   // recomputing it from the raw schedule raced with the report-time
   // user_offsets write. PENDING_NEGATIVE is also skipped (no offset may be
   // computed until Growatt ON resolves it — spec Part 1).
-  const hasAuthoritativeOffset = typeof resyncPoint?.offsetValue === 'number';
+  // BUG-FIX (cloned offset lost): offsetValue crosses PostgREST/AsyncStorage
+  // as a TEXT string ("48") — `typeof === 'number'` rejected every cloned
+  // offset, so the engine ignored the FINAL clone value and recomputed a
+  // legacy Q2-A offset instead. Numeric strings are authoritative too.
+  const authoritativeOffsetParsed = typeof resyncPoint?.offsetValue === 'number'
+    ? resyncPoint.offsetValue
+    : (resyncPoint?.offsetValue != null && resyncPoint.offsetValue !== 'PENDING'
+        ? Number(resyncPoint.offsetValue)
+        : NaN);
+  const hasAuthoritativeOffset = Number.isFinite(authoritativeOffsetParsed);
   const isPendingResync = resyncPoint?.offsetState === 'PENDING_NEGATIVE' ||
     resyncPoint?.offsetValue === 'PENDING';
   if (resyncPoint && frozenCommunityOffset === null && onOffsetCalculated &&
@@ -1268,7 +1277,13 @@ export function computeCommunityOffset(
 ): number {
   if (frozenOffset !== null) return frozenOffset;
   if (resyncPoint?.offsetValue !== undefined && resyncPoint.offsetValue !== null) {
-    return typeof resyncPoint.offsetValue === 'string' ? 0 : resyncPoint.offsetValue;
+    // BUG-FIX (cloned offset lost): offsetValue arrives as a TEXT string
+    // ("48") from PostgREST/AsyncStorage — the old code returned 0 for ANY
+    // string, silently dropping every cloned offset. Parse numeric strings;
+    // only 'PENDING'/unparseable values fall back to 0.
+    if (typeof resyncPoint.offsetValue === 'number') return resyncPoint.offsetValue;
+    const parsed = Number(resyncPoint.offsetValue);
+    return Number.isFinite(parsed) ? parsed : 0;
   }
   return fallbackOffset;
 }
