@@ -263,7 +263,7 @@ export const AR = {
   yourBlockIs: 'حيّك يتأخر',
   beforeMain: 'قبل',
   afterMain: 'بعد',
-  readingsAdjusted: 'قراءات Growatt الرئيسية.\nكل التوقعات معدّلة الآن لموقعك.',
+  readingsAdjusted: 'قراءات الحساس الرئيسية.\nكل التوقعات معدّلة الآن لموقعك.',
   communityImpactWeek: 'تأثير المجتمع هذا الأسبوع',
   scheduleAdjustments: 'تعديلات الجدول',
   avgDelta: 'متوسط الفرق',
@@ -329,7 +329,7 @@ export const AR = {
 
   // ── Admin panel ───────────────────────────────────────────────────────────
   adminPanel: 'لوحة الإدارة',
-  growattMonitor: 'مراقب Growatt',
+  growattMonitor: 'مراقب الحساس الرئيسي ',
   growattSub: 'KHM8EYS0SC · اليمن',
   adminBadge: '⚙️ مشرف',
   solarBattery: '☀️  طاقة شمسية + بطارية BYD',
@@ -479,7 +479,7 @@ export const AR = {
 
   // ── Conflicts screen ──────────────────────────────────────────────────────
   conflictsTitle: 'التعارضات المجتمعية',
-  growattSensor: 'مستشعر Growatt',
+  growattSensor: 'مستشعر الحساس الرئيسي ',
   communityReport: 'بلاغ المجتمع',
   adminNotes: 'ملاحظات المشرف',
   addNotes: 'أضف ملاحظاتك حول هذا التعارض (اختياري)…',
@@ -490,7 +490,7 @@ export const AR = {
   conflictHash: 'تعارض #',
   reviewed: '✓ تمت المراجعة',
   pending: '⚠ معلّق',
-  growattLabel: 'GROWATT',
+  growattLabel: 'الحساس الرئيسي ',
   reportedLabel: 'المُبلَّغ',
   reporterLabel: 'المُبلِّغ',
   timeLabel: 'الوقت',
@@ -498,7 +498,7 @@ export const AR = {
   reviewConflict: 'مراجعة هذا التعارض',
   noPendingConflicts: 'لا توجد تعارضات معلّقة',
   noConflictsFound: 'لا توجد تعارضات',
-  allInAgreement: 'جميع البلاغات متوافقة مع بيانات مستشعر Growatt.',
+  allInAgreement: 'جميع البلاغات متوافقة مع بيانات مستشعر الحساس الرئيسي .',
   dataConsistent: 'البلاغات وبيانات المستشعر كانت متسقة.',
   loadingConflicts: 'جارٍ تحميل التعارضات…',
   reviewConflictTitle: 'مراجعة التعارض',
