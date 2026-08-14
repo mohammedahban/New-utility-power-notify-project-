@@ -84,6 +84,7 @@ function useElapsedFromIso(startIso: string | null): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GROWATT ON TOAST — 3-second auto-dismiss
+// <GeneratedOnBanner prediction={stablePrediction} />
 // Shown when a UTILITY_ON power_event arrives while user is in
 // UNCERTAIN_ZONE / WAITING_FOR_GROWATT with a negative offset.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1408,10 +1409,10 @@ export default function Home() {
           return (<View style={styles.historyDiagBadge}><Text style={styles.historyDiagText}>🛡️ تم تجاهل {filtered} صفّاً ملوّثاً من سجلّ الدقّة لمحرك التوقّع</Text></View>);
         })()}
 
-        <ParticipationNudge userId={profile?.id} />
-        <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
+        // <ParticipationNudge userId={profile?.id} />
+        // <PendingDSDChip pendingDSD={pendingDSD} onCancel={clearPendingDSD} />
         // <GeneratedOnBanner prediction={stablePrediction} />
-        <PendingNegativeBanner prediction={stablePrediction} />
+        // <PendingNegativeBanner prediction={stablePrediction} />
         <PositiveOffsetPendingBanner prediction={stablePrediction} />
         <ValidationWindowToast prediction={stablePrediction} />
         <PersonalStatusCard prediction={stablePrediction} anchorStartIso={anchorStartIso} onRevertToGrowatt={handleRevert} hasSnapshot={hasSnapshot} reasoningLine={stablePrediction?.reasoning?.[0] ?? undefined} />
