@@ -372,8 +372,6 @@ export default function UserSettings() {
             </View>
           </View>
           <View style={[styles.aboutRow, { borderBottomWidth: 0, marginTop: 4 }]}>
-            <Text style={styles.aboutValue}>Growatt · KHM8EYS0SC</Text>
-            <Text style={styles.aboutLabel}>مصدر البيانات</Text>
           </View>
         </View>
 
