@@ -42,14 +42,6 @@ function translateCrisisReason(reason: string): string {
   return r;
 }
 
-function fmtOverrunAr(min: number): string {
-  if (min < 60) return `${min} دقيقة`;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  const hLabel = h === 1 ? 'ساعة' : h === 2 ? 'ساعتين' : `${h} ساعات`;
-  return m === 0 ? hLabel : `${hLabel} و ${m} دقيقة`;
-}
-
 // ── Header mode pill (purely presentational map of the engine's atc mode) ───
 const MODE_PILL: Record<string, { label: string; color: string }> = {
   NORMAL: { label: 'الوضع الآن — مؤكد', color: T.success },
@@ -115,43 +107,6 @@ const gtStyles = StyleSheet.create({
   },
   text: { color: T.success, fontSize: 14, fontWeight: '800', textAlign: 'center' },
 });
-
-// ── Live overrun seconds clock ──────────────────────────────────────────────
-// Ticks every second to show exact HH:MM:SS elapsed since the predicted OFF
-// ended. Anchors the entry timestamp from `overrunMinutes` on first render
-// (when uncertain state begins) so subsequent 30s heartbeat re-derivations
-// of overrunMinutes don't reset or drift the clock.
-function useOverrunLiveClock(overrunMinutes: number, isUncertain: boolean): string {
-  const entryMsRef = useRef<number | null>(null);
-  const [display, setDisplay] = useState('00:00:00');
-  useEffect(() => {
-    if (!isUncertain || overrunMinutes <= 0) {
-      entryMsRef.current = null;
-      setDisplay('00:00:00');
-      return;
-    }
-    // Anchor on first activation — derive from overrunMinutes once
-    if (entryMsRef.current === null) {
-      entryMsRef.current = serverNowMs() - overrunMinutes * 60_000;
-    }
-    const update = () => {
-      const elapsed = Math.max(0, serverNowMs() - entryMsRef.current!);
-      const totalSec = Math.floor(elapsed / 1000);
-      const h = Math.floor(totalSec / 3600);
-      const m = Math.floor((totalSec % 3600) / 60);
-      const s = totalSec % 60;
-      setDisplay(
-        `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`,
-      );
-    };
-    update();
-    const id = setInterval(update, 1000);
-    return () => clearInterval(id);
-  // Only re-anchor when the uncertain state flips or overrunMinutes crosses zero
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isUncertain, overrunMinutes > 0]);
-  return display;
-}
 
 // ── Countdown hook ────────────────────────────────────────────────────────────
 // SPEC-FIX C1: anchor the countdown on the absolute target ISO instead of a
@@ -481,6 +436,176 @@ const pdcStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RANGE WATCH CARD — the ONE waiting card (replaces all legacy wait cards)
+// ─────────────────────────────────────────────────────────────────────────────
+// A single card rendered below the "منذ" block for EVERY account type
+// (positive / negative / neutral / pending-negative), in two phases:
+//
+//   • EARLY CHANCE (amber) — the 20 minutes BEFORE the predicted range
+//     starts. Electricity occasionally arrives EARLIER than the predicted
+//     range, so the user is prepared and primed to report instantly.
+//   • ACTIVE WAIT (green for an expected ON, red for an expected OFF) — from
+//     the range start until the transition is confirmed, however long that
+//     takes (UNCERTAIN_ZONE / WAITING_FOR_GROWATT / GRACE_MODE included),
+//     with a live count-up of the waiting time.
+//
+// Hidden in COMMUNITY_SYNCED (has its own sync banner) and
+// POSITIVE_OFFSET_PENDING (has its own scheduled-change countdown banner).
+// ─────────────────────────────────────────────────────────────────────────────
+const RANGE_EARLY_MIN = 20;
+
+// Live count-up clock (ticks every second) anchored at an absolute instant.
+function useWaitClockSec(anchorMs: number | null): { h: number; m: number; s: number } {
+  const [nowMs, setNowMs] = useState(() => serverNowMs());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(serverNowMs()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const total = anchorMs === null ? 0 : Math.max(0, Math.floor((nowMs - anchorMs) / 1000));
+  return { h: Math.floor(total / 3600), m: Math.floor((total % 3600) / 60), s: total % 60 };
+}
+
+function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
+  const atcMode = prediction?.atc?.mode ?? 'NORMAL';
+  const nt = prediction?.nextTransition ?? null;
+  const overrunMin = Math.max(0, Math.ceil(prediction?.atc?.overrunMinutes ?? 0));
+  const rangeStartIso = nt?.rangeStartIso ?? null;
+  // Ticks every second — when it hits 0 the card flips from the early-chance
+  // phase to the active-wait phase live, without waiting for a server refresh.
+  const cd = useCountdownSec(rangeStartIso);
+
+  // Soft pulse for the early-chance badge dot.
+  const pulseAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(pulseAnim, { toValue: 1, duration: 900, useNativeDriver: false }),
+      Animated.timing(pulseAnim, { toValue: 0, duration: 900, useNativeDriver: false }),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, [pulseAnim]);
+  const pulseOpacity = pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.45, 1] });
+
+  // Hold modes: the engine deliberately keeps a stale "next transition", so
+  // the wait start is derived from overrunMinutes (minutes past the expected
+  // transition) instead of the untrustworthy range start.
+  const inHoldWait = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT' || atcMode === 'GRACE_MODE';
+  const rangeStartMs = rangeStartIso ? new Date(rangeStartIso).getTime() : NaN;
+
+  let phase: 'early' | 'active' | null = null;
+  let awaitingOn = true;
+  let rawAnchorMs: number | null = null;
+  if (prediction && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING') {
+    if (inHoldWait) {
+      phase = 'active';
+      awaitingOn = prediction.currentState !== 'ON';
+      rawAnchorMs = overrunMin > 0
+        ? serverNowMs() - overrunMin * 60_000
+        : (Number.isFinite(rangeStartMs) && rangeStartMs <= serverNowMs() ? rangeStartMs : serverNowMs());
+    } else if (Number.isFinite(rangeStartMs)) {
+      awaitingOn = nt?.type === 'UTILITY_ON';
+      if (cd.total <= 0 && serverNowMs() >= rangeStartMs) { phase = 'active'; rawAnchorMs = rangeStartMs; }
+      else if (cd.total > 0 && cd.total <= RANGE_EARLY_MIN * 60) { phase = 'early'; }
+    }
+  }
+
+  // Anchor the count-up ONCE per wait so periodic overrun re-derivations
+  // don't jitter the clock; resets whenever the card leaves the wait phase.
+  const anchorRef = useRef<number | null>(null);
+  if (phase !== 'active') anchorRef.current = null;
+  else if (anchorRef.current === null) anchorRef.current = rawAnchorMs;
+  const wait = useWaitClockSec(phase === 'active' ? anchorRef.current : null);
+
+  if (!prediction || phase === null) return null;
+
+  const isEarly = phase === 'early';
+  const color = isEarly ? T.warning : (awaitingOn ? T.success : T.danger);
+  const bg = isEarly ? TINT.warningBg : (awaitingOn ? TINT.successBg : TINT.dangerBg);
+  const unitBg = isEarly ? '#1a1104' : (awaitingOn ? '#062015' : '#220c10');
+
+  const title = isEarly
+    ? (awaitingOn ? '⚡ الكهرباء قد تعود قبل موعدها!' : '⏻ الكهرباء قد تنطفئ قبل موعدها!')
+    : (awaitingOn ? '⚡ الكهرباء متوقَّعة في أي لحظة' : '⏻ الانطفاء متوقَّع في أي لحظة');
+  const badgeText = isEarly
+    ? 'فرصة مبكرة محتملة'
+    : (awaitingOn ? 'نطاق التوقع نشط' : 'نطاق الانطفاء نشط');
+  const body = isEarly
+    ? (awaitingOn
+      ? 'أحياناً تعود الكهرباء قبل نطاق التوقع الرسمي — ليس المعتاد لكنه يحدث. كن مستعداً خلال هذه الدقائق، وإذا وصلتك الكهرباء الآن أرسل بلاغ تشغيل فوراً ليُؤكَّد توقيتك ويستفيد جيرانك.'
+      : 'أحياناً تنقطع الكهرباء قبل نطاق التوقع الرسمي — ليس المعتاد لكنه يحدث. كن مستعداً خلال هذه الدقائق، وإذا انقطعت الكهرباء عندك الآن أرسل بلاغ انطفاء فوراً ليُؤكَّد توقيتك ويستفيد جيرانك.')
+    : (awaitingOn
+      ? 'أنت الآن داخل نطاق التشغيل المتوقَّع — قد تعود الكهرباء في أي لحظة. التوقع غير مؤكد، فإذا وصلتك الكهرباء أرسل بلاغ تشغيل فوراً ليستفيد جيرانك.'
+      : 'أنت الآن داخل نطاق الانطفاء المتوقَّع — قد تنقطع الكهرباء في أي لحظة. التوقع غير مؤكد، فإذا انقطعت الكهرباء عندك أرسل بلاغ انطفاء فوراً ليستفيد جيرانك.');
+
+  const timerLabel = isEarly ? 'يبدأ نطاق التوقع الرسمي خلال' : 'مدة الانتظار داخل النطاق';
+  const units: { v: number; sub: string }[] = isEarly
+    ? (cd.h > 0 ? [{ v: cd.h, sub: 'ساعة' }, { v: cd.m, sub: 'دقيقة' }, { v: cd.s, sub: 'ثانية' }] : [{ v: cd.m, sub: 'دقيقة' }, { v: cd.s, sub: 'ثانية' }])
+    : (wait.h > 0 ? [{ v: wait.h, sub: 'ساعة' }, { v: wait.m, sub: 'دقيقة' }, { v: wait.s, sub: 'ثانية' }] : [{ v: wait.m, sub: 'دقيقة' }, { v: wait.s, sub: 'ثانية' }]);
+
+  const isManual = (prediction?.atc?.transitionMode ?? 'AUTO') === 'MANUAL';
+  const elevated = prediction?.atc?.communityElevated === true;
+  const stripText = isEarly
+    ? `🎯 الموعد المتوقع لبدء النطاق: ${fmtTimeAr(rangeStartIso)} — وقد يسبقه التغيير أحياناً`
+    : elevated
+      ? '👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — بلاغ واحد منك يؤكد التوقع لك ولجيرانك'
+      : (awaitingOn ? '📢 بلاغ تشغيل واحد منك يؤكد التوقع لك ولجيرانك' : '📢 بلاغ انطفاء واحد منك يؤكد التوقع لك ولجيرانك');
+
+  return (
+    <View style={[rwStyles.card, { backgroundColor: bg, borderColor: color + '66' }]}>
+      <View style={rwStyles.headerRow}>
+        <View style={[rwStyles.badge, { borderColor: color + '66' }]}>
+          <Animated.View style={[rwStyles.badgeDot, { backgroundColor: color, opacity: isEarly ? pulseOpacity : 1 }]} />
+          <Text style={[rwStyles.badgeText, { color }]}>{badgeText}</Text>
+        </View>
+        <Text style={rwStyles.title}>{title}</Text>
+      </View>
+
+      <Text style={rwStyles.body}>{body}</Text>
+
+      <Text style={[rwStyles.timerLabel, { color }]}>{timerLabel}</Text>
+      <View style={rwStyles.timerRow}>
+        {units.map((u, i) => (
+          <React.Fragment key={i}>
+            {i > 0 && <Text style={[rwStyles.timerColon, { color }]}>:</Text>}
+            <View style={[rwStyles.timerUnit, { backgroundColor: unitBg, borderColor: color + '44' }]}>
+              <Text style={[rwStyles.timerVal, { color }]}>{String(u.v).padStart(2, '0')}</Text>
+              <Text style={rwStyles.timerSub}>{u.sub}</Text>
+            </View>
+          </React.Fragment>
+        ))}
+      </View>
+
+      {isManual && !isEarly && (
+        <Text style={rwStyles.manualNote}>وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الانتظار</Text>
+      )}
+
+      <View style={[rwStyles.strip, { backgroundColor: unitBg, borderColor: color + '44' }]}>
+        <Text style={[rwStyles.stripText, { color }]}>{stripText}</Text>
+      </View>
+    </View>
+  );
+}
+
+const rwStyles = StyleSheet.create({
+  card: { borderRadius: 22, padding: 16, marginBottom: 14, borderWidth: 1.5 },
+  headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, marginBottom: 10 },
+  title: { color: T.textPrimary, fontSize: 16.5, fontWeight: '900', textAlign: 'right', flex: 1, lineHeight: 24 },
+  badge: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, marginTop: 2 },
+  badgeDot: { width: 7, height: 7, borderRadius: 4 },
+  badgeText: { fontSize: 11.5, fontWeight: '800' },
+  body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 14 },
+  timerLabel: { fontSize: 12.5, fontWeight: '700', textAlign: 'right', marginBottom: 10 },
+  timerRow: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 14 },
+  timerUnit: { borderRadius: 14, paddingVertical: 10, paddingHorizontal: 14, alignItems: 'center', minWidth: 72, borderWidth: 1 },
+  timerVal: { fontSize: 28, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 1, writingDirection: 'ltr' },
+  timerSub: { color: T.textMuted, fontSize: 10.5, fontWeight: '600', marginTop: 2 },
+  timerColon: { fontSize: 26, fontWeight: '900', marginBottom: 12 },
+  strip: { borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, borderWidth: 1 },
+  stripText: { fontSize: 12.5, fontWeight: '700', textAlign: 'center', lineHeight: 19 },
+  manualNote: { color: T.textMuted, fontSize: 12, fontStyle: 'italic', textAlign: 'right', marginBottom: 10, marginTop: -6 },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PERSONAL STATUS CARD — hero ring + live stats (all engine logic unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, hasSnapshot, reasoningLine }: {
@@ -531,10 +656,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const handleRevertPress = useCallback(() => {
     if (Platform.OS === 'web') { setRevertConfirmVisible(true); } else { onRevertToGrowatt?.(); }
   }, [onRevertToGrowatt]);
-
-  const isUncertain = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'الانتظار للحساس الرئيسي ';
-  const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
-  const overrunLiveClock = useOverrunLiveClock(overrunMin, isUncertain);
 
   const animColor = useRef(new Animated.Value(0)).current;
   useEffect(() => {
@@ -671,55 +792,12 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         </View>
       ) : null}
 
-      {/* ATC mode badge (never in COMMUNITY_SYNCED) — content unchanged */}
-      {!isSynced && (() => {
-        const showATCBadge = atcMode !== 'NORMAL';
-        if (!showATCBadge) return null;
-        const tMode = prediction?.atc?.transitionMode ?? 'AUTO';
-        const configs: Record<string, { icon: string; bg: string; border: string; textColor: string }> = {
-          PREDICTION_RANGE: { icon: '🔮', bg: TINT.accentBg, border: T.accent + '55', textColor: T.accent },
-          UNCERTAIN_ZONE:       { icon: '⚠',  bg: TINT.warningBg, border: T.warning + '55', textColor: T.warning },
-          WAITING_FOR_GROWATT:  { icon: '⏳', bg: TINT.warningBg, border: T.warning + '55', textColor: T.warning },
-          GRACE_MODE: { icon: '⏳', bg: TINT.accentBg, border: T.warning + '44', textColor: T.warning },
-          POSITIVE_OFFSET_PENDING: { icon: '⏰', bg: TINT.accentBg, border: T.accent + '55', textColor: T.accent },
-        };
-        const cfg = configs[atcMode];
-        if (!cfg) return null;
-        return (
-          <View style={[psStyles.atcBadge, { backgroundColor: cfg.bg, borderColor: cfg.border }]}>
-            <Text style={[psStyles.atcBadgeLine, { color: cfg.textColor }]}>
-              {cfg.icon}  {prediction?.atc?.statusLine ?? atcMode}
-            </Text>
-            {/* Prominent exceeded-time badge for UNCERTAIN_ZONE / WAITING_FOR_GROWATT */}
-            {isUncertain && overrunMin > 0 && (
-              <View style={psStyles.exceededBadge}>
-                <View style={psStyles.exceededRow}>
-                  <Text style={psStyles.exceededIcon}>⏱</Text>
-                  <View style={{ flex: 1 }}>
-                    <Text style={psStyles.exceededLabel}>تجاوز المدة المتوقعة</Text>
-                    <Text style={psStyles.exceededValue}>{fmtOverrunAr(overrunMin)}</Text>
-                  </View>
-                </View>
-                {/* Live HH:MM:SS ticking clock — updates every second */}
-                <View style={psStyles.liveClockRow}>
-                  <Text style={psStyles.liveClockLabel}>وقت الانتظار الفعلي</Text>
-                  <Text style={psStyles.liveClockValue}>{overrunLiveClock}</Text>
-                </View>
-                {/* SPEC-FIX C3: the deduction note only makes sense for a negative
-                    offset (user ON started before Growatt ON). For neutral/positive
-                    offsets nothing is deducted, so the note is hidden. */}
-                {(prediction?.offsetMinutes ?? 0) < 0 && (
-                  <Text style={psStyles.deductionNote}>سيُخصم من مدة التشغيل القادمة</Text>
-                )}
-              </View>
-            )}
-            {isUncertain && tMode === 'MANUAL' && (
-              <Text style={[psStyles.atcBodyLine, { color: cfg.textColor + 'aa' }]}>وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة</Text>
-            )}
-            <Text style={psStyles.atcSubLine}> 👥 بلاغات المجتمع ذات أولوية مرتفعة,في اي لحظة سوف تشتغل الكهرباء لذلك قدم تقرير أثناء حدوث ذلك </Text>
-          </View>
-        );
-      })()}
+      {/* THE one waiting card — sits directly below the "منذ" block. Shows
+          the amber early-chance design 20 min before the predicted range
+          starts, then the green/red "any moment now" design with a live
+          count-up until the transition is confirmed. Replaces all the old
+          ATC waiting badges and hold cards for every account type. */}
+      <RangeWatchCard prediction={prediction} />
 
       {DurationsBlock}{ReasoningBlock}
     </View>
@@ -769,19 +847,6 @@ const psStyles = StyleSheet.create({
   revertConfirmBtnCancelText: { color: T.textSecondary, fontSize: 14, fontWeight: '700' },
   revertConfirmBtnOk: { backgroundColor: TINT.dangerBg, borderColor: T.danger + '55' },
   revertConfirmBtnOkText: { color: T.danger, fontSize: 14, fontWeight: '800' },
-  atcBadge: { borderRadius: 14, padding: 12, marginBottom: 12, borderWidth: 1 },
-  atcBadgeLine: { fontSize: 14.5, fontWeight: '700', textAlign: 'right', marginBottom: 6 },
-  atcBodyLine: { fontSize: 12.5, textAlign: 'right', marginBottom: 4, lineHeight: 18 },
-  atcSubLine: { color: T.accent, fontSize: 12.5, textAlign: 'right' },
-  exceededBadge: { backgroundColor: '#2d1a00', borderRadius: 12, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: T.warning + '66' },
-  exceededRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10, marginBottom: 8 },
-  exceededIcon: { fontSize: 22, flexShrink: 0 },
-  exceededLabel: { color: T.warning, fontSize: 11.5, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
-  exceededValue: { color: T.warning, fontSize: 22, fontWeight: '900', textAlign: 'right' },
-  liveClockRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1a0a00', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8 },
-  liveClockLabel: { color: T.warning + '99', fontSize: 11.5, fontWeight: '600' },
-  liveClockValue: { color: T.warning, fontSize: 22, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 2 },
-  deductionNote: { color: T.warning + 'cc', fontSize: 12.5, fontWeight: '600', textAlign: 'right', fontStyle: 'italic' },
   reasoningBox: { backgroundColor: T.elevated, borderRadius: 12, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.border },
   reasoningText: { color: T.textSecondary, fontSize: 12.5, lineHeight: 19, textAlign: 'right', fontWeight: '500' },
 });
@@ -793,7 +858,6 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   const nt = prediction?.nextTransition ?? null;
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
-  const overrunMin = Math.ceil(prediction?.atc?.overrunMinutes ?? 0);
   // SPEC-FIX C1: countdown targets the transition's rangeStart ISO directly.
   const countdownTargetIso = nt?.rangeStartIso ?? null;
   const { h, m, s, total } = useCountdownSec(countdownTargetIso);
@@ -825,31 +889,28 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
     return nt;
   })();
 
-  if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED') {
+  // All waiting/hold states (UNCERTAIN_ZONE / WAITING_FOR_GROWATT /
+  // GRACE_MODE and every other hold mode except the scheduled-change one)
+  // are now covered by the single RangeWatchCard rendered below the "منذ"
+  // block inside PersonalStatusCard — this card renders NOTHING while those
+  // waits are active, so the waiting info appears exactly once on screen.
+  if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING') {
+    return null;
+  }
+
+  if (isHolding && atcMode === 'POSITIVE_OFFSET_PENDING') {
     const isCurrentOn = prediction.currentState === 'ON';
-    const tMode = prediction.atc.transitionMode ?? 'AUTO';
-    const modeConfigs: Record<string, { icon: string; title: string; body: string; borderColor: string; iconColor: string }> = {
-      UNCERTAIN_ZONE: { icon: '⚠️', title: 'استمرار غير معتاد', body: overrunMin > 0 ? `تجاوزت المدة المتوقعة بـ ${fmtOverrunAr(overrunMin)} — قد تعود الكهرباء في أي لحظة الآن. عند تأكيد الحساس (Growatt) يبدأ التشغيل ويُحسب المتبقي من فارقك المخزّن تلقائياً. إذا وصلتك الكهرباء قبل ذلك أرسل بلاغ تغيير الحالة فوراً ليستفيد جيرانك` : 'الكهرباء قد تشتغل في أي لحظة — التغيير محتمل لكنه غير مؤكد بعد. بمجرد أن تصلك الكهرباء أرسل بلاغ تغيير الحالة ليتحدّث توقيتك وتوقيت مجتمعك فوراً', borderColor: T.warning + '44', iconColor: T.warning },
-      WAITING_FOR_GROWATT: { icon: '⏳', title: 'بانتظار تأكيد الحساس', body: tMode === 'MANUAL' ? 'وضع يدوي — بلاغك أو تأكيد مجتمعي ينهي الدورة' : 'تجاوزنا نطاق التوقع وبانتظار تأكيد الحساس أو بلاغ مجتمعي — قد تشتغل الكهرباء في أي لحظة. إذا وصلتك الكهرباء أرسل بلاغ تغيير الحالة فوراً', borderColor: T.accent + '44', iconColor: T.accent },
-      PREDICTION_RANGE: { icon: '🔮', title: 'نطاق التوقع نشط', body: 'التغيير محتمل الآن — بانتظار تأكيد', borderColor: T.accent + '33', iconColor: T.accent },
-      GRACE_MODE: { icon: '⏳', title: 'تأخر غير معتاد', body: 'لا يزال التشغيل مستمراً خارج النطاق المتوقع — سيتم المزامنة فور تغيير الحالة', borderColor: T.warning + '44', iconColor: T.warning },
-      POSITIVE_OFFSET_PENDING: { icon: '⏰', title: 'تغيير تلقائي مجدول', body: prediction?.atc?.statusLine ?? 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد', borderColor: T.accent + '44', iconColor: T.accent },
-    };
-    const cfg = modeConfigs[atcMode] ?? modeConfigs.UNCERTAIN_ZONE;
     return (
-      <View style={[utStyles.card, { borderColor: cfg.borderColor }]}>
+      <View style={[utStyles.card, { borderColor: T.accent + '44' }]}>
         <View style={utStyles.headerRow}>
           <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
         </View>
         <View style={utStyles.holdBox}>
           <View style={{ flex: 1 }}>
-            <Text style={[utStyles.holdTitle, { color: cfg.iconColor }]}>{cfg.icon} {cfg.title}</Text>
-            <Text style={utStyles.holdBody}>{cfg.body}</Text>
+            <Text style={[utStyles.holdTitle, { color: T.accent }]}>⏰ تغيير تلقائي مجدول</Text>
+            <Text style={utStyles.holdBody}>{prediction?.atc?.statusLine ?? 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد'}</Text>
           </View>
         </View>
-        {prediction.atc.communityElevated && (
-          <View style={utStyles.communityPrioBox}><Text style={utStyles.communityPrioText}>👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — شارك بملاحظاتك</Text></View>
-        )}
         {effectiveNt && (
           <View style={utStyles.rangeBox}>
             <Text style={[utStyles.rangeBoxLabel, { color: isCurrentOn ? T.danger : T.success }]}>{effectiveNt.type === 'UTILITY_ON' ? 'من المتوقع أن تشتغل الكهرباء بين:' : 'من المتوقع أن تنطفئ الكهرباء بين:'}</Text>
@@ -899,12 +960,6 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
         <Text style={utStyles.approxPillText}>⏱ تقدير تقريبي — ليس موعداً مؤكداً</Text>
       </View>
       {showCrisisAwareChip && (<View style={utStyles.crisisAwareChip}><Text style={utStyles.crisisAwareChipText}>⚠️ محرك التوقع يتكيّف مع تغيّر النمط — قد تتأثر دقة التوقع</Text></View>)}
-      {nt.inRangeWindow && (
-        <View style={[utStyles.rangeWindowBadge, { backgroundColor: color + '15', borderColor: color + '66' }]}>
-          <Text style={[utStyles.rangeWindowText, { color }]}>🟠 {isNextOn ? 'بدأ نطاق التشغيل المتوقع' : 'بدأ نطاق الانطفاء المتوقع'}</Text>
-          <Text style={[utStyles.rangeWindowSub, { color: color + 'aa' }]}>قد يحدث التغيير في أي لحظة</Text>
-        </View>
-      )}
       <Text style={[utStyles.rangeBoxLabel, { color: T.textSecondary }]}>{isNextOn ? 'يُرجَّح أن تشتغل الكهرباء خلال هذا النطاق:' : 'يُرجَّح أن تنطفئ الكهرباء خلال هذا النطاق:'}</Text>
       <View style={utStyles.rangeTimesRow}>
         <Text style={[utStyles.rangeTimeBig, { color }]}>{fmtTimeAr(nt.rangeStartIso) || (nt as any).earliestFormatted || '—'}</Text>
@@ -952,9 +1007,6 @@ const utStyles = StyleSheet.create({
   confText: { fontSize: 13, fontWeight: '700' },
   approxPill: { alignSelf: 'flex-start', backgroundColor: TINT.warningBg, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: T.warning + '55', marginBottom: 14 },
   approxPillText: { color: T.warning, fontSize: 11.5, fontWeight: '800' },
-  rangeWindowBadge: { borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1.5, marginBottom: 14, alignItems: 'center' },
-  rangeWindowText: { fontSize: 16, fontWeight: '800', textAlign: 'center', marginBottom: 4 },
-  rangeWindowSub: { fontSize: 12.5, textAlign: 'center' },
   rangeBox: { backgroundColor: T.elevated, borderRadius: 18, padding: 20, marginTop: 12, borderWidth: 1, borderColor: T.border, alignItems: 'center' },
   rangeBoxLabel: { fontSize: 13.5, fontWeight: '600', marginBottom: 12, textAlign: 'center' },
   rangeTimeStack: { alignItems: 'center', gap: 8 },
@@ -982,8 +1034,6 @@ const utStyles = StyleSheet.create({
   holdBox: { flexDirection: 'row-reverse', gap: 12, alignItems: 'flex-start', backgroundColor: T.elevated, borderRadius: 16, padding: 14, marginTop: 4 },
   holdTitle: { fontSize: 16, fontWeight: '800', textAlign: 'right', marginBottom: 4 },
   holdBody: { color: T.textSecondary, fontSize: 13, lineHeight: 19, textAlign: 'right' },
-  communityPrioBox: { backgroundColor: TINT.accentBg, borderRadius: 12, padding: 10, marginTop: 10, borderWidth: 1, borderColor: T.accent + '44' },
-  communityPrioText: { color: T.accent, fontSize: 12.5, fontWeight: '600', textAlign: 'right' },
   crisisAwareChip: { backgroundColor: TINT.warningBg, borderRadius: 12, padding: 10, marginBottom: 12, borderWidth: 1, borderColor: T.warning + '44' },
   crisisAwareChipText: { color: T.warning, fontSize: 12.5, fontWeight: '600', textAlign: 'right', lineHeight: 18 },
 });
