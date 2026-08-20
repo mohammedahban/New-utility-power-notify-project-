@@ -556,9 +556,36 @@ function computeATCMode(
         .sort((a, b) => new Date(a.startIso).getTime() - new Date(b.startIso).getTime())[0];
 
       if (nextSlot) {
+        // SPEC-FIX (2026-08-20 — positive OFF-gap): when the NEXT slot is an
+        // OFF slot, the "hold the opposite of the upcoming slot" heuristic
+        // fabricates an ON out of thin air. Seen live: Growatt turned OFF
+        // mid-countdown, the regenerated schedule started with the current
+        // raw OFF slot, and the app showed the user ON with a countdown to
+        // the shifted OFF (تغيير تلقائي مجدول → طافية) although the user's
+        // power never came ON. A slotless ON cannot exist for positive users
+        // (ON→OFF is always automatic, and the OFF→ON countdown/window is
+        // owned by the Growatt-ON anchor in useUserPredictions). Hold a quiet
+        // OFF instead.
+        if (nextSlot.state === 'OFF') {
+          const prevOffSlot = shiftedSlots
+            .filter(s => s.state === 'OFF' && s.endIso && new Date(s.endIso).getTime() <= nowMs)
+            .sort((a, b) => new Date(b.endIso!).getTime() - new Date(a.endIso!).getTime())[0] ?? null;
+          return {
+            mode: 'NORMAL',
+            currentState: 'OFF',
+            currentStateStartIso: prevOffSlot?.startIso ?? null,
+            isHoldingState: false,
+            overrunMinutes: 0,
+            communityElevated: false,
+            inValidationWindow: false,
+            validationWindowRemainingMin: 0,
+            scheduledAutoTransitionIso: null,
+            statusLine: '',
+          };
+        }
         // The held state is the OPPOSITE of the upcoming slot's state.
         // e.g. next slot is ON → user is currently holding OFF.
-        const heldState: 'ON' | 'OFF' = nextSlot.state === 'ON' ? 'OFF' : 'ON';
+        const heldState: 'ON' | 'OFF' = 'OFF';
         // Anchor the held state at the start of the most recently ended slot
         // of the held state type, so "منذ" and الآن show the real start time.
         const prevHeldSlot = shiftedSlots

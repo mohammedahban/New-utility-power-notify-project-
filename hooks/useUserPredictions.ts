@@ -521,14 +521,21 @@ function useGrowattOnWatcher(
   // user device can anchor its timeline the moment the sensor flips (the engine
   // would otherwise keep the user OFF until analyze-patterns regenerates).
   isPositiveOffset: boolean = false,
-): { growattOnTick: number; growattOnIso: string | null; clearGrowattOn: () => void } {
+): { growattOnTick: number; growattOnIso: string | null; growattOffIso: string | null; clearGrowattOn: () => void } {
   const [tick, setTick] = useState(0);
   const [growattOnIso, setGrowattOnIso] = useState<string | null>(null);
+  // POSITIVE-offset anchor companion: the Growatt OFF time of the current
+  // cycle. Kept so the reference ON duration (the user's ON lasts exactly as
+  // long as the reference Growatt ON) stays known after the sensor flips
+  // back to OFF in the middle of the countdown.
+  const [growattOffIso, setGrowattOffIso] = useState<string | null>(null);
+  const seededRef = useRef(false);
 
   const shouldSubscribe = isPendingNegative || isNegativeOffset || isPositiveOffset;
 
   const clearGrowattOn = useCallback(() => {
     setGrowattOnIso(null);
+    setGrowattOffIso(null);
   }, []);
 
   // Subscribe to power_events for new UTILITY_ON / UTILITY_OFF rows
@@ -543,18 +550,30 @@ function useGrowattOnWatcher(
           const newRow = payload.new as { event_type?: string; occurred_at?: string };
           if (newRow.event_type === 'UTILITY_ON') {
             if (newRow.occurred_at) setGrowattOnIso(newRow.occurred_at);
+            setGrowattOffIso(null); // new ON cycle
             setTick(t => t + 1);
           } else if (newRow.event_type === 'UTILITY_OFF') {
-            // New OFF cycle started — clear any previous ON iso so it
-            // doesn't bleed into the next UNCERTAIN_ZONE check.
-            setGrowattOnIso(null);
+            if (isPositiveOffset) {
+              // POSITIVE: KEEP the Growatt-ON anchor — the scheduled OFF→ON
+              // countdown (GrowattON + offset) must continue even though the
+              // sensor flipped back to OFF. Record the OFF time: it fixes the
+              // reference ON duration for the upcoming ON window.
+              if (newRow.occurred_at) {
+                const offIsoP = newRow.occurred_at;
+                setGrowattOffIso(prev => prev ?? offIsoP);
+              }
+            } else {
+              // New OFF cycle started — clear any previous ON iso so it
+              // doesn't bleed into the next UNCERTAIN_ZONE check.
+              setGrowattOnIso(null);
+            }
             setTick(t => t + 1);
           }
         },
       )
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [shouldSubscribe, resyncPoint?.syncedAtIso]);
+  }, [shouldSubscribe, resyncPoint?.syncedAtIso, isPositiveOffset]);
 
   // Secondary: inverter_state real-time for edge cases (e.g. power_events delayed)
   useEffect(() => {
@@ -571,20 +590,54 @@ function useGrowattOnWatcher(
             // ON transition: record approximate time (power_events has precise time)
             const approxOnIso = row.last_polled ?? new Date().toISOString();
             setGrowattOnIso(prev => prev ?? approxOnIso);
+            setGrowattOffIso(null); // new ON cycle
             setTick(t => t + 1);
           } else if (row.utility_on === false && old.utility_on === true) {
-            // OFF transition: clear growattOnIso so next UNCERTAIN_ZONE doesn't
-            // inherit the previous cycle's Growatt ON timestamp.
-            setGrowattOnIso(null);
+            if (isPositiveOffset) {
+              // POSITIVE: keep the Growatt-ON anchor (see the power_events
+              // handler above) — just record the OFF transition time.
+              const approxOffIso = row.last_polled ?? new Date().toISOString();
+              setGrowattOffIso(prev => prev ?? approxOffIso);
+            } else {
+              // OFF transition: clear growattOnIso so next UNCERTAIN_ZONE doesn't
+              // inherit the previous cycle's Growatt ON timestamp.
+              setGrowattOnIso(null);
+            }
             setTick(t => t + 1);
           }
         },
       )
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [shouldSubscribe]);
+  }, [shouldSubscribe, isPositiveOffset]);
 
-  return { growattOnTick: tick, growattOnIso, clearGrowattOn };
+  // POSITIVE restart-safety: the anchor is in-memory only. On mount, reseed it
+  // from the latest power_events so an app restart mid-countdown (or mid
+  // ON window) restores the scheduled OFF→ON countdown and the ON window.
+  // A stale seed self-releases: the memo's window-ended guard clears it.
+  useEffect(() => {
+    if (!isPositiveOffset || seededRef.current) return;
+    seededRef.current = true;
+    (async () => {
+      try {
+        const { data } = await supabase
+          .from('power_events')
+          .select('event_type, occurred_at')
+          .order('occurred_at', { ascending: false })
+          .limit(10);
+        if (!data || data.length === 0) return;
+        const lastOn = data.find((r: any) => r.event_type === 'UTILITY_ON');
+        const lastOff = data.find((r: any) => r.event_type === 'UTILITY_OFF');
+        if (lastOn?.occurred_at) setGrowattOnIso(prev => prev ?? lastOn.occurred_at);
+        if (lastOn?.occurred_at && lastOff?.occurred_at &&
+            new Date(lastOff.occurred_at).getTime() > new Date(lastOn.occurred_at).getTime()) {
+          setGrowattOffIso(prev => prev ?? lastOff.occurred_at);
+        }
+      } catch (_) { /* non-fatal: the live watcher still covers this session */ }
+    })();
+  }, [isPositiveOffset]);
+
+  return { growattOnTick: tick, growattOnIso, growattOffIso, clearGrowattOn };
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────────
@@ -776,7 +829,7 @@ export function useUserPredictions(
   // isNegativeOffset: must immediately flip UI to ON without waiting for analyze-patterns
   const isPendingNegativeV21 = v21Meta.offsetState === 'PENDING_NEGATIVE';
   const isNegativeOffset = offsetMinutes < 0;
-  const { growattOnTick, growattOnIso, clearGrowattOn } = useGrowattOnWatcher(
+  const { growattOnTick, growattOnIso, growattOffIso, clearGrowattOn } = useGrowattOnWatcher(
     resyncPoint,
     isPendingNegativeV21,
     isNegativeOffset,
@@ -972,18 +1025,21 @@ export function useUserPredictions(
         modeV22 !== 'COMMUNITY_SYNCED' &&
         offsetMinutes < 0;
 
-      // SPEC-FIX D1: positive-offset anchoring on live Growatt ON.
-      // A positive-offset user's ON starts offsetMinutes AFTER the sensor
-      // flips. Without this branch the app sat in WAITING_FOR_GROWATT until
-      // analyze-patterns regenerated the schedule (10–30 s+). The moment the
-      // watcher sees this cycle's Growatt UTILITY_ON we either start the
-      // POSITIVE_OFFSET_PENDING countdown (ON still ahead) or flip straight
-      // to ON (offset already elapsed).
+      // SPEC-FIX D1 (revised 2026-08-20 — "the countdown survives Growatt OFF"):
+      // positive-offset anchoring on the current cycle's live Growatt UTILITY_ON.
+      // A positive-offset user's ON starts offsetMinutes AFTER the sensor flips.
+      // The branch now fires whenever the anchor exists — regardless of the
+      // engine's current mode. The old gate (engine must already hold OFF in
+      // WAITING_FOR_GROWATT, anchor validated against the uncertain-entry
+      // timestamp) died the moment Growatt flipped back to OFF mid-countdown:
+      // the watcher cleared growattOnIso, and the engine's gap heuristic then
+      // fabricated an ON hold with a countdown to the shifted OFF slot.
+      // Stale-anchor safety comes from the anchor lifecycle instead: replaced
+      // on every new Growatt ON, cleared when the user's ON window ends.
       const shouldPositiveGrowattAnchor =
-        growattOnIsCurrentCycle &&
-        inUncertainFamily &&
-        modeV22 === 'WAITING_FOR_GROWATT' &&
-        offsetMinutes > 0;
+        offsetMinutes > 0 &&
+        growattOnIso !== null &&
+        modeV22 !== 'COMMUNITY_SYNCED';
 
       if (shouldImmediateFlip && growattOnIso) {
         const growattOnMs = new Date(growattOnIso).getTime();
@@ -1186,14 +1242,97 @@ export function useUserPredictions(
           timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
         }).replace('AM', ' ص').replace('PM', ' م');
 
+        // ON duration = the reference Growatt ON duration: the ACTUAL length
+        // once the sensor has turned back OFF (growattOffIso − growattOnIso),
+        // otherwise the most-predicted ON duration from the shifted schedule.
+        const growattOffMsP = growattOffIso ? new Date(growattOffIso).getTime() : NaN;
+        const scheduledOnSlotP = (v21Result.daySchedule ?? []).find(
+          (s: ShiftedScheduleSlot) => s.state === 'ON' && new Date(s.startIso).getTime() >= growattOnMsP - 2 * 3600_000,
+        );
+        const onDurationMsP = Number.isFinite(growattOffMsP) && growattOffMsP > growattOnMsP
+          ? growattOffMsP - growattOnMsP
+          : scheduledOnSlotP?.endIso
+            ? new Date(scheduledOnSlotP.endIso).getTime() - new Date(scheduledOnSlotP.startIso).getTime()
+            : 120 * 60_000;
+        const userOnEndMsP = userOnStartMsP + onDurationMsP;
+        const userOnEndIsoP = new Date(userOnEndMsP).toISOString();
+
+        // SPEC-FIX B4 (positive variant): never flip into an ON window that
+        // has already ended by now — release to the engine (the ON→OFF flip
+        // is automatic) and drop the spent anchor.
+        if (userOnEndMsP <= nowV22) {
+          immediateOnActiveRef.current = false;
+          shouldClearGrowattOnRef.current = true;
+          return finalResult;
+        }
+
+        const durMinP = Math.round(onDurationMsP / 60_000);
+        const durHP = Math.floor(durMinP / 60); const durMP = durMinP % 60;
+        const durationLabelP = durHP === 0 ? `${durMP}د`
+          : durMP === 0 ? (durHP === 1 ? 'ساعة' : `${durHP}س`)
+          : `${durHP}س ${durMP}د`;
+
+        const syntheticOnSlotP: ShiftedScheduleSlot = {
+          state: 'ON',
+          startIso: userOnStartIsoP,
+          endIso: userOnEndIsoP,
+          startFormatted: fmtLocalP(userOnStartIsoP),
+          endFormatted: fmtLocalP(userOnEndIsoP),
+          shiftedStartFormatted: fmtLocalP(userOnStartIsoP),
+          shiftedEndFormatted: fmtLocalP(userOnEndIsoP),
+          durationLabel: durationLabelP,
+          zone: 'DAY',
+          isEstimated: true,
+        };
+
+        // Drop schedule slots this cycle's anchored window replaces:
+        //   - any ON slot starting inside the anchored window (the shifted
+        //     schedule's predicted ON, or the engine's fabricated ON hold)
+        //   - the OFF slot feeding the anchored ON (the engine's injected
+        //     held-OFF ends exactly at the predicted ON start)
+        const restSlotsP = (v21Result.daySchedule ?? []).filter((s: ShiftedScheduleSlot) => {
+          const st = new Date(s.startIso).getTime();
+          const en = s.endIso ? new Date(s.endIso).getTime() : NaN;
+          if (s.state === 'ON' && st >= growattOnMsP - 60_000 && st <= userOnEndMsP) return false;
+          if (s.state === 'OFF' && Number.isFinite(en) && Math.abs(en - userOnStartMsP) < 30 * 60_000) return false;
+          return true;
+        });
+
         if (userOnStartMsP > nowV22) {
           // ON time still ahead → POSITIVE_OFFSET_PENDING countdown state.
           // currentState stays OFF; the banner counts down to the user's own ON.
+          // Mirrors the engine's synthetic held-slot injection so the Home
+          // widgets and the Schedule page keep showing the held OFF plus the
+          // upcoming ON window even after Growatt turned back OFF.
           const minFromNowP = Math.max(0, (userOnStartMsP - nowV22) / 60_000);
+          const offStartIsoP = (v21Result.currentState === 'OFF' && v21Result.currentStateStartIso)
+            ? v21Result.currentStateStartIso
+            : null;
+          const heldOffStartIsoP = offStartIsoP ?? growattOnIso;
+          const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
+          const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
+          const heldOffLabelP = heldOffDurMinP <= 0 ? '0د'
+            : hdHP === 0 ? `${hdMP}د`
+            : hdMP === 0 ? (hdHP === 1 ? 'ساعة' : `${hdHP}س`)
+            : `${hdHP}س ${hdMP}د`;
+          const syntheticHeldOffSlotP: ShiftedScheduleSlot = {
+            state: 'OFF',
+            startIso: heldOffStartIsoP,
+            endIso: userOnStartIsoP,
+            startFormatted: fmtLocalP(heldOffStartIsoP),
+            endFormatted: fmtLocalP(userOnStartIsoP),
+            shiftedStartFormatted: fmtLocalP(heldOffStartIsoP),
+            shiftedEndFormatted: fmtLocalP(userOnStartIsoP),
+            durationLabel: heldOffLabelP,
+            zone: 'DAY',
+            isEstimated: false,
+          };
           finalResult = {
             ...v21Result,
             currentState: 'OFF',
+            currentStateStartIso: offStartIsoP,
             isHoldingState: true,
+            daySchedule: [syntheticHeldOffSlotP, syntheticOnSlotP, ...restSlotsP],
             nextTransition: {
               type: 'UTILITY_ON' as const,
               earliestTime: userOnStartIsoP,
@@ -1218,43 +1357,11 @@ export function useUserPredictions(
             },
           };
         } else {
-          // Offset already elapsed since the sensor flip → user is ON now.
-          // Mirrors the negative-offset synthetic ON above.
-          const scheduledOnSlotP = (v21Result.daySchedule ?? []).find(
-            (s: ShiftedScheduleSlot) => s.state === 'ON' && new Date(s.startIso).getTime() >= growattOnMsP - 2 * 3600_000,
-          );
-          const onDurationMsP = scheduledOnSlotP?.endIso
-            ? new Date(scheduledOnSlotP.endIso).getTime() - new Date(scheduledOnSlotP.startIso).getTime()
-            : 120 * 60_000;
-          const userOnEndMsP = userOnStartMsP + onDurationMsP;
-          const userOnEndIsoP = new Date(userOnEndMsP).toISOString();
-
-          // SPEC-FIX B4 (positive variant): never flip into an ON window that
-          // has already ended by now.
-          if (userOnEndMsP <= nowV22) {
-            immediateOnActiveRef.current = false;
-            return finalResult;
-          }
-
-          const durMinP = Math.round(onDurationMsP / 60_000);
-          const durHP = Math.floor(durMinP / 60); const durMP = durMinP % 60;
-          const durationLabelP = durHP === 0 ? `${durMP}د`
-            : durMP === 0 ? (durHP === 1 ? 'ساعة' : `${durHP}س`)
-            : `${durHP}س ${durMP}د`;
-
-          const syntheticOnSlotP: ShiftedScheduleSlot = {
-            state: 'ON',
-            startIso: userOnStartIsoP,
-            endIso: userOnEndIsoP,
-            startFormatted: fmtLocalP(userOnStartIsoP),
-            endFormatted: fmtLocalP(userOnEndIsoP),
-            shiftedStartFormatted: fmtLocalP(userOnStartIsoP),
-            shiftedEndFormatted: fmtLocalP(userOnEndIsoP),
-            durationLabel: durationLabelP,
-            zone: 'DAY',
-            isEstimated: true,
-          };
-
+          // Countdown finished → the user is ON now (automatic flip).
+          // Mirrors the negative-offset synthetic ON above. The ON lasts the
+          // reference ON duration, then flips OFF automatically — the precise
+          // timer below fires at the window end; mode stays NORMAL so NO
+          // countdown banner renders for the ON→OFF direction.
           immediateOnActiveRef.current = true;
           shouldClearGrowattOnRef.current = false; // keep active while holding
 
@@ -1264,7 +1371,7 @@ export function useUserPredictions(
             currentStateStartIso: userOnStartIsoP,
             reconciledCycleStartIso: userOnStartIsoP,
             isHoldingState: false,
-            daySchedule: [syntheticOnSlotP, ...(v21Result.daySchedule ?? [])],
+            daySchedule: [syntheticOnSlotP, ...restSlotsP],
             nextTransition: {
               type: 'UTILITY_OFF' as const,
               earliestTime: userOnEndIsoP,
@@ -1285,6 +1392,7 @@ export function useUserPredictions(
               overrunMinutes: 0,
               communityElevated: false,
               isHoldingState: false,
+              scheduledAutoTransitionIso: userOnEndIsoP,
             },
           };
         }
@@ -1337,7 +1445,7 @@ export function useUserPredictions(
   // excluded from deps (Rule Q2-A freeze). growattOnIso and resolutionTick
   // are included so the memo re-runs immediately when the watcher fires.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick, growattOnIso, onCommunityOffsetComputed]);
+  }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick, growattOnIso, growattOffIso, onCommunityOffsetComputed]);
 
   // ── Clear stale growattOnIso after engine catches up ─────────────────────
   // Runs after the memo settles. Prevents the previous ON cycle's growattOnIso
