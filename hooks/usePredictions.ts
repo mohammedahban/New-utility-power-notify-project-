@@ -72,6 +72,12 @@ export interface Prediction {
   dataWindowHours: number;
   computedAt: string;
 
+  // APPPE v6.2: dedicated per-phase models, keyed by offset-hour group
+  // ("+5"…"+9", "-3"…"-7"). Each value is a full prediction payload computed
+  // by an independent pipeline run over the phase-shifted event stream.
+  // Optional + absent on old servers → callers fall back to this base model.
+  phaseModels?: Record<string, Prediction>;
+
   // APPPE v4.0 metadata
   apppe?: {
     version: string;

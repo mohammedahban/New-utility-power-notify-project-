@@ -35,6 +35,12 @@
  *   8. Generate 24h schedule with PER-SLOT durations; data-driven ranges.
  *   9. Accuracy logging v2 (snapshot & resolve) + prediction horizon.
  *  10. Write result to utility_predictions (id = 1, upsert).
+ *  11. v6.2 phase-group models: ONE shared pipeline module
+ *      (computePhaseModel) is re-run per offset-hour group (+5…+9, −3…−7 —
+ *      intentionally asymmetric) over the phase-shifted event stream, each
+ *      producing its own stats/curves/schedule/confidence. Embedded as
+ *      prediction.phaseModels; they never write accuracy rows — all learning
+ *      stays exclusive to the base Growatt model.
  *
  * IMPORTANT: This function must remain deployed at all times.
  * poll-growatt calls it automatically after every state change detection.
@@ -90,6 +96,26 @@ const MAX_ALLOWED_ERROR_MIN = 180;     // accuracy score scale
 const SNAPSHOT_MAX_AGE_HOURS = 36;
 const SNAPSHOT_CAP = 40;
 const SNAPSHOT_MATCH_TOLERANCE_MS = 6 * 3600_000;
+
+// ── v6.2 phase-group models ─────────────────────────────────────────────────
+// Dedicated per-phase prediction models, all produced by ONE shared pipeline
+// module (computePhaseModel below) — only the phase offset VALUE changes
+// between runs; there is no per-model system. The groups are INTENTIONALLY
+// ASYMMETRIC (product decision — do not normalize):
+//   POSITIVE offsets: dedicated models for +5h … +9h only
+//                     (+1h … +4h keep using the base model + full offset)
+//   NEGATIVE offsets: dedicated models for −3h … −7h only
+//                     (−1h … −2h keep using the base model + full offset)
+// The base sensor model (offset 0) remains the ONLY model that learns:
+// pattern learning, drift/bias correction, crisis/shock detection outputs and
+// accuracy logging stay exclusive to it. Phase models never write to
+// prediction_accuracy_logs and never register snapshots.
+// NOTE: the same list is declared client-side in lib/phaseGroups.ts
+// (edge functions cannot import app code) — keep the two in sync.
+const PHASE_GROUP_OFFSETS_HOURS: readonly number[] = [
+  5, 6, 7, 8, 9,      // positive phases
+  -3, -4, -5, -6, -7, // negative phases
+];
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface PowerEvent {
@@ -1021,6 +1047,252 @@ async function loadHistory(supabase: ReturnType<typeof getSupabase>): Promise<Ac
   return (data ?? []) as AccuracyLogRow[];
 }
 
+// ── Expected duration range (avg ± sd) ──────────────────────────────────────
+// v6.2: hoisted to module scope so the base model and the phase models share
+// ONE implementation. Logic unchanged (was an inline closure in the handler).
+function computeExpectedRange(arr: number[]): { minMin: number; maxMin: number; label: string } | null {
+  if (arr.length === 0) return null;
+  const avg = mean(arr);
+  const sd = stdDev(arr);
+  const minMin = Math.max(5, Math.round(avg - sd));
+  const maxMin = Math.round(avg + sd);
+  return { minMin, maxMin, label: `${durationLabel(minMin)}–${durationLabel(maxMin)}` };
+}
+
+// ── v6.2 Phase-model module ─────────────────────────────────────────────────
+//
+// ONE module for ALL phase groups — the only thing that changes between runs
+// is the phase offset VALUE. The module re-runs the full analysis pipeline
+// independently over the phase-shifted event stream: cycle extraction,
+// pattern stats, the circadian kernel duration model, crisis detection, the
+// shock detector, schedule generation, next-transition, confidence and
+// reasoning are ALL recomputed from the shifted stream — no outputs are
+// copied from the base model. Shared inputs are limited to:
+//   • the physical sensor facts (current state + when it started), moved by
+//     the phase offset to anchor the phase timeline, and
+//   • the base model's LEARNED corrections (drift offset, bias ratios,
+//     volatility EMA, sample pools) — phase models have no accuracy history
+//     of their own (accuracy learning is intentionally base-model-only), so
+//     they inherit the regime-level corrections while their statistics,
+//     curves, schedules and reasoning stay fully their own.
+//
+// Output: a payload with the SAME shape as the base prediction (plus
+// apppe.phaseOffsetHours), embedded under prediction.phaseModels["+5" …].
+// Clients pick their phase model by rounding the user offset to the nearest
+// hour group and apply only the sub-hour residual on top (minute precision).
+function computePhaseModel(args: {
+  phaseOffsetHours: number;
+  extEvents: PowerEvent[];          // 80-day learning window (unshifted)
+  currentState: "ON" | "OFF";       // real sensor state — shared physical fact
+  currentStateStartMs: number;      // real sensor state start (unshifted)
+  inverterOffline: boolean;
+  driftOffset: number;              // learned on the base model — applied as-is
+  driftSamples: number[];           // base drift sample pool (quality factor)
+  driftSampleCount: number;
+  biasResult: BiasResult;           // learned on the base model — applied as-is
+  biasSamples: number[];            // base bias sample pool (quality factor)
+  volatilityEMA: number;            // base volatility EMA (quality factor)
+  nowMs: number;
+}): Record<string, unknown> {
+  const { phaseOffsetHours, nowMs } = args;
+  const shiftMs = phaseOffsetHours * 3600_000;
+
+  // ── 1. Phase-shift the event stream ───────────────────────────────────────
+  // A phase user's timeline = the sensor timeline moved by the group offset.
+  // The most recent event MAY land in the future for positive phases right
+  // after a sensor flip — extractCycles then marks the still-active run
+  // censored (excluded from duration stats), so statistics stay clean.
+  const shiftedEvents: PowerEvent[] = args.extEvents.map(e => ({
+    ...e,
+    occurred_at: new Date(new Date(e.occurred_at).getTime() + shiftMs).toISOString(),
+  }));
+
+  // ── 2. Cycles + pattern stats (independent) ───────────────────────────────
+  const cycles = extractCycles(shiftedEvents, LEARNING_WINDOW_DAYS * 24 * 3600_000, nowMs);
+  const dayCycles = cycles.filter(c => c.period === "day");
+  const nightCycles = cycles.filter(c => c.period === "night");
+  const allStats = computePatternStats(cycles);
+  const dayStats = computePatternStats(dayCycles);
+  const nightStats = computePatternStats(nightCycles);
+
+  // ── 3. Kernel duration model (independent) ────────────────────────────────
+  const model = buildDurationModel(cycles, nowMs);
+
+  // ── 4. Crisis + shock detection (independent, over the shifted stream) ────
+  const last24hCycles = cycles.filter(c => c.startMs > nowMs - 24 * 3600_000);
+  const { crisisActive, crisisReason, crisisShift } = detectCrisis(last24hCycles, cycles);
+  const shock = detectShock(cycles, model);
+
+  // ── 5. Schedule anchored at the phase timeline's current-state start ──────
+  // Positive phases right after a sensor flip anchor in the FUTURE: the
+  // schedule starts ahead of "now" and the client engine holds the prior
+  // state until the first slot begins (same mechanics as a positive offset).
+  const phaseStateStartMs = args.currentStateStartMs + shiftMs;
+  const daySchedule = generateDaySchedule(
+    args.currentState,
+    phaseStateStartMs,
+    model,
+    args.driftOffset,
+    args.biasResult,
+    nowMs,
+    crisisActive,
+    crisisShift,
+    shock,
+  );
+
+  // ── 6. Next transition (per phase timeline) ───────────────────────────────
+  const nextTransition = computeNextTransition(daySchedule, args.currentState, model, nowMs);
+
+  // ── 7. Confidence (own cycles; shared regime factors) ─────────────────────
+  const qualityFactors = computeQualityFactors(
+    cycles,
+    args.driftSamples,
+    args.biasSamples,
+    args.volatilityEMA,
+    crisisActive,
+  );
+  const confidence = computeConfidence(qualityFactors);
+  // Same label thresholds as the base model.
+  const confidenceLabel =
+    confidence >= 88 ? "مرتفعة جداً" :
+    confidence >= 72 ? "مرتفعة" :
+    confidence >= 52 ? "متوسطة" : "منخفضة";
+
+  // ── 8. Learning mode + stability (own cycles) ─────────────────────────────
+  const effectiveWeightedSamples = Math.min(cycles.length, 25);
+  const learningMode: "prior_only" | "hybrid" | "learned" =
+    effectiveWeightedSamples >= 21 ? "learned" :
+    effectiveWeightedSamples >= 7 ? "hybrid" : "prior_only";
+
+  const offDurations = cycles.filter(c => c.state === "OFF" && !c.censored).map(c => c.durationMin);
+  const onDurations = cycles.filter(c => c.state === "ON" && !c.censored).map(c => c.durationMin);
+  const madOffVal = Math.round(mad(offDurations));
+  const avgOffVal = mean(offDurations);
+  const madOnVal = onDurations.length > 0 ? Math.round(mad(onDurations)) : null;
+  const relativeMAD = avgOffVal > 0 ? mad(offDurations) / avgOffVal : 1;
+  const stabilityScore = Math.max(0, Math.min(100, Math.round(100 - relativeMAD * 200)));
+  const stabilityLabel = stabilityScore >= 75 ? "Stable"
+    : stabilityScore >= 45 ? "Slightly Unstable" : "Unstable";
+  const isUnstable = stabilityScore < 45;
+
+  // ── 9. Expected ranges (own cycles, shared helper) ────────────────────────
+  const expectedOffRange = computeExpectedRange(offDurations);
+  const expectedOnRange = computeExpectedRange(onDurations);
+
+  // ── 10. Reasoning (own stats/curve; same templates as the base model) ─────
+  const sign = phaseOffsetHours > 0 ? "+" : "";
+  const reasoning: string[] = [];
+  reasoning.push(`تم تحليل ${cycles.length} دورة في نافذة ${LEARNING_WINDOW_DAYS} أيام`);
+  if (model.offCurve.length > 0) {
+    const durs = model.offCurve.map(p => p.durMin);
+    const lo = Math.min(...durs);
+    const hi = Math.max(...durs);
+    if (hi - lo >= 30) {
+      reasoning.push(
+        `مدة الانقطاع تعتمد على وقت بدئها: من ${durationLabel(lo)} ظهراً (دعم الطاقة الشمسية) ` +
+        `حتى ${durationLabel(hi)} في ذروة المساء`
+      );
+    }
+  }
+  if (crisisActive && crisisReason) {
+    reasoning.push(`⚠️ وضع الأزمة: ${crisisReason}`);
+  }
+  if (shock.shockActive && shock.shockKind === "inrun") {
+    reasoning.push(
+      "⚠️ انقطاع ممتد: تجاوزت مدة الانقطاع الحالية النمط المعتاد لهذا الوقت — تم تمديد التوقع تلقائياً"
+    );
+  } else if (shock.shockActive && shock.shockKind === "persistent") {
+    reasoning.push(
+      `⚠️ كشف تغيّر مفاجئ في النمط (نقص وقود / طقس غائم / عطل): ` +
+      `تم تعديل توقعات الانقطاع بمقدار ${shock.shiftOffMin > 0 ? "+" : ""}${shock.shiftOffMin} دقيقة`
+    );
+  }
+  if (args.driftOffset !== 0) {
+    reasoning.push(`انحراف التوقيت المُصحَّح: ${args.driftOffset > 0 ? "+" : ""}${args.driftOffset} دقيقة`);
+  }
+  if (args.biasResult.sampleCount >= 4) {
+    reasoning.push(
+      `تصحيح التحيّز: تشغيل ×${args.biasResult.biasRatioOn.toFixed(2)}, انقطاع ×${args.biasResult.biasRatioOff.toFixed(2)}`
+    );
+  }
+  if (learningMode === "learned") {
+    reasoning.push("النظام في وضع التعلم المكتمل — تعتمد التوقعات بالكامل على البيانات الفعلية");
+  } else if (learningMode === "hybrid") {
+    reasoning.push("وضع هجين — تمزج التوقعات بين البيانات الفعلية والنماذج الأساسية");
+  } else {
+    reasoning.push("وضع التعلم المبكر — التوقعات تعتمد على النماذج الأساسية في الوقت الحالي");
+  }
+  // Phase marker (last line — Home shows only reasoning[0]).
+  reasoning.push(`🧭 نموذج طور مخصص: ${sign}${phaseOffsetHours} ساعات عن النموذج الأساسي`);
+
+  const currentStateDurationMin = Math.max(0, Math.round((nowMs - phaseStateStartMs) / 60_000));
+
+  // ── 11. Assemble the phase payload (same shape as the base prediction) ────
+  return {
+    currentState: args.currentState,
+    currentStateDurationMin,
+    currentStateDurationLabel: durationLabel(currentStateDurationMin),
+    // The phase timeline's current-state start. May be future-dated for
+    // positive phases right after a sensor flip (the phase's current state
+    // has not begun yet) — the client engine derives its own display anchors.
+    lastTransitionAt: new Date(phaseStateStartMs).toISOString(),
+    inverterOffline: args.inverterOffline,
+
+    nextTransition,
+    expectedOffRange,
+    expectedOnRange,
+    daySchedule,
+    snapshots: [], // phase models never register accuracy snapshots (base-only learning)
+
+    confidence,
+    confidenceLabel,
+    isUnstable,
+    stabilityScore,
+    stabilityLabel,
+
+    dayPattern: dayStats,
+    nightPattern: nightStats,
+    allPattern: allStats,
+    cyclesAnalyzed: cycles.length,
+    dayCyclesAnalyzed: dayCycles.length,
+    nightCyclesAnalyzed: nightCycles.length,
+
+    currentPeriod: getPeriod(nowMs),
+    reasoning,
+    learningMode,
+    dataWindowHours: ANALYSIS_WINDOW_HOURS,
+    computedAt: new Date(nowMs).toISOString(),
+
+    apppe: {
+      version: "6.2-phase",
+      phaseOffsetHours,
+      crisisActive,
+      crisisReason,
+      shockActive: shock.shockActive,
+      shockKind: shock.shockKind,
+      shockShiftOffMin: shock.shiftOffMin,
+      shockReason: shock.reason,
+      driftOffset: args.driftOffset,
+      driftSampleCount: args.driftSampleCount,
+      biasRatio: args.biasResult.biasRatioOn,
+      biasRatioOff: args.biasResult.biasRatioOff,
+      biasSampleCount: args.biasResult.sampleCount,
+      volatilityEMA: args.volatilityEMA,
+      volatilityLabel: args.volatilityEMA < 20 ? "Low" : args.volatilityEMA < 45 ? "Moderate" : args.volatilityEMA < 90 ? "Elevated" : "High",
+      crisisShift,
+      learningStrength: Math.round((effectiveWeightedSamples / 25) * 100),
+      effectiveWeightedSamples,
+      effectiveWeightedSamplesOn: onDurations.length,
+      madOff: madOffVal,
+      madOn: madOnVal,
+      predictionQuality: qualityFactors,
+      offDurationCurve: model.offCurve,
+      historySource: "shared base-model learning (phase models never write accuracy rows)",
+      rangeWasClamped: false,
+    },
+  };
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -1268,17 +1540,9 @@ Deno.serve(async (req) => {
       : stabilityScore >= 45 ? "Slightly Unstable" : "Unstable";
     const isUnstable = stabilityScore < 45;
 
-    // ── 19. Expected ranges ───────────────────────────────────────────────────
-    const computeRange = (arr: number[]) => {
-      if (arr.length === 0) return null;
-      const avg = mean(arr);
-      const sd = stdDev(arr);
-      const minMin = Math.max(5, Math.round(avg - sd));
-      const maxMin = Math.round(avg + sd);
-      return { minMin, maxMin, label: `${durationLabel(minMin)}–${durationLabel(maxMin)}` };
-    };
-    const expectedOffRange = computeRange(offDurations);
-    const expectedOnRange = computeRange(onDurations);
+    // ── 19. Expected ranges (v6.2: shared module-level helper, same logic) ──
+    const expectedOffRange = computeExpectedRange(offDurations);
+    const expectedOnRange = computeExpectedRange(onDurations);
 
     // ── 20. Confidence label ──────────────────────────────────────────────────
     const confidenceLabel =
@@ -1333,6 +1597,35 @@ Deno.serve(async (req) => {
 
     const currentPeriod = getPeriod(nowMs);
 
+    // ── 21b. Phase-group models (v6.2) ──────────────────────────────────────
+    // ONE shared module (computePhaseModel), called once per group with only
+    // the phase offset VALUE changed. The base model above is untouched and
+    // remains the ONLY learning model; a failing phase can never take the
+    // base model down (per-phase try/catch).
+    const phaseModels: Record<string, Record<string, unknown>> = {};
+    for (const phaseOffsetHours of PHASE_GROUP_OFFSETS_HOURS) {
+      const phaseKey = phaseOffsetHours > 0 ? `+${phaseOffsetHours}` : `${phaseOffsetHours}`;
+      try {
+        phaseModels[phaseKey] = computePhaseModel({
+          phaseOffsetHours,
+          extEvents: (extEvents ?? []) as PowerEvent[],
+          currentState,
+          currentStateStartMs,
+          inverterOffline,
+          driftOffset,
+          driftSamples,
+          driftSampleCount,
+          biasResult,
+          biasSamples,
+          volatilityEMA,
+          nowMs,
+        });
+      } catch (phaseErr) {
+        console.error(`[analyze-patterns] phase model ${phaseKey} failed (non-fatal):`, phaseErr);
+      }
+    }
+    console.log(`[analyze-patterns] Phase models computed: ${Object.keys(phaseModels).join(", ") || "none"}`);
+
     // ── 22. Assemble prediction object (v4 shape + v5 additions) ─────────────
     const prediction = {
       currentState,
@@ -1346,6 +1639,9 @@ Deno.serve(async (req) => {
       expectedOnRange,
       daySchedule,
       snapshots,
+      // v6.2: dedicated per-phase models (additive — older clients ignore
+      // this key and keep using the base model with the full user offset).
+      phaseModels,
 
       confidence,
       confidenceLabel,
@@ -1436,6 +1732,7 @@ Deno.serve(async (req) => {
         computedAt: prediction.computedAt,
         accuracyInserted: accInserted,
         snapshotCount: snapshots.length,
+        phaseModelKeys: Object.keys(phaseModels),
       }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );

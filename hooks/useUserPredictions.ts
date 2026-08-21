@@ -54,6 +54,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePredictions } from './usePredictions';
 import { supabase } from '../lib/supabase';
 import { serverNowMs } from '../lib/serverTime';
+import { selectPhaseGroup } from '../lib/phaseGroups';
 import {
   applyOffsetToPrediction as _applyOffsetToPrediction,
   fmtYemenTime,
@@ -858,17 +859,47 @@ export function useUserPredictions(
           }
         : null;
 
+      // ── APPPE v6.2: phase-model selection ────────────────────────────────
+      // When the EFFECTIVE offset (frozen community offset wins, exactly as
+      // the engine resolves it) rounds to an hour group that has a dedicated
+      // server-side phase model, the engine below runs on THAT model and only
+      // the sub-hour residual is applied as the shift — minute precision is
+      // preserved (e.g. +5h18m → "+5" model + 18 min). Offsets without a
+      // dedicated group (or an old server without phaseModels) keep the exact
+      // pre-v6.2 behavior: base model + full offset.
+      // IMPORTANT: everything that anchors on REAL sensor events (Growatt-ON
+      // watchers, immediate flips, reconciliation) keeps using the FULL
+      // physical offsetMinutes — a phase model only replaces the learned
+      // schedule/statistics source, never the physical sensor relationship.
+      const effectiveFullOffset = frozenOffsetRef.current ?? offsetMinutes;
+      const phaseGroup = selectPhaseGroup(effectiveFullOffset);
+      const phaseModel = (phaseGroup ? (prediction as any).phaseModels?.[phaseGroup.key] : null) ?? null;
+      // Offsets fed INTO the engine live in the phase model's residual domain;
+      // the frozen community offset (a full physical offset) is converted too,
+      // otherwise the phase-shifted schedule would be shifted twice.
+      const engineOffsetMinutes = phaseModel && phaseGroup
+        ? effectiveFullOffset - phaseGroup.groupHours * 60
+        : offsetMinutes;
+      const engineFrozenOffset = phaseModel && phaseGroup && frozenOffsetRef.current !== null
+        ? frozenOffsetRef.current - phaseGroup.groupHours * 60
+        : frozenOffsetRef.current;
+
       const handleOffsetCalculated = (
         computedOffsetMinutes: number,
         _meta: { sign: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'; referenceIso: string | null; referenceKind: string | null },
       ) => {
+        // APPPE v6.2: with a phase model active, the engine's Q2-A offset was
+        // measured against the PHASE model's raw slots — convert it back to
+        // the full physical offset vs the sensor timeline before
+        // freezing/persisting (onCommunityOffsetComputed writes user_offsets).
+        const fullComputedOffsetMinutes = computedOffsetMinutes + (phaseModel && phaseGroup ? phaseGroup.groupHours * 60 : 0);
         if (frozenOffsetRef.current === null && resyncPoint) {
-          frozenOffsetRef.current = computedOffsetMinutes;
+          frozenOffsetRef.current = fullComputedOffsetMinutes;
           const derivedState: OffsetState = _meta.sign === 'POSITIVE'
             ? 'POSITIVE' : _meta.sign === 'NEGATIVE' ? 'NEGATIVE' : 'NEUTRAL';
           frozenOffsetStateRef.current = derivedState;
           frozenAlignmentRef.current = _meta.referenceIso ?? resyncPoint.syncedAtIso;
-          AsyncStorage.setItem(frozenOffsetStorageKey(resyncPoint.syncedAtIso), String(computedOffsetMinutes)).catch(() => {});
+          AsyncStorage.setItem(frozenOffsetStorageKey(resyncPoint.syncedAtIso), String(fullComputedOffsetMinutes)).catch(() => {});
           AsyncStorage.setItem(frozenOffsetStateStorageKey(resyncPoint.syncedAtIso), derivedState).catch(() => {});
           AsyncStorage.setItem(frozenAlignmentStorageKey(resyncPoint.syncedAtIso), frozenAlignmentRef.current).catch(() => {});
           // ISSUE-FIX (pending clobber): never persist the engine-computed
@@ -879,7 +910,7 @@ export function useUserPredictions(
           // poisoned later snapshots/reverts with NEUTRAL 0. The backend
           // resolver is the only writer allowed to resolve a pending.
           if (resyncPoint.offsetState !== 'PENDING_NEGATIVE' && resyncPoint.offsetValue !== 'PENDING') {
-            onCommunityOffsetComputed?.(computedOffsetMinutes);
+            onCommunityOffsetComputed?.(fullComputedOffsetMinutes);
           }
         }
       };
@@ -898,14 +929,16 @@ export function useUserPredictions(
       };
 
       // ── Engine pipeline ──────────────────────────────────────────────────
+      // v6.2: engine input = the dedicated phase model when selected (its
+      // schedule is already phase-shifted server-side), else the base model.
       const engineResult = _applyOffsetToPrediction(
-        prediction as any,
-        offsetMinutes,
+        (phaseModel ?? prediction) as any,
+        engineOffsetMinutes,
         resyncPoint,
         syncMeta,
         transitionMode,
         anchorStartIso,
-        frozenOffsetRef.current,
+        engineFrozenOffset,
         handleOffsetCalculated,
         nowV22,
         handleAccuracyEvent,
@@ -949,6 +982,12 @@ export function useUserPredictions(
       let v21Result: UserPrediction = {
         ...engineResult,
         daySchedule: v21Schedule,
+        // v6.2: the engine ran on the RESIDUAL offset (phase-model domain),
+        // so engineResult.offsetMinutes is the residual. Restore the FULL
+        // physical offset here — downstream UI derives real sensor-event
+        // times from it (e.g. the scheduled-transition banner subtracts
+        // offsetMinutes from the scheduled flip to get the sensor's flip).
+        offsetMinutes: effectiveFullOffset,
         offsetState: finalOffsetState,
         offsetValue: finalOffsetValue,
         timelineAlignment: finalTimelineAlignment,
