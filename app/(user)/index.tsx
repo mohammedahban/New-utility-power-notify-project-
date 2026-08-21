@@ -595,7 +595,8 @@ const rwStyles = StyleSheet.create({
   badgeText: { fontSize: 11.5, fontWeight: '800' },
   body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 14 },
   timerLabel: { fontSize: 12.5, fontWeight: '700', textAlign: 'right', marginBottom: 10 },
-  timerRow: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 14 },
+  // LTR: digits/colon must flow left→right even under RTL (hours:minutes:seconds)
+  timerRow: { flexDirection: 'row', direction: 'ltr', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 14 },
   timerUnit: { borderRadius: 14, paddingVertical: 10, paddingHorizontal: 14, alignItems: 'center', minWidth: 72, borderWidth: 1 },
   timerVal: { fontSize: 28, fontWeight: '900', fontVariant: ['tabular-nums'], letterSpacing: 1, writingDirection: 'ltr' },
   timerSub: { color: T.textMuted, fontSize: 10.5, fontWeight: '600', marginTop: 2 },
@@ -616,7 +617,8 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   const isHolding = prediction?.isHoldingState ?? false;
   const isOn = prediction?.currentState === 'ON';
   const color = isOn ? T.success : T.danger;
-  const offsetStateChip = <OffsetStateChip prediction={prediction} />;
+  // The offset chip (فارق سلبي/إيجابي) was removed from this card per design;
+  // the OffsetStateChip component itself is kept untouched above for reuse.
   const elapsed = useElapsedFromIso(anchorStartIso);
   const meta = prediction?.communitySyncMeta;
   const syncElapsed = useElapsedFromIso(meta?.syncedAtIso ?? null);
@@ -648,9 +650,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
   // SPEC-FIX C2: round total minutes ONCE, then split — the old floor/round
   // mix could show e.g. "1 س و 60 د" when remainMinutes was 119.6.
   const remainTotalMin = remainMinutes !== null ? Math.round(remainMinutes) : null;
-  const remainH = remainTotalMin !== null ? Math.floor(remainTotalMin / 60) : 0;
-  const remainM = remainTotalMin !== null ? remainTotalMin % 60 : 0;
-  const remainLabel = remainTotalMin === null ? null : remainTotalMin < 1 ? 'قريباً' : remainH === 0 ? `${remainM} دقيقة` : remainM === 0 ? (remainH === 1 ? 'ساعة' : remainH === 2 ? 'ساعتان' : `${remainH} ساعات`) : `${remainH} س و ${remainM} د`;
 
   const [revertConfirmVisible, setRevertConfirmVisible] = useState(false);
   const handleRevertPress = useCallback(() => {
@@ -764,8 +763,6 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
         </Text>
       )}
 
-      {offsetStateChip}
-
       {/* community sync banner (COMMUNITY_SYNCED only) — content unchanged */}
       {isSynced && (
         <View style={[psStyles.communityBanner, { borderColor: T.accent + '44' }]}>
@@ -784,20 +781,19 @@ function PersonalStatusCard({ prediction, anchorStartIso, onRevertToGrowatt, has
 
       {RevertBlock}
 
-      {/* elapsed / remaining stat cards */}
-      {(elapsed || remainLabel) ? (
-        <View style={psStyles.timeRow}>
-          {elapsed ? (<View style={psStyles.timeBlock}><Text style={psStyles.timeLabel}>منذ (وقت فعلي)</Text><Text style={[psStyles.timeValue, { color: color + 'cc' }]}>{elapsed}</Text></View>) : null}
-          {remainLabel ? (<View style={[psStyles.timeBlock, psStyles.timeBlockDashed, { borderColor: color + '77' }]}><Text style={psStyles.timeLabel}>{isSynced ? 'الوقت المتوقع المتبقي:' : 'متبقي (تقديري)'}</Text><Text style={[psStyles.timeValue, { color }]}>{remainLabel}</Text></View>) : null}
-        </View>
-      ) : null}
-
-      {/* THE one waiting card — sits directly below the "منذ" block. Shows
-          the amber early-chance design 20 min before the predicted range
-          starts, then the green/red "any moment now" design with a live
-          count-up until the transition is confirmed. Replaces all the old
-          ATC waiting badges and hold cards for every account type. */}
+      {/* THE one waiting card — shows the amber early-chance design 20 min
+          before the predicted range starts, then the green/red "any moment
+          now" design with a live count-up until the transition is confirmed.
+          Replaces all the old ATC waiting badges and hold cards for every
+          account type. (The old "منذ/متبقي" stat cards were removed per
+          design — elapsed time still lives inside the hero ring.) */}
       <RangeWatchCard prediction={prediction} />
+
+      {/* Upcoming transition — moved INSIDE this card per design (replaces the
+          removed offset chip + منذ/متبقي cards, making the card taller).
+          Same component/logic as before, rendered as a seamless section
+          instead of a standalone card. */}
+      <UpcomingTransitionSection prediction={prediction} />
 
       {DurationsBlock}{ReasoningBlock}
     </View>
@@ -816,11 +812,6 @@ const psStyles = StyleSheet.create({
   ringStatus: { fontSize: 27, fontWeight: '900', textAlign: 'center', lineHeight: 34 },
   ringElapsed: { color: T.textSecondary, fontSize: 13.5, fontWeight: '600', textAlign: 'center', marginTop: 6 },
   ringPctLine: { color: T.textSecondary, fontSize: 12.5, fontWeight: '600', textAlign: 'center', marginTop: 10, marginBottom: 2 },
-  timeRow: { flexDirection: 'row-reverse', gap: 10, marginBottom: 14, marginTop: 4 },
-  timeBlock: { flex: 1, backgroundColor: T.elevated, borderRadius: 16, padding: 14, borderWidth: 1, borderColor: 'transparent' },
-  timeBlockDashed: { backgroundColor: T.surface, borderStyle: 'dashed' },
-  timeLabel: { color: T.textMuted, fontSize: 11.5, fontWeight: '600', textAlign: 'right', marginBottom: 5 },
-  timeValue: { fontSize: 21, fontWeight: '800', textAlign: 'right' },
   durSection: { marginTop: 6 },
   durSectionTitle: { color: T.textMuted, fontSize: 11.5, fontWeight: '700', textAlign: 'right', marginBottom: 8 },
   durRow: { flexDirection: 'row-reverse', gap: 8 },
@@ -852,9 +843,12 @@ const psStyles = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UPCOMING TRANSITION CARD — dashed estimate card (screenshot style)
+// UPCOMING TRANSITION SECTION — the old dashed "التوقع القادم" card, merged
+// INTO PersonalStatusCard (one tall modern card). Same content and logic, new
+// home: a section with a top divider below the RangeWatchCard.
+// All time ranges and countdown digits are forced LTR (times read left→right).
 // ─────────────────────────────────────────────────────────────────────────────
-function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | null }) {
+function UpcomingTransitionSection({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
   const atcMode = prediction?.atc?.mode ?? 'NORMAL';
   const isHolding = prediction?.isHoldingState ?? false;
@@ -891,9 +885,9 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   // All waiting/hold states (UNCERTAIN_ZONE / WAITING_FOR_GROWATT /
   // GRACE_MODE and every other hold mode except the scheduled-change one)
-  // are now covered by the single RangeWatchCard rendered below the "منذ"
-  // block inside PersonalStatusCard — this card renders NOTHING while those
-  // waits are active, so the waiting info appears exactly once on screen.
+  // are covered by the single RangeWatchCard inside this same card — this
+  // section renders NOTHING while those waits are active, so the waiting
+  // info appears exactly once on screen.
   if (isHolding && atcMode !== 'NORMAL' && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING') {
     return null;
   }
@@ -901,7 +895,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   if (isHolding && atcMode === 'POSITIVE_OFFSET_PENDING') {
     const isCurrentOn = prediction.currentState === 'ON';
     return (
-      <View style={[utStyles.card, { borderColor: T.accent + '44' }]}>
+      <View style={utStyles.section}>
         <View style={utStyles.headerRow}>
           <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
         </View>
@@ -926,7 +920,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
 
   if (!nt) {
     return (
-      <View style={[utStyles.card, { borderColor: T.warning + '44' }]}>
+      <View style={utStyles.section}>
         <View style={utStyles.headerRow}>
           <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
         </View>
@@ -951,7 +945,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   const windowDays = Math.max(1, Math.round((prediction.dataWindowHours ?? 24) / 24));
 
   return (
-    <View style={[utStyles.card, { borderColor: color + '55' }]}>
+    <View style={utStyles.section}>
       <View style={utStyles.headerRow}>
         <View style={[utStyles.confBadge, { backgroundColor: confColor + '20', borderColor: confColor + '44' }]}><Text style={[utStyles.confText, { color: confColor }]}>{confText}</Text></View>
         <Text style={utStyles.cardTitle}>⚡ التوقع القادم</Text>
@@ -961,6 +955,7 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
       </View>
       {showCrisisAwareChip && (<View style={utStyles.crisisAwareChip}><Text style={utStyles.crisisAwareChipText}>⚠️ محرك التوقع يتكيّف مع تغيّر النمط — قد تتأثر دقة التوقع</Text></View>)}
       <Text style={[utStyles.rangeBoxLabel, { color: T.textSecondary }]}>{isNextOn ? 'يُرجَّح أن تشتغل الكهرباء خلال هذا النطاق:' : 'يُرجَّح أن تنطفئ الكهرباء خلال هذا النطاق:'}</Text>
+      {/* LTR: start time on the LEFT, "إلى" in the middle, end time on the RIGHT */}
       <View style={utStyles.rangeTimesRow}>
         <Text style={[utStyles.rangeTimeBig, { color }]}>{fmtTimeAr(nt.rangeStartIso) || (nt as any).earliestFormatted || '—'}</Text>
         <Text style={utStyles.rangeTo}>إلى</Text>
@@ -969,7 +964,8 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
       {!nt.inRangeWindow && (
         <View style={utStyles.countdownSection}>
           <Text style={utStyles.countdownLabel}>يبدأ النطاق بعد حوالي</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginBottom: 12 }}>
+          {/* LTR: hours : minutes : seconds, read left → right */}
+          <View style={utStyles.countdownRow}>
             {h > 0 && (<><View style={utStyles.cdUnit}><Text style={[utStyles.cdVal, { color }]}>{String(h).padStart(2, '0')}</Text><Text style={utStyles.cdSub}>س</Text></View><Text style={[utStyles.cdColon, { color }]}>:</Text></>)}
             <View style={utStyles.cdUnit}><Text style={[utStyles.cdVal, { color }]}>{String(m).padStart(2, '0')}</Text><Text style={utStyles.cdSub}>د</Text></View>
             <Text style={[utStyles.cdColon, { color }]}>:</Text>
@@ -1000,7 +996,11 @@ function UpcomingTransitionCard({ prediction }: { prediction: UserPrediction | n
   );
 }
 const utStyles = StyleSheet.create({
-  card: { backgroundColor: T.surface, borderRadius: 26, padding: 20, marginBottom: 14, borderWidth: 1.5, borderStyle: 'dashed' },
+  // Rendered as a seamless section INSIDE PersonalStatusCard (no standalone
+  // card chrome) — a soft divider separates it from the content above.
+  section: { marginTop: 16, paddingTop: 18, borderTopWidth: 1, borderColor: T.border + '88' },
+  // LTR row (Yoga direction): hours:minutes:seconds read left → right, RTL-immune
+  countdownRow: { flexDirection: 'row', direction: 'ltr', alignItems: 'baseline', gap: 4, marginBottom: 12 },
   headerRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
   cardTitle: { color: T.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1.2 },
   confBadge: { borderRadius: 20, paddingHorizontal: 12, paddingVertical: 5, borderWidth: 1 },
@@ -1011,7 +1011,8 @@ const utStyles = StyleSheet.create({
   rangeBoxLabel: { fontSize: 13.5, fontWeight: '600', marginBottom: 12, textAlign: 'center' },
   rangeTimeStack: { alignItems: 'center', gap: 8 },
   rangeTime: { fontSize: 32, fontWeight: '900', textAlign: 'center', letterSpacing: -0.5, writingDirection: 'ltr' },
-  rangeTimesRow: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 18 },
+  // LTR row (Yoga direction): start time LEFT → end time RIGHT, RTL-immune
+  rangeTimesRow: { flexDirection: 'row', direction: 'ltr', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 18 },
   rangeTimeBig: { fontSize: 34, fontWeight: '900', letterSpacing: -0.5, writingDirection: 'ltr' },
   rangeTo: { color: T.textMuted, fontSize: 15, fontWeight: '700' },
   rangeSep: { fontSize: 14, fontWeight: '600', color: T.textMuted },
@@ -1462,8 +1463,9 @@ export default function Home() {
         <ParticipationNudge userId={profile?.id} />
         <PositiveOffsetPendingBanner prediction={stablePrediction} />
         <ValidationWindowToast prediction={stablePrediction} />
+        {/* Upcoming-transition content now renders INSIDE PersonalStatusCard
+            (as UpcomingTransitionSection) per design — no standalone card. */}
         <PersonalStatusCard prediction={stablePrediction} anchorStartIso={anchorStartIso} onRevertToGrowatt={handleRevert} hasSnapshot={hasSnapshot} reasoningLine={stablePrediction?.reasoning?.[0] ?? undefined} />
-        <UpcomingTransitionCard prediction={stablePrediction} />
         {stablePrediction && (<StabilityBar score={stablePrediction.stabilityScore} label={stablePrediction.stabilityLabel} />)}
         <CommunityActivity pendingAlerts={pendingCount} onViewAll={() => router.push('/(user)/community')} userId={profile?.id} onReporterPress={(rid) => router.push(`/(user)/reporter/${rid}` as any)} />
       </ScrollView>

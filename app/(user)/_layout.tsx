@@ -400,14 +400,6 @@ function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
           }}
         />
         <Tabs.Screen
-          name="history"
-          options={{
-            title: 'السجل',
-            headerTitle: 'السجل',
-            tabBarIcon: ({ color, size }) => <Ionicons name="time-outline" size={size} color={color} />,
-          }}
-        />
-        <Tabs.Screen
           name="settings"
           options={{
             title: 'إعداداتي',
@@ -416,6 +408,18 @@ function UserLayoutInner({ reportModalVisible, setReportModalVisible }: {
           }}
         />
         {/* Hidden screens — not shown in tab bar */}
+        {/* السجل (history): hidden from the bottom navigation per product
+            decision, but the route, screen file and ALL its logic stay fully
+            intact (href:null only removes the tab button) — it can be
+            re-enabled later by restoring the tabBarIcon/title options. */}
+        <Tabs.Screen
+          name="history"
+          options={{
+            href: null,
+            title: 'السجل',
+            headerTitle: 'السجل',
+          }}
+        />
         <Tabs.Screen
           name="reporter/[id]"
           options={{
