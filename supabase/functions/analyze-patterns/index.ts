@@ -39,8 +39,10 @@
  *      (computePhaseModel) is re-run per offset-hour group (+5…+9, −3…−7 —
  *      intentionally asymmetric) over the phase-shifted event stream, each
  *      producing its own stats/curves/schedule/confidence. Embedded as
- *      prediction.phaseModels; they never write accuracy rows — all learning
- *      stays exclusive to the base Growatt model.
+ *      prediction.phaseModels; they never write accuracy rows and never run
+ *      their own shock/crisis detection — all learning and all operational
+ *      decisions stay exclusive to the base Growatt model and are only
+ *      inherited (then phase-applied) by the phase models.
  *
  * IMPORTANT: This function must remain deployed at all times.
  * poll-growatt calls it automatically after every state change detection.
@@ -1062,30 +1064,39 @@ function computeExpectedRange(arr: number[]): { minMin: number; maxMin: number; 
 // ── v6.2 Phase-model module ─────────────────────────────────────────────────
 //
 // ONE module for ALL phase groups — the only thing that changes between runs
-// is the phase offset VALUE. The module re-runs the full analysis pipeline
+// is the phase offset VALUE. The module re-runs the statistical pipeline
 // independently over the phase-shifted event stream: cycle extraction,
-// pattern stats, the circadian kernel duration model, crisis detection, the
-// shock detector, schedule generation, next-transition, confidence and
-// reasoning are ALL recomputed from the shifted stream — no outputs are
-// copied from the base model. Shared inputs are limited to:
+// pattern stats, the circadian kernel duration model, schedule generation,
+// next-transition, confidence and reasoning are ALL recomputed from the
+// shifted stream — no schedule/statistic is copied from the base model.
+//
+// Operational source-of-truth responsibilities stay EXCLUSIVE to the base
+// model — a phase model NEVER runs its own shock/crisis detection and never
+// writes accuracy rows. It only inherits the base model's decisions
+// (crisisActive/crisisShift/shock, plus the learned drift/bias corrections
+// and volatility EMA) and APPLIES them to its own phase-correct schedule.
+// Shared inputs are therefore limited to:
 //   • the physical sensor facts (current state + when it started), moved by
 //     the phase offset to anchor the phase timeline, and
-//   • the base model's LEARNED corrections (drift offset, bias ratios,
-//     volatility EMA, sample pools) — phase models have no accuracy history
-//     of their own (accuracy learning is intentionally base-model-only), so
-//     they inherit the regime-level corrections while their statistics,
-//     curves, schedules and reasoning stay fully their own.
+//   • the base model's operational decisions + learned corrections.
 //
 // Output: a payload with the SAME shape as the base prediction (plus
 // apppe.phaseOffsetHours), embedded under prediction.phaseModels["+5" …].
 // Clients pick their phase model by rounding the user offset to the nearest
-// hour group and apply only the sub-hour residual on top (minute precision).
+// hour group (see lib/phaseGroups.ts) and apply only the sub-hour residual
+// on top (minute precision).
 function computePhaseModel(args: {
   phaseOffsetHours: number;
   extEvents: PowerEvent[];          // 80-day learning window (unshifted)
   currentState: "ON" | "OFF";       // real sensor state — shared physical fact
   currentStateStartMs: number;      // real sensor state start (unshifted)
   inverterOffline: boolean;
+  // ── Base-model operational decisions (single source of truth) ──────────
+  crisisActive: boolean;            // detected on the BASE model only
+  crisisReason: string | null;      // detected on the BASE model only
+  crisisShift: { on: number; off: number }; // detected on the BASE model only
+  shock: ShockResult;               // detected on the BASE model only
+  // ── Base-model learned corrections (accuracy learning is base-only) ────
   driftOffset: number;              // learned on the base model — applied as-is
   driftSamples: number[];           // base drift sample pool (quality factor)
   driftSampleCount: number;
@@ -1118,16 +1129,29 @@ function computePhaseModel(args: {
   // ── 3. Kernel duration model (independent) ────────────────────────────────
   const model = buildDurationModel(cycles, nowMs);
 
-  // ── 4. Crisis + shock detection (independent, over the shifted stream) ────
-  const last24hCycles = cycles.filter(c => c.startMs > nowMs - 24 * 3600_000);
-  const { crisisActive, crisisReason, crisisShift } = detectCrisis(last24hCycles, cycles);
-  const shock = detectShock(cycles, model);
+  // ── 4. Crisis + shock: INHERITED from the base model (never detected here) ─
+  // The base model is the single source of truth for operational decisions.
+  // A phase model only APPLIES the base's crisis shift / shock correction to
+  // its own phase-anchored schedule — it has no detector of its own.
+  const { crisisActive, crisisReason, crisisShift } = args;
+  const baseShock = args.shock;
 
   // ── 5. Schedule anchored at the phase timeline's current-state start ──────
   // Positive phases right after a sensor flip anchor in the FUTURE: the
   // schedule starts ahead of "now" and the client engine holds the prior
   // state until the first slot begins (same mechanics as a positive offset).
   const phaseStateStartMs = args.currentStateStartMs + shiftMs;
+  // Guard: an IN-RUN shock extends the CURRENT run using elapsed time, which
+  // is only meaningful once the run has actually started on this phase
+  // timeline. With a future anchor (positive phase right after a flip) the
+  // shock run has not begun there yet and the elapsed-based extension would
+  // corrupt the first slot — drop it. PERSISTENT shocks (and crisis shifts)
+  // adjust future-run durations in minutes, which are phase-independent
+  // physical quantities, so they still apply.
+  const appliedShock: ShockResult =
+    baseShock.shockKind === "inrun" && phaseStateStartMs > nowMs
+      ? { shockActive: false, shockKind: "none", shiftOffMin: 0, reason: null }
+      : baseShock;
   const daySchedule = generateDaySchedule(
     args.currentState,
     phaseStateStartMs,
@@ -1137,7 +1161,7 @@ function computePhaseModel(args: {
     nowMs,
     crisisActive,
     crisisShift,
-    shock,
+    appliedShock,
   );
 
   // ── 6. Next transition (per phase timeline) ───────────────────────────────
@@ -1194,17 +1218,20 @@ function computePhaseModel(args: {
       );
     }
   }
+  // Crisis/shock lines report the BASE model's decisions (inherited), and a
+  // shock line appears only when the correction was actually applied to this
+  // phase schedule (an in-run shock is not applied to a future anchor).
   if (crisisActive && crisisReason) {
     reasoning.push(`⚠️ وضع الأزمة: ${crisisReason}`);
   }
-  if (shock.shockActive && shock.shockKind === "inrun") {
+  if (appliedShock.shockActive && appliedShock.shockKind === "inrun") {
     reasoning.push(
       "⚠️ انقطاع ممتد: تجاوزت مدة الانقطاع الحالية النمط المعتاد لهذا الوقت — تم تمديد التوقع تلقائياً"
     );
-  } else if (shock.shockActive && shock.shockKind === "persistent") {
+  } else if (appliedShock.shockActive && appliedShock.shockKind === "persistent") {
     reasoning.push(
       `⚠️ كشف تغيّر مفاجئ في النمط (نقص وقود / طقس غائم / عطل): ` +
-      `تم تعديل توقعات الانقطاع بمقدار ${shock.shiftOffMin > 0 ? "+" : ""}${shock.shiftOffMin} دقيقة`
+      `تم تعديل توقعات الانقطاع بمقدار ${appliedShock.shiftOffMin > 0 ? "+" : ""}${appliedShock.shiftOffMin} دقيقة`
     );
   }
   if (args.driftOffset !== 0) {
@@ -1266,12 +1293,17 @@ function computePhaseModel(args: {
     apppe: {
       version: "6.2-phase",
       phaseOffsetHours,
+      // Operational decisions INHERITED from the base model (verbatim) — a
+      // phase model never detects shock/crisis on its own. shockApplied below
+      // records whether the inherited shock correction actually reached this
+      // phase's schedule (an in-run shock is skipped on a future anchor).
       crisisActive,
       crisisReason,
-      shockActive: shock.shockActive,
-      shockKind: shock.shockKind,
-      shockShiftOffMin: shock.shiftOffMin,
-      shockReason: shock.reason,
+      shockActive: baseShock.shockActive,
+      shockKind: baseShock.shockKind,
+      shockShiftOffMin: baseShock.shiftOffMin,
+      shockReason: baseShock.reason,
+      shockApplied: appliedShock.shockActive,
       driftOffset: args.driftOffset,
       driftSampleCount: args.driftSampleCount,
       biasRatio: args.biasResult.biasRatioOn,
@@ -1600,8 +1632,10 @@ Deno.serve(async (req) => {
     // ── 21b. Phase-group models (v6.2) ──────────────────────────────────────
     // ONE shared module (computePhaseModel), called once per group with only
     // the phase offset VALUE changed. The base model above is untouched and
-    // remains the ONLY learning model; a failing phase can never take the
-    // base model down (per-phase try/catch).
+    // remains the ONLY learning model AND the ONLY operational decision-maker:
+    // shock/crisis detection, drift and bias are computed once above and
+    // inherited by every phase model (never re-detected). A failing phase can
+    // never take the base model down (per-phase try/catch).
     const phaseModels: Record<string, Record<string, unknown>> = {};
     for (const phaseOffsetHours of PHASE_GROUP_OFFSETS_HOURS) {
       const phaseKey = phaseOffsetHours > 0 ? `+${phaseOffsetHours}` : `${phaseOffsetHours}`;
@@ -1612,6 +1646,12 @@ Deno.serve(async (req) => {
           currentState,
           currentStateStartMs,
           inverterOffline,
+          // Base model's operational decisions — the single source of truth.
+          crisisActive,
+          crisisReason,
+          crisisShift,
+          shock,
+          // Base model's learned corrections.
           driftOffset,
           driftSamples,
           driftSampleCount,
