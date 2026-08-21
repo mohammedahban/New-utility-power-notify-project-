@@ -470,6 +470,7 @@ function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
   const overrunMin = Math.max(0, Math.ceil(prediction?.atc?.overrunMinutes ?? 0));
   const rangeStartIso = nt?.rangeStartIso ?? null;
+  const rangeEndIso = nt?.rangeEndIso ?? null;
   // Ticks every second — when it hits 0 the card flips from the early-chance
   // phase to the active-wait phase live, without waiting for a server refresh.
   const cd = useCountdownSec(rangeStartIso);
@@ -562,6 +563,19 @@ function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
 
       <Text style={rwStyles.body}>{body}</Text>
 
+      {/* Exact predicted range times — RTL: start on the right, end on the
+          left. Hidden in hold waits: there the engine's range is stale and
+          untrustworthy (same rule as the upcoming-transition section). */}
+      {!inHoldWait && rangeStartIso && rangeEndIso && (
+        <View style={[rwStyles.rangeBox, { borderColor: color + '44', backgroundColor: unitBg }]}>
+          <Text style={[rwStyles.rangeLabel, { color }]}>{awaitingOn ? 'نطاق التشغيل المتوقع:' : 'نطاق الانطفاء المتوقع:'}</Text>
+          <View style={rwStyles.rangeRow}>
+            <Text style={[rwStyles.rangeTime, { color }]}>{fmtTimeAr(rangeStartIso) || '—'}</Text>
+            {rangeStartIso !== rangeEndIso && (<><Text style={rwStyles.rangeTo}>إلى</Text><Text style={[rwStyles.rangeTime, { color }]}>{fmtTimeAr(rangeEndIso) || '—'}</Text></>)}
+          </View>
+        </View>
+      )}
+
       <Text style={[rwStyles.timerLabel, { color }]}>{timerLabel}</Text>
       <View style={rwStyles.timerRow}>
         {units.map((u, i) => (
@@ -595,6 +609,14 @@ const rwStyles = StyleSheet.create({
   badgeText: { fontSize: 11.5, fontWeight: '800' },
   body: { color: T.textSecondary, fontSize: 13, lineHeight: 20, textAlign: 'right', marginBottom: 14 },
   timerLabel: { fontSize: 12.5, fontWeight: '700', textAlign: 'right', marginBottom: 10 },
+  // Predicted range times inside the waiting card: RTL row (start RIGHT →
+  // end LEFT, Yoga direction — layout-direction-immune); each time string
+  // keeps its digits LTR internally.
+  rangeBox: { borderRadius: 14, paddingVertical: 10, paddingHorizontal: 12, borderWidth: 1, marginBottom: 14, alignItems: 'center' },
+  rangeLabel: { fontSize: 12.5, fontWeight: '800', marginBottom: 6, textAlign: 'center' },
+  rangeRow: { flexDirection: 'row', direction: 'rtl', alignItems: 'center', justifyContent: 'center', gap: 10 },
+  rangeTime: { fontSize: 22, fontWeight: '900', letterSpacing: -0.5, writingDirection: 'ltr' },
+  rangeTo: { color: T.textMuted, fontSize: 13, fontWeight: '700' },
   // LTR: digits/colon must flow left→right even under RTL (hours:minutes:seconds)
   timerRow: { flexDirection: 'row', direction: 'ltr', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 14 },
   timerUnit: { borderRadius: 14, paddingVertical: 10, paddingHorizontal: 14, alignItems: 'center', minWidth: 72, borderWidth: 1 },
@@ -846,7 +868,8 @@ const psStyles = StyleSheet.create({
 // UPCOMING TRANSITION SECTION — the old dashed "التوقع القادم" card, merged
 // INTO PersonalStatusCard (one tall modern card). Same content and logic, new
 // home: a section with a top divider below the RangeWatchCard.
-// All time ranges and countdown digits are forced LTR (times read left→right).
+// Range times read RTL (start on the right, end on the left); countdown
+// digits stay forced LTR (read left→right).
 // ─────────────────────────────────────────────────────────────────────────────
 function UpcomingTransitionSection({ prediction }: { prediction: UserPrediction | null }) {
   const nt = prediction?.nextTransition ?? null;
@@ -955,7 +978,7 @@ function UpcomingTransitionSection({ prediction }: { prediction: UserPrediction 
       </View>
       {showCrisisAwareChip && (<View style={utStyles.crisisAwareChip}><Text style={utStyles.crisisAwareChipText}>⚠️ محرك التوقع يتكيّف مع تغيّر النمط — قد تتأثر دقة التوقع</Text></View>)}
       <Text style={[utStyles.rangeBoxLabel, { color: T.textSecondary }]}>{isNextOn ? 'يُرجَّح أن تشتغل الكهرباء خلال هذا النطاق:' : 'يُرجَّح أن تنطفئ الكهرباء خلال هذا النطاق:'}</Text>
-      {/* LTR: start time on the LEFT, "إلى" in the middle, end time on the RIGHT */}
+      {/* RTL: start time on the RIGHT, "إلى" in the middle, end time on the LEFT (countdown below stays LTR) */}
       <View style={utStyles.rangeTimesRow}>
         <Text style={[utStyles.rangeTimeBig, { color }]}>{fmtTimeAr(nt.rangeStartIso) || (nt as any).earliestFormatted || '—'}</Text>
         <Text style={utStyles.rangeTo}>إلى</Text>
@@ -1011,8 +1034,8 @@ const utStyles = StyleSheet.create({
   rangeBoxLabel: { fontSize: 13.5, fontWeight: '600', marginBottom: 12, textAlign: 'center' },
   rangeTimeStack: { alignItems: 'center', gap: 8 },
   rangeTime: { fontSize: 32, fontWeight: '900', textAlign: 'center', letterSpacing: -0.5, writingDirection: 'ltr' },
-  // LTR row (Yoga direction): start time LEFT → end time RIGHT, RTL-immune
-  rangeTimesRow: { flexDirection: 'row', direction: 'ltr', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 18 },
+  // RTL row (Yoga direction): start time RIGHT → end time LEFT, layout-direction-immune
+  rangeTimesRow: { flexDirection: 'row', direction: 'rtl', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 18 },
   rangeTimeBig: { fontSize: 34, fontWeight: '900', letterSpacing: -0.5, writingDirection: 'ltr' },
   rangeTo: { color: T.textMuted, fontSize: 15, fontWeight: '700' },
   rangeSep: { fontSize: 14, fontWeight: '600', color: T.textMuted },
