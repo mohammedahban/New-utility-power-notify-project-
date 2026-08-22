@@ -441,13 +441,16 @@ const pdcStyles = StyleSheet.create({
 // A single card rendered below the "منذ" block for EVERY account type
 // (positive / negative / neutral / pending-negative), in two phases:
 //
-//   • EARLY CHANCE (amber) — the 20 minutes BEFORE the predicted range
+//   • EARLY CHANCE (amber) — the 20 minutes BEFORE the predicted ON range
 //     starts. Electricity occasionally arrives EARLIER than the predicted
 //     range, so the user is prepared and primed to report instantly.
-//   • ACTIVE WAIT (green for an expected ON, red for an expected OFF) — from
-//     the range start until the transition is confirmed, however long that
-//     takes (UNCERTAIN_ZONE / WAITING_FOR_GROWATT / GRACE_MODE included),
-//     with a live count-up of the waiting time.
+//   • ACTIVE WAIT (green) — from the ON-range start until the sensor or a
+//     report confirms ON, however long that takes (UNCERTAIN_ZONE /
+//     WAITING_FOR_GROWATT / GRACE_MODE included), with a live count-up of
+//     the waiting time.
+//
+// NEVER rendered while waiting for OFF: ON→OFF is always automatic and the
+// app has no OFF report flow (rule restored from 0d4fb6a).
 //
 // Hidden in COMMUNITY_SYNCED (has its own sync banner) and
 // POSITIVE_OFFSET_PENDING (has its own scheduled-change countdown banner).
@@ -493,18 +496,22 @@ function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
   const inHoldWait = atcMode === 'UNCERTAIN_ZONE' || atcMode === 'WAITING_FOR_GROWATT' || atcMode === 'GRACE_MODE';
   const rangeStartMs = rangeStartIso ? new Date(rangeStartIso).getTime() : NaN;
 
+  // ON-WAITING ONLY (rule restored from 0d4fb6a): this card exists solely
+  // while waiting for the electricity to turn ON. ON→OFF is ALWAYS automatic
+  // (predicted ON duration consumed → OFF) — there is no OFF report flow, so
+  // the card must never wait for OFF or ask for an انطفاء report.
   let phase: 'early' | 'active' | null = null;
-  let awaitingOn = true;
   let rawAnchorMs: number | null = null;
   if (prediction && atcMode !== 'COMMUNITY_SYNCED' && atcMode !== 'POSITIVE_OFFSET_PENDING') {
     if (inHoldWait) {
-      phase = 'active';
-      awaitingOn = prediction.currentState !== 'ON';
-      rawAnchorMs = overrunMin > 0
-        ? serverNowMs() - overrunMin * 60_000
-        : (Number.isFinite(rangeStartMs) && rangeStartMs <= serverNowMs() ? rangeStartMs : serverNowMs());
-    } else if (Number.isFinite(rangeStartMs)) {
-      awaitingOn = nt?.type === 'UTILITY_ON';
+      // Hold states only count while holding OFF awaiting ON confirmation.
+      if (prediction.currentState !== 'ON') {
+        phase = 'active';
+        rawAnchorMs = overrunMin > 0
+          ? serverNowMs() - overrunMin * 60_000
+          : (Number.isFinite(rangeStartMs) && rangeStartMs <= serverNowMs() ? rangeStartMs : serverNowMs());
+      }
+    } else if (Number.isFinite(rangeStartMs) && nt?.type === 'UTILITY_ON') {
       if (cd.total <= 0 && serverNowMs() >= rangeStartMs) { phase = 'active'; rawAnchorMs = rangeStartMs; }
       else if (cd.total > 0 && cd.total <= RANGE_EARLY_MIN * 60) { phase = 'early'; }
     }
@@ -520,23 +527,19 @@ function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
   if (!prediction || phase === null) return null;
 
   const isEarly = phase === 'early';
-  const color = isEarly ? T.warning : (awaitingOn ? T.success : T.danger);
-  const bg = isEarly ? TINT.warningBg : (awaitingOn ? TINT.successBg : TINT.dangerBg);
-  const unitBg = isEarly ? '#1a1104' : (awaitingOn ? '#062015' : '#220c10');
+  const color = isEarly ? T.warning : T.success;
+  const bg = isEarly ? TINT.warningBg : TINT.successBg;
+  const unitBg = isEarly ? '#1a1104' : '#062015';
 
   const title = isEarly
-    ? (awaitingOn ? '⚡ الكهرباء قد تعود قبل موعدها!' : '⏻ الكهرباء قد تنطفئ قبل موعدها!')
-    : (awaitingOn ? '⚡ الكهرباء متوقَّعة في أي لحظة' : '⏻ الانطفاء متوقَّع في أي لحظة');
+    ? '⚡ الكهرباء قد تعود قبل موعدها!'
+    : '⚡ الكهرباء متوقَّعة في أي لحظة';
   const badgeText = isEarly
     ? 'فرصة مبكرة محتملة'
-    : (awaitingOn ? 'نطاق التوقع نشط' : 'نطاق الانطفاء نشط');
+    : 'نطاق التوقع نشط';
   const body = isEarly
-    ? (awaitingOn
-      ? 'أحياناً تعود الكهرباء قبل نطاق التوقع الرسمي — ليس المعتاد لكنه يحدث. كن مستعداً خلال هذه الدقائق، وإذا وصلتك الكهرباء الآن أرسل بلاغ تشغيل فوراً ليُؤكَّد توقيتك ويستفيد جيرانك.'
-      : 'أحياناً تنقطع الكهرباء قبل نطاق التوقع الرسمي — ليس المعتاد لكنه يحدث. كن مستعداً خلال هذه الدقائق، وإذا انقطعت الكهرباء عندك الآن أرسل بلاغ انطفاء فوراً ليُؤكَّد توقيتك ويستفيد جيرانك.')
-    : (awaitingOn
-      ? 'أنت الآن داخل نطاق التشغيل المتوقَّع — قد تعود الكهرباء في أي لحظة. التوقع غير مؤكد، فإذا وصلتك الكهرباء أرسل بلاغ تشغيل فوراً ليستفيد جيرانك.'
-      : 'أنت الآن داخل نطاق الانطفاء المتوقَّع — قد تنقطع الكهرباء في أي لحظة. التوقع غير مؤكد، فإذا انقطعت الكهرباء عندك أرسل بلاغ انطفاء فوراً ليستفيد جيرانك.');
+    ? 'أحياناً تعود الكهرباء قبل نطاق التوقع الرسمي — ليس المعتاد لكنه يحدث. كن مستعداً خلال هذه الدقائق، وإذا وصلتك الكهرباء الآن أرسل بلاغ تشغيل فوراً ليُؤكَّد توقيتك ويستفيد جيرانك.'
+    : 'أنت الآن داخل نطاق التشغيل المتوقَّع — قد تعود الكهرباء في أي لحظة. التوقع غير مؤكد، فإذا وصلتك الكهرباء أرسل بلاغ تشغيل فوراً ليستفيد جيرانك.';
 
   const timerLabel = isEarly ? 'يبدأ نطاق التوقع الرسمي خلال' : 'مدة الانتظار داخل النطاق';
   const units: { v: number; sub: string }[] = isEarly
@@ -549,7 +552,7 @@ function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
     ? `🎯 الموعد المتوقع لبدء النطاق: ${fmtTimeAr(rangeStartIso)} — وقد يسبقه التغيير أحياناً`
     : elevated
       ? '👥 بلاغات المجتمع ذات أولوية مرتفعة الآن — بلاغ واحد منك يؤكد التوقع لك ولجيرانك'
-      : (awaitingOn ? '📢 بلاغ تشغيل واحد منك يؤكد التوقع لك ولجيرانك' : '📢 بلاغ انطفاء واحد منك يؤكد التوقع لك ولجيرانك');
+      : '📢 بلاغ تشغيل واحد منك يؤكد التوقع لك ولجيرانك';
 
   return (
     <View style={[rwStyles.card, { backgroundColor: bg, borderColor: color + '66' }]}>
@@ -568,7 +571,7 @@ function RangeWatchCard({ prediction }: { prediction: UserPrediction | null }) {
           untrustworthy (same rule as the upcoming-transition section). */}
       {!inHoldWait && rangeStartIso && rangeEndIso && (
         <View style={[rwStyles.rangeBox, { borderColor: color + '44', backgroundColor: unitBg }]}>
-          <Text style={[rwStyles.rangeLabel, { color }]}>{awaitingOn ? 'نطاق التشغيل المتوقع:' : 'نطاق الانطفاء المتوقع:'}</Text>
+          <Text style={[rwStyles.rangeLabel, { color }]}>نطاق التشغيل المتوقع:</Text>
           <View style={rwStyles.rangeRow}>
             <Text style={[rwStyles.rangeTime, { color }]}>{fmtTimeAr(rangeStartIso) || '—'}</Text>
             {rangeStartIso !== rangeEndIso && (<><Text style={rwStyles.rangeTo}>إلى</Text><Text style={[rwStyles.rangeTime, { color }]}>{fmtTimeAr(rangeEndIso) || '—'}</Text></>)}

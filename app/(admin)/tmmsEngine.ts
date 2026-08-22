@@ -403,6 +403,13 @@ function computeATCMode(
   // (raw active slot is ON — prediction miss) from "user ON tail overlapping
   // Growatt OFF" (raw active slot is OFF — ON→OFF must stay automatic).
   rawSlots: ScheduleSlot[] = shiftedSlots,
+  // APPPE v6.2 FIX: when a server phase model drives the schedule, the
+  // `offsetMinutes` above is the sub-hour RESIDUAL (its sign can flip or
+  // zero out near hour boundaries — e.g. full offset -2h45m → group "-3" →
+  // residual +15m). All sign-based gating (POSITIVE pending / NEGATIVE
+  // uncertain holds / NEUTRAL mirror) MUST use the FULL PHYSICAL offset,
+  // otherwise a negative user is routed into the positive auto-ON branch.
+  gatingOffsetMinutes?: number,
 ): {
   mode: ScheduleStateMode;
   currentState: 'ON' | 'OFF';
@@ -521,7 +528,8 @@ function computeATCMode(
   // user is treated as negative; all displayed/stored offsets stay 0.
   const isPendingNegative = resyncPoint?.offsetState === 'PENDING_NEGATIVE' ||
     resyncPoint?.offsetValue === 'PENDING';
-  const offsetSign = isPendingNegative && offsetMinutes === 0 ? -1 : offsetMinutes;
+  const signSource = gatingOffsetMinutes ?? offsetMinutes;
+  const offsetSign = isPendingNegative && signSource === 0 ? -1 : signSource;
 
   // ── CASE 1: No active slot — user is between slots ───────────────────────
   //
@@ -1028,8 +1036,18 @@ export function applyOffsetToPrediction(
   ) => void,
   nowMs: number = serverNowMs(),
   onAccuracyEvent?: (event: AccuracyLogEvent) => void,
+  // APPPE v6.2 FIX: when a server phase model drives the schedule,
+  // `offsetMinutes`/`frozenCommunityOffset` are sub-hour RESIDUALS and
+  // `prediction.daySchedule` is the phase-shifted schedule. The ATC state
+  // machine must still GATE on the full physical offset sign and compare
+  // against the TRUE raw (unshifted) Growatt schedule — pass both here.
+  engineGating?: { gatingOffsetMinutes?: number; trueRawSlots?: ScheduleSlot[] },
 ): UserPrediction {
   const rawSlots: ScheduleSlot[] = prediction.daySchedule ?? [];
+  // True raw Growatt slots for sensor-timeline reasoning (positive-offset
+  // gate + Q2-A reference); falls back to the input schedule when no phase
+  // model is involved (pre-v6.2 behavior, byte-identical).
+  const sensorRawSlots: ScheduleSlot[] = engineGating?.trueRawSlots ?? rawSlots;
   const effectiveOffset = frozenCommunityOffset ?? offsetMinutes;
   const offsetMs = effectiveOffset * 60_000;
 
@@ -1044,7 +1062,8 @@ export function applyOffsetToPrediction(
     resyncPoint,
     transitionMode,
     nowMs,
-    rawSlots, // SPEC-FIX: raw Growatt slots for the positive-offset gate
+    sensorRawSlots, // SPEC-FIX: raw Growatt slots for the positive-offset gate
+    engineGating?.gatingOffsetMinutes,
   );
 
   // ── 3. Inject synthetic slot for POSITIVE_OFFSET_PENDING ───────────────────
@@ -1131,11 +1150,13 @@ export function applyOffsetToPrediction(
   if (resyncPoint && frozenCommunityOffset === null && onOffsetCalculated &&
       !hasAuthoritativeOffset && !isPendingResync) {
     const syncMs = new Date(resyncPoint.syncedAtIso).getTime();
-    const referenceSlot = rawSlots.find(s => {
+    // v6.2: measure against the TRUE raw schedule so the computed offset is
+    // the FULL physical offset even when a phase model drives the engine.
+    const referenceSlot = sensorRawSlots.find(s => {
       const startMs = new Date(s.startIso).getTime();
       const endMs = s.endIso ? new Date(s.endIso).getTime() : Infinity;
       return s.state === resyncPoint.syncedState && syncMs >= startMs && syncMs < endMs;
-    }) ?? rawSlots.find(s => s.state === resyncPoint.syncedState) ?? null;
+    }) ?? sensorRawSlots.find(s => s.state === resyncPoint.syncedState) ?? null;
 
     if (referenceSlot) {
       const refStartMs = new Date(referenceSlot.startIso).getTime();

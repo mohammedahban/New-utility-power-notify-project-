@@ -888,11 +888,10 @@ export function useUserPredictions(
         computedOffsetMinutes: number,
         _meta: { sign: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'; referenceIso: string | null; referenceKind: string | null },
       ) => {
-        // APPPE v6.2: with a phase model active, the engine's Q2-A offset was
-        // measured against the PHASE model's raw slots — convert it back to
-        // the full physical offset vs the sensor timeline before
-        // freezing/persisting (onCommunityOffsetComputed writes user_offsets).
-        const fullComputedOffsetMinutes = computedOffsetMinutes + (phaseModel && phaseGroup ? phaseGroup.groupHours * 60 : 0);
+        // APPPE v6.2 FIX: the engine now measures Q2-A against the TRUE raw
+        // sensor schedule (trueRawSlots below), so the computed offset is
+        // already the FULL physical offset — no conversion needed.
+        const fullComputedOffsetMinutes = computedOffsetMinutes;
         if (frozenOffsetRef.current === null && resyncPoint) {
           frozenOffsetRef.current = fullComputedOffsetMinutes;
           const derivedState: OffsetState = _meta.sign === 'POSITIVE'
@@ -931,6 +930,11 @@ export function useUserPredictions(
       // ── Engine pipeline ──────────────────────────────────────────────────
       // v6.2: engine input = the dedicated phase model when selected (its
       // schedule is already phase-shifted server-side), else the base model.
+      // v6.2 FIX: the phase model only replaces the LEARNED SCHEDULE source —
+      // the state machine must keep gating on the FULL PHYSICAL offset sign
+      // (the residual's sign can flip/zero near hour boundaries, which routed
+      // negative users into the positive auto-ON branch) and compare against
+      // the TRUE raw sensor schedule for the positive-offset gate + Q2-A.
       const engineResult = _applyOffsetToPrediction(
         (phaseModel ?? prediction) as any,
         engineOffsetMinutes,
@@ -942,6 +946,9 @@ export function useUserPredictions(
         handleOffsetCalculated,
         nowV22,
         handleAccuracyEvent,
+        phaseModel && phaseGroup
+          ? { gatingOffsetMinutes: effectiveFullOffset, trueRawSlots: ((prediction as any).daySchedule ?? []) }
+          : undefined,
       );
 
       // ── V2.1 layer: Offset State / Value / Alignment ─────────────────────
