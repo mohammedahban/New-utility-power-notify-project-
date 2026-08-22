@@ -1082,10 +1082,24 @@ export function useUserPredictions(
       // fabricated an ON hold with a countdown to the shifted OFF slot.
       // Stale-anchor safety comes from the anchor lifecycle instead: replaced
       // on every new Growatt ON, cleared when the user's ON window ends.
+      // HIDDEN COUNTDOWN INVALIDATION (spec 2026-08-22): a report from the
+      // current user or an accepted followed user whose transition time falls
+      // during/after the current Growatt ON anchor STOPS the hidden countdown
+      // immediately — the existing report logic takes over, and the anchor is
+      // cleared (else-branch below) so the countdown can never resurrect and
+      // overwrite the report-based state after the resync expires.
+      const reportInvalidatesPositiveAnchor =
+        offsetMinutes > 0 &&
+        growattOnIso !== null &&
+        resyncPoint !== null &&
+        Number.isFinite(Date.parse(resyncPoint.syncedAtIso)) &&
+        Date.parse(resyncPoint.syncedAtIso) >= growattOnMs - 60_000;
+
       const shouldPositiveGrowattAnchor =
         offsetMinutes > 0 &&
         growattOnIso !== null &&
-        modeV22 !== 'COMMUNITY_SYNCED';
+        modeV22 !== 'COMMUNITY_SYNCED' &&
+        !reportInvalidatesPositiveAnchor;
 
       if (shouldImmediateFlip && growattOnIso) {
         const growattOnMs = new Date(growattOnIso).getTime();
@@ -1277,10 +1291,26 @@ export function useUserPredictions(
           },
         };
       } else if (shouldPositiveGrowattAnchor && growattOnIso) {
-        // SPEC-FIX D1: anchor a positive-offset user's timeline on the live
-        // Growatt UTILITY_ON of the current cycle.
+        // HIDDEN POSITIVE-OFFSET COUNTDOWN (spec 2026-08-22).
+        // The Growatt OFF→ON flip starts an INTERNAL countdown:
+        //   duration = positive offset + predicted ON duration + 60 minutes,
+        //   anchored exactly at the Growatt ON start time.
+        // Rules:
+        //   • The countdown NEVER appears on Home/Index (no banner, no pill,
+        //     no popup) — the mode is normalized so every POSITIVE_OFFSET_PENDING
+        //     surface stays dark. Timer/state/expiration keep running internally.
+        //   • Growatt ON does NOT turn the user ON, and neither does the
+        //     countdown itself: the state stays OFF for the whole window, in
+        //     the same logical state as immediately before the flip.
+        //   • Any report (own or accepted followed) invalidates the countdown
+        //     (guard above) — report logic takes over and the countdown never
+        //     overwrites the report-based state afterwards.
+        //   • On expiry with no report: NO automatic ON. The user is set OFF
+        //     with the OFF elapsed anchored at the end of the predicted ON
+        //     window — exactly 60 minutes at the expiry instant — and the
+        //     prediction cycle resumes from there.
         const growattOnMsP = new Date(growattOnIso).getTime();
-        // User's ON starts = Growatt ON time + offset (positive → shifts forward)
+        // Predicted ON start for this user = Growatt ON + positive offset.
         const userOnStartMsP = growattOnMsP + offsetMinutes * 60_000;
         const userOnStartIsoP = new Date(userOnStartMsP).toISOString();
 
@@ -1288,27 +1318,41 @@ export function useUserPredictions(
           timeZone: 'Asia/Aden', hour: 'numeric', minute: '2-digit', hour12: true,
         }).replace('AM', ' ص').replace('PM', ' م');
 
-        // ON duration = the reference Growatt ON duration: the ACTUAL length
-        // once the sensor has turned back OFF (growattOffIso − growattOnIso),
-        // otherwise the most-predicted ON duration from the shifted schedule.
-        const growattOffMsP = growattOffIso ? new Date(growattOffIso).getTime() : NaN;
+        // Predicted ON duration — the existing engine value from the shifted
+        // schedule (no new calculation; the countdown does NOT switch to the
+        // actual sensor duration when Growatt turns back OFF).
         const scheduledOnSlotP = (v21Result.daySchedule ?? []).find(
           (s: ShiftedScheduleSlot) => s.state === 'ON' && new Date(s.startIso).getTime() >= growattOnMsP - 2 * 3600_000,
         );
-        const onDurationMsP = Number.isFinite(growattOffMsP) && growattOffMsP > growattOnMsP
-          ? growattOffMsP - growattOnMsP
-          : scheduledOnSlotP?.endIso
-            ? new Date(scheduledOnSlotP.endIso).getTime() - new Date(scheduledOnSlotP.startIso).getTime()
-            : 120 * 60_000;
+        const onDurationMsP = scheduledOnSlotP?.endIso
+          ? new Date(scheduledOnSlotP.endIso).getTime() - new Date(scheduledOnSlotP.startIso).getTime()
+          : 120 * 60_000;
         const userOnEndMsP = userOnStartMsP + onDurationMsP;
         const userOnEndIsoP = new Date(userOnEndMsP).toISOString();
 
-        // SPEC-FIX B4 (positive variant): never flip into an ON window that
-        // has already ended by now — release to the engine (the ON→OFF flip
-        // is automatic) and drop the spent anchor.
-        if (userOnEndMsP <= nowV22) {
+        // Countdown expiry = Growatt ON + offset + predicted ON + 60 minutes.
+        // Example: offset +100m, predicted ON 120m → 280m (08:00 → 12:40).
+        const hiddenExpiryMsP = userOnEndMsP + 60 * 60_000;
+        const hiddenExpiryIsoP = new Date(hiddenExpiryMsP).toISOString();
+
+        if (hiddenExpiryMsP <= nowV22) {
+          // COUNTDOWN EXPIRED with no report → NO automatic ON. Force OFF
+          // whose start is the end of the predicted ON window, so the OFF
+          // elapsed is exactly 60 minutes at the expiry instant and keeps
+          // counting; the prediction cycle resumes from 1h after the
+          // predicted ON period ended. Idempotent: pure derivation, no state
+          // writes. The anchor is KEPT so this state stays stable; it is
+          // replaced by the next Growatt ON (a fresh countdown) or cleared
+          // by a report (guard above). The engine's own schedule and next
+          // transition already describe the resumed cycle.
           immediateOnActiveRef.current = false;
-          shouldClearGrowattOnRef.current = true;
+          finalResult = {
+            ...v21Result,
+            currentState: 'OFF',
+            currentStateStartIso: userOnEndIsoP,
+            reconciledCycleStartIso: userOnEndIsoP,
+            isHoldingState: false,
+          };
           return finalResult;
         }
 
@@ -1344,104 +1388,76 @@ export function useUserPredictions(
           return true;
         });
 
-        if (userOnStartMsP > nowV22) {
-          // ON time still ahead → POSITIVE_OFFSET_PENDING countdown state.
-          // currentState stays OFF; the banner counts down to the user's own ON.
-          // Mirrors the engine's synthetic held-slot injection so the Home
-          // widgets and the Schedule page keep showing the held OFF plus the
-          // upcoming ON window even after Growatt turned back OFF.
-          const minFromNowP = Math.max(0, (userOnStartMsP - nowV22) / 60_000);
-          const offStartIsoP = (v21Result.currentState === 'OFF' && v21Result.currentStateStartIso)
-            ? v21Result.currentStateStartIso
-            : null;
-          const heldOffStartIsoP = offStartIsoP ?? growattOnIso;
-          const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
-          const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
-          const heldOffLabelP = heldOffDurMinP <= 0 ? '0د'
-            : hdHP === 0 ? `${hdMP}د`
-            : hdMP === 0 ? (hdHP === 1 ? 'ساعة' : `${hdHP}س`)
-            : `${hdHP}س ${hdMP}د`;
-          const syntheticHeldOffSlotP: ShiftedScheduleSlot = {
-            state: 'OFF',
-            startIso: heldOffStartIsoP,
-            endIso: userOnStartIsoP,
-            startFormatted: fmtLocalP(heldOffStartIsoP),
-            endFormatted: fmtLocalP(userOnStartIsoP),
-            shiftedStartFormatted: fmtLocalP(heldOffStartIsoP),
-            shiftedEndFormatted: fmtLocalP(userOnStartIsoP),
-            durationLabel: heldOffLabelP,
-            zone: 'DAY',
-            isEstimated: false,
-          };
-          finalResult = {
-            ...v21Result,
-            currentState: 'OFF',
-            currentStateStartIso: offStartIsoP,
-            isHoldingState: true,
-            daySchedule: [syntheticHeldOffSlotP, syntheticOnSlotP, ...restSlotsP],
-            nextTransition: {
-              type: 'UTILITY_ON' as const,
-              earliestTime: userOnStartIsoP,
-              latestTime: userOnStartIsoP,
-              earliestFormatted: fmtLocalP(userOnStartIsoP),
-              latestFormatted: fmtLocalP(userOnStartIsoP),
-              minFromNowMin: minFromNowP,
-              maxFromNowMin: minFromNowP,
-              rangeLabel: fmtLocalP(userOnStartIsoP),
-              rangeStartIso: userOnStartIsoP,
-              rangeEndIso: userOnStartIsoP,
-              inRangeWindow: false,
-            },
-            atc: {
-              ...v21Result.atc,
-              mode: 'POSITIVE_OFFSET_PENDING' as any,
-              statusLine: 'الحساس الرئيسي حوّل حالته — سيتم التحديث تلقائياً في الوقت المحدد',
-              overrunMinutes: 0,
-              communityElevated: false,
-              isHoldingState: true,
-              scheduledAutoTransitionIso: userOnStartIsoP,
-            },
-          };
-        } else {
-          // Countdown finished → the user is ON now (automatic flip).
-          // Mirrors the negative-offset synthetic ON above. The ON lasts the
-          // reference ON duration, then flips OFF automatically — the precise
-          // timer below fires at the window end; mode stays NORMAL so NO
-          // countdown banner renders for the ON→OFF direction.
-          immediateOnActiveRef.current = true;
-          shouldClearGrowattOnRef.current = false; // keep active while holding
-
-          finalResult = {
-            ...v21Result,
-            currentState: 'ON',
-            currentStateStartIso: userOnStartIsoP,
-            reconciledCycleStartIso: userOnStartIsoP,
+        // COUNTDOWN RUNNING — hidden. Hold the user OFF (the same logical
+        // state as immediately before the flip). nextTransition still
+        // pinpoints the predicted ON start so the regular waiting UI shows
+        // the predicted range, but NOTHING auto-flips at that instant; the
+        // precise re-render timer is aimed at the EXPIRY instant instead.
+        const minFromNowP = Math.max(0, (userOnStartMsP - nowV22) / 60_000);
+        const offStartIsoP = (v21Result.currentState === 'OFF' && v21Result.currentStateStartIso)
+          ? v21Result.currentStateStartIso
+          : (() => {
+              const cur = (v21Result.daySchedule ?? []).find((s: ShiftedScheduleSlot) =>
+                s.state === 'OFF' &&
+                new Date(s.startIso).getTime() <= nowV22 &&
+                (s.endIso ? new Date(s.endIso).getTime() : Infinity) > nowV22);
+              return cur?.startIso ?? null;
+            })();
+        const heldOffStartIsoP = offStartIsoP ?? growattOnIso;
+        const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
+        const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
+        const heldOffLabelP = heldOffDurMinP <= 0 ? '0د'
+          : hdHP === 0 ? `${hdMP}د`
+          : hdMP === 0 ? (hdHP === 1 ? 'ساعة' : `${hdHP}س`)
+          : `${hdHP}س ${hdMP}د`;
+        const syntheticHeldOffSlotP: ShiftedScheduleSlot = {
+          state: 'OFF',
+          startIso: heldOffStartIsoP,
+          endIso: userOnStartIsoP,
+          startFormatted: fmtLocalP(heldOffStartIsoP),
+          endFormatted: fmtLocalP(userOnStartIsoP),
+          shiftedStartFormatted: fmtLocalP(heldOffStartIsoP),
+          shiftedEndFormatted: fmtLocalP(userOnStartIsoP),
+          durationLabel: heldOffLabelP,
+          zone: 'DAY',
+          isEstimated: false,
+        };
+        immediateOnActiveRef.current = false;
+        shouldClearGrowattOnRef.current = false; // anchor stays while the countdown runs
+        finalResult = {
+          ...v21Result,
+          currentState: 'OFF',
+          currentStateStartIso: offStartIsoP,
+          isHoldingState: false,
+          daySchedule: [syntheticHeldOffSlotP, syntheticOnSlotP, ...restSlotsP],
+          nextTransition: {
+            type: 'UTILITY_ON' as const,
+            earliestTime: userOnStartIsoP,
+            latestTime: userOnStartIsoP,
+            earliestFormatted: fmtLocalP(userOnStartIsoP),
+            latestFormatted: fmtLocalP(userOnStartIsoP),
+            minFromNowMin: minFromNowP,
+            maxFromNowMin: minFromNowP,
+            rangeLabel: fmtLocalP(userOnStartIsoP),
+            rangeStartIso: userOnStartIsoP,
+            rangeEndIso: userOnStartIsoP,
+            inRangeWindow: false,
+          },
+          atc: {
+            ...v21Result.atc,
+            // NORMAL hides every POSITIVE_OFFSET_PENDING surface (banner,
+            // mode pill, popup) while the countdown runs internally.
+            mode: 'NORMAL' as any,
+            statusLine: '',
+            overrunMinutes: 0,
+            communityElevated: false,
             isHoldingState: false,
-            daySchedule: [syntheticOnSlotP, ...restSlotsP],
-            nextTransition: {
-              type: 'UTILITY_OFF' as const,
-              earliestTime: userOnEndIsoP,
-              latestTime: userOnEndIsoP,
-              earliestFormatted: fmtLocalP(userOnEndIsoP),
-              latestFormatted: fmtLocalP(userOnEndIsoP),
-              minFromNowMin: Math.max(0, (userOnEndMsP - nowV22) / 60_000),
-              maxFromNowMin: Math.max(0, (userOnEndMsP - nowV22) / 60_000),
-              rangeLabel: fmtLocalP(userOnEndIsoP),
-              rangeStartIso: userOnEndIsoP,
-              rangeEndIso: userOnEndIsoP,
-              inRangeWindow: false,
-            },
-            atc: {
-              ...v21Result.atc,
-              mode: 'NORMAL' as any,
-              statusLine: '',
-              overrunMinutes: 0,
-              communityElevated: false,
-              isHoldingState: false,
-              scheduledAutoTransitionIso: userOnEndIsoP,
-            },
-          };
-        }
+            // Internal re-render tick at the EXPIRY instant only — never
+            // displayed (all consumers require POSITIVE_OFFSET_PENDING) and
+            // never a visible state-change trigger.
+            scheduledAutoTransitionIso: hiddenExpiryIsoP,
+          },
+        };
       } else {
         immediateOnActiveRef.current = false;
         // If the engine has caught up (v21Result shows ON), schedule growattOnIso
@@ -1449,6 +1465,14 @@ export function useUserPredictions(
         // than calling clearGrowattOn() inside useMemo to avoid state updates
         // during render.
         if (v21Result.currentState === 'ON' && growattOnIso !== null) {
+          shouldClearGrowattOnRef.current = true;
+        }
+
+        // Hidden-countdown invalidation: a report (own or accepted followed)
+        // took over this cycle — drop the stale Growatt ON anchor for good so
+        // the hidden countdown can never fire later and overwrite the
+        // report-based state once the resync window expires.
+        if (reportInvalidatesPositiveAnchor) {
           shouldClearGrowattOnRef.current = true;
         }
 
