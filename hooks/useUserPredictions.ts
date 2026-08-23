@@ -1393,16 +1393,34 @@ export function useUserPredictions(
         // pinpoints the predicted ON start so the regular waiting UI shows
         // the predicted range, but NOTHING auto-flips at that instant; the
         // precise re-render timer is aimed at the EXPIRY instant instead.
+        //
+        // ELAPSED-TIME CONTINUITY: the Home "منذ" counter must keep showing
+        // the REAL elapsed time of the OFF state the user was already in —
+        // it must NOT restart from "للتو" when the countdown starts. The OFF
+        // start therefore comes from the OFF slot feeding the predicted ON
+        // window (the same OFF period shown before the flip), NOT from the
+        // engine's passthrough fields (which track the sensor's ON start
+        // while the sensor is ON and would read as "للتو").
         const minFromNowP = Math.max(0, (userOnStartMsP - nowV22) / 60_000);
-        const offStartIsoP = (v21Result.currentState === 'OFF' && v21Result.currentStateStartIso)
-          ? v21Result.currentStateStartIso
-          : (() => {
-              const cur = (v21Result.daySchedule ?? []).find((s: ShiftedScheduleSlot) =>
-                s.state === 'OFF' &&
-                new Date(s.startIso).getTime() <= nowV22 &&
-                (s.endIso ? new Date(s.endIso).getTime() : Infinity) > nowV22);
-              return cur?.startIso ?? null;
-            })();
+        const offStartIsoP = (() => {
+          const slots = v21Result.daySchedule ?? [];
+          // 1) The OFF slot feeding the predicted ON window — the OFF period
+          //    the user was already in when the sensor flipped. Valid for the
+          //    whole countdown (before AND after the predicted ON start).
+          const feeder = [...slots].reverse().find((s: ShiftedScheduleSlot) =>
+            s.state === 'OFF' && new Date(s.startIso).getTime() < userOnStartMsP);
+          if (feeder) return feeder.startIso;
+          // 2) Engine's own OFF start when the engine already shows OFF.
+          if (v21Result.currentState === 'OFF' && v21Result.currentStateStartIso) {
+            return v21Result.currentStateStartIso;
+          }
+          // 3) Any OFF slot containing "now".
+          const cur = slots.find((s: ShiftedScheduleSlot) =>
+            s.state === 'OFF' &&
+            new Date(s.startIso).getTime() <= nowV22 &&
+            (s.endIso ? new Date(s.endIso).getTime() : Infinity) > nowV22);
+          return cur?.startIso ?? null;
+        })();
         const heldOffStartIsoP = offStartIsoP ?? growattOnIso;
         const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
         const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
@@ -1427,7 +1445,13 @@ export function useUserPredictions(
         finalResult = {
           ...v21Result,
           currentState: 'OFF',
-          currentStateStartIso: offStartIsoP,
+          // Both start fields carry the CONTINUING OFF start: Home's "منذ"
+          // counter reads reconciledCycleStartIso first, so it must also be
+          // overridden — otherwise the engine's sensor-ON passthrough value
+          // resets the displayed elapsed time to "للتو" for the whole
+          // countdown.
+          currentStateStartIso: heldOffStartIsoP,
+          reconciledCycleStartIso: heldOffStartIsoP,
           isHoldingState: false,
           daySchedule: [syntheticHeldOffSlotP, syntheticOnSlotP, ...restSlotsP],
           nextTransition: {

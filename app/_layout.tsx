@@ -13,6 +13,7 @@ import * as SplashScreen from 'expo-splash-screen';
 SplashScreen.preventAutoHideAsync().catch(() => {});
 import { AuthProvider, useAuth } from '../contexts/AuthContext';
 import { ResyncProvider } from '../contexts/ResyncContext';
+import ConnectivityGate from '../components/ConnectivityGate';
 import {
   registerPushToken,
   setupNotificationResponseHandler,
@@ -184,12 +185,17 @@ function RootNavigator() {
 export default function RootLayout() {
   return (
     <SafeAreaProvider>
-      <AuthProvider>
-        <ResyncProvider>
-          <RootNavigator />
-          <StatusBar style="light" />
-        </ResyncProvider>
-      </AuthProvider>
+      {/* No internet at app open → hold the user on a no-internet screen
+          with a reload button instead of a broken home screen. The check
+          tolerates slow connections (12s budget + one retry). */}
+      <ConnectivityGate>
+        <AuthProvider>
+          <ResyncProvider>
+            <RootNavigator />
+            <StatusBar style="light" />
+          </ResyncProvider>
+        </AuthProvider>
+      </ConnectivityGate>
     </SafeAreaProvider>
   );
 }
