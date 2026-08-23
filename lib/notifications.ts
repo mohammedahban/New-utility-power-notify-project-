@@ -32,9 +32,18 @@ Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
     const data = notification.request.content.data ?? {};
     const soundEnabled = await getSoundEnabled();
+    // Grid state-change pushes carry play_sound (in-app alarm). Community
+    // report pushes instead carry the SERVER's hourly-throttle verdict:
+    // `audible: true` marks the first notification of the hour (spec §33),
+    // `audible: false` the throttled silent ones. Honor it so the first
+    // community push of each hour SOUNDS even while the app is open —
+    // without it every foreground community push was forced silent.
+    const audible =
+      data.play_sound === true ||
+      data.audible === true || data.audible === 'true';
     return {
       shouldShowAlert: true,
-      shouldPlaySound: soundEnabled && (data.play_sound === true),
+      shouldPlaySound: soundEnabled && audible,
       shouldSetBadge: true,
     };
   },

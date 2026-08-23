@@ -31,14 +31,16 @@ export default function ConnectivityGate({ children }: { children: React.ReactNo
     runCheck();
   }, [runCheck]);
 
-  // The native splash is normally held until AuthGate finishes — but this
-  // gate renders first and AuthGate may never mount (offline screen), so the
-  // gate hands off to its own identical JS splash immediately. Otherwise the
-  // user would stare at the native splash for the whole probe (up to ~24s)
-  // and never see the offline screen at all.
+  // The native splash is held by AuthGate until routing state is known — the
+  // pre-gate startup flow the user is used to (splash → brief default route →
+  // correct home, NO loading spinners). This gate must not change the ONLINE
+  // flow at all, so while the probe runs we render NOTHING and leave the
+  // native splash untouched (never hide it here — AuthGate hides it exactly
+  // as before once the app is ready). The splash is only dismissed when the
+  // phone turns out to be OFFLINE, so the no-internet screen becomes visible.
   useEffect(() => {
-    SplashScreen.hideAsync().catch(() => {});
-  }, []);
+    if (status === 'offline') SplashScreen.hideAsync().catch(() => {});
+  }, [status]);
 
   const onReload = useCallback(async () => {
     if (busy) return;
@@ -48,11 +50,9 @@ export default function ConnectivityGate({ children }: { children: React.ReactNo
   }, [busy, runCheck]);
 
   if (status === 'checking') {
-    return (
-      <View style={styles.splash}>
-        <ActivityIndicator size="large" color="#38bdf8" />
-      </View>
-    );
+    // Native splash is still covering — identical to the startup flow from
+    // before this gate existed. No spinner, no flash, no behavior change.
+    return null;
   }
 
   if (status === 'offline') {

@@ -522,7 +522,7 @@ function useGrowattOnWatcher(
   // user device can anchor its timeline the moment the sensor flips (the engine
   // would otherwise keep the user OFF until analyze-patterns regenerates).
   isPositiveOffset: boolean = false,
-): { growattOnTick: number; growattOnIso: string | null; growattOffIso: string | null; clearGrowattOn: () => void } {
+): { growattOnTick: number; growattOnIso: string | null; growattOffIso: string | null; growattPrevOffIso: string | null; clearGrowattOn: () => void } {
   const [tick, setTick] = useState(0);
   const [growattOnIso, setGrowattOnIso] = useState<string | null>(null);
   // POSITIVE-offset anchor companion: the Growatt OFF time of the current
@@ -530,6 +530,13 @@ function useGrowattOnWatcher(
   // long as the reference Growatt ON) stays known after the sensor flips
   // back to OFF in the middle of the countdown.
   const [growattOffIso, setGrowattOffIso] = useState<string | null>(null);
+  // POSITIVE-offset elapsed-continuity companion: the start of the OFF period
+  // that the current Growatt ON just ended. Once analyze-patterns regenerates
+  // post-flip, the schedule STARTS with the ON slot and carries no preceding
+  // OFF slot, so the memo's OFF-start lookups all fail — this event-derived
+  // value (+ the user's offset) reproduces the exact OFF start the user saw
+  // before the flip, so the "منذ" counter never restarts from "للتو".
+  const [growattPrevOffIso, setGrowattPrevOffIso] = useState<string | null>(null);
   const seededRef = useRef(false);
 
   const shouldSubscribe = isPendingNegative || isNegativeOffset || isPositiveOffset;
@@ -537,7 +544,25 @@ function useGrowattOnWatcher(
   const clearGrowattOn = useCallback(() => {
     setGrowattOnIso(null);
     setGrowattOffIso(null);
+    setGrowattPrevOffIso(null);
   }, []);
+
+  // The start of the OFF period a given ON event ended = the latest UTILITY_OFF
+  // strictly before it. Rare (only on ON transitions) and tiny (limit 1).
+  const fetchPrevOffStart = async (beforeIso: string): Promise<string | null> => {
+    try {
+      const { data } = await supabase
+        .from('power_events')
+        .select('occurred_at')
+        .eq('event_type', 'UTILITY_OFF')
+        .lt('occurred_at', beforeIso)
+        .order('occurred_at', { ascending: false })
+        .limit(1);
+      return data?.[0]?.occurred_at ?? null;
+    } catch (_) {
+      return null;
+    }
+  };
 
   // Subscribe to power_events for new UTILITY_ON / UTILITY_OFF rows
   useEffect(() => {
@@ -552,6 +577,9 @@ function useGrowattOnWatcher(
           if (newRow.event_type === 'UTILITY_ON') {
             if (newRow.occurred_at) setGrowattOnIso(newRow.occurred_at);
             setGrowattOffIso(null); // new ON cycle
+            if (isPositiveOffset && newRow.occurred_at) {
+              fetchPrevOffStart(newRow.occurred_at).then(iso => { if (iso) setGrowattPrevOffIso(iso); });
+            }
             setTick(t => t + 1);
           } else if (newRow.event_type === 'UTILITY_OFF') {
             if (isPositiveOffset) {
@@ -592,6 +620,9 @@ function useGrowattOnWatcher(
             const approxOnIso = row.last_polled ?? new Date().toISOString();
             setGrowattOnIso(prev => prev ?? approxOnIso);
             setGrowattOffIso(null); // new ON cycle
+            if (isPositiveOffset) {
+              fetchPrevOffStart(approxOnIso).then(iso => { if (iso) setGrowattPrevOffIso(prev => prev ?? iso); });
+            }
             setTick(t => t + 1);
           } else if (row.utility_on === false && old.utility_on === true) {
             if (isPositiveOffset) {
@@ -634,11 +665,20 @@ function useGrowattOnWatcher(
             new Date(lastOff.occurred_at).getTime() > new Date(lastOn.occurred_at).getTime()) {
           setGrowattOffIso(prev => prev ?? lastOff.occurred_at);
         }
+        // The OFF period the latest ON ended (rows are newest-first, so the
+        // first OFF OLDER than the ON is the one that fed it). Keeps the
+        // positive-offset "منذ" counter continuous after an app restart.
+        if (lastOn?.occurred_at) {
+          const onMs = new Date(lastOn.occurred_at).getTime();
+          const prevOff = data.find((r: any) =>
+            r.event_type === 'UTILITY_OFF' && new Date(r.occurred_at).getTime() < onMs);
+          if (prevOff?.occurred_at) setGrowattPrevOffIso(prev => prev ?? prevOff.occurred_at);
+        }
       } catch (_) { /* non-fatal: the live watcher still covers this session */ }
     })();
   }, [isPositiveOffset]);
 
-  return { growattOnTick: tick, growattOnIso, growattOffIso, clearGrowattOn };
+  return { growattOnTick: tick, growattOnIso, growattOffIso, growattPrevOffIso, clearGrowattOn };
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────────
@@ -830,7 +870,7 @@ export function useUserPredictions(
   // isNegativeOffset: must immediately flip UI to ON without waiting for analyze-patterns
   const isPendingNegativeV21 = v21Meta.offsetState === 'PENDING_NEGATIVE';
   const isNegativeOffset = offsetMinutes < 0;
-  const { growattOnTick, growattOnIso, growattOffIso, clearGrowattOn } = useGrowattOnWatcher(
+  const { growattOnTick, growattOnIso, growattOffIso, growattPrevOffIso, clearGrowattOn } = useGrowattOnWatcher(
     resyncPoint,
     isPendingNegativeV21,
     isNegativeOffset,
@@ -1421,7 +1461,18 @@ export function useUserPredictions(
             (s.endIso ? new Date(s.endIso).getTime() : Infinity) > nowV22);
           return cur?.startIso ?? null;
         })();
-        const heldOffStartIsoP = offStartIsoP ?? growattOnIso;
+        // ELAPSED-CONTINUITY FALLBACK (Issue: "منذ للتو" after the flip):
+        // once analyze-patterns regenerates post-flip, the schedule STARTS
+        // with the ON slot and carries NO preceding OFF slot, so every lookup
+        // above fails and the chain used to collapse to the sensor-flip time.
+        // The watcher's event-derived previous-OFF start + the user's offset
+        // reproduces the exact OFF start shown before the flip (the user's
+        // OFF begins offset-minutes after the sensor's OFF), so the counter
+        // continues seamlessly — e.g. "منذ ساعة" keeps counting.
+        const prevOffStartIsoP = growattPrevOffIso
+          ? new Date(new Date(growattPrevOffIso).getTime() + offsetMinutes * 60_000).toISOString()
+          : null;
+        const heldOffStartIsoP = offStartIsoP ?? prevOffStartIsoP ?? growattOnIso;
         const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
         const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
         const heldOffLabelP = heldOffDurMinP <= 0 ? '0د'
@@ -1539,7 +1590,7 @@ export function useUserPredictions(
   // excluded from deps (Rule Q2-A freeze). growattOnIso and resolutionTick
   // are included so the memo re-runs immediately when the watcher fires.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick, growattOnIso, growattOffIso, onCommunityOffsetComputed]);
+  }, [prediction, offsetMinutes, resyncPoint, transitionMode, anchorStartIso, tick, frozenOffsetLoaded, v21Meta, resolutionTick, growattOnIso, growattOffIso, growattPrevOffIso, onCommunityOffsetComputed]);
 
   // ── Clear stale growattOnIso after engine catches up ─────────────────────
   // Runs after the memo settles. Prevents the previous ON cycle's growattOnIso
