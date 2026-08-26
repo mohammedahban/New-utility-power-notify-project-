@@ -883,6 +883,13 @@ export function useUserPredictions(
   const immediateOnActiveRef = useRef(false);
   // Ref to drive post-memo growattOnIso cleanup without rendering side-effects.
   const shouldClearGrowattOnRef = useRef(false);
+  // POSITIVE hidden-countdown elapsed-continuity carry-forward: remembers the
+  // continuing-OFF start resolved for the CURRENT Growatt-ON cycle so the
+  // Home "منذ" counter never collapses to "للتو" when the schedule
+  // regenerates mid-countdown and the live lookups fail (see usage in the
+  // memo below). Keyed by the cycle's Growatt-ON instant — a new cycle
+  // invalidates it automatically.
+  const heldOffContinuityRef = useRef<{ onMs: number; iso: string } | null>(null);
 
   const userPrediction = useMemo((): UserPrediction | null => {
     if (!prediction) return null;
@@ -1472,7 +1479,29 @@ export function useUserPredictions(
         const prevOffStartIsoP = growattPrevOffIso
           ? new Date(new Date(growattPrevOffIso).getTime() + offsetMinutes * 60_000).toISOString()
           : null;
-        const heldOffStartIsoP = offStartIsoP ?? prevOffStartIsoP ?? growattOnIso;
+        // FOLLOW-UP FIX (UI shows "للتو" until the predicted range starts):
+        // the feeder lookup above succeeds against the PRE-flip schedule in
+        // the same pass that first sees the Growatt ON, but analyze-patterns
+        // soon regenerates the schedule WITHOUT any preceding OFF slot and
+        // the prev-OFF fetch may still be in flight (or have failed) — the
+        // chain then collapsed to growattOnIso, so the anchor sat at the
+        // sensor-flip instant and useElapsedFromIso rendered "للتو" for the
+        // whole Growatt-ON → predicted-range window. Carry the FIRST
+        // continuing-OFF start resolved for THIS cycle and reuse it whenever
+        // the live lookups come up empty, so the counter keeps counting from
+        // the user's real OFF start. Display plumbing only — the countdown,
+        // expiry (60-minute rebase) and report logic are untouched.
+        const resolvedOffStartIsoP = offStartIsoP ?? prevOffStartIsoP ?? null;
+        if (resolvedOffStartIsoP && resolvedOffStartIsoP !== growattOnIso) {
+          if (heldOffContinuityRef.current?.onMs !== growattOnMsP) {
+            heldOffContinuityRef.current = { onMs: growattOnMsP, iso: resolvedOffStartIsoP };
+          }
+        }
+        const carriedOffStartIsoP =
+          heldOffContinuityRef.current?.onMs === growattOnMsP
+            ? heldOffContinuityRef.current.iso
+            : null;
+        const heldOffStartIsoP = resolvedOffStartIsoP ?? carriedOffStartIsoP ?? growattOnIso;
         const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
         const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
         const heldOffLabelP = heldOffDurMinP <= 0 ? '0د'
