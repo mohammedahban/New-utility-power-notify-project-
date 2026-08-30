@@ -12,6 +12,40 @@ const GROWATT_TOKEN = Deno.env.get("GROWATT_TOKEN")!;
 const INVERTER_SN   = Deno.env.get("GROWATT_INVERTER_SN")!;
 const PAC_INPUT_THRESHOLD = 50;
 
+// ISSUE-2 FIX: single reusable analyze-patterns trigger. The original inline
+// loop fired only when a transition was freshly detected; if all 3 attempts
+// failed (timeouts, function hiccup) the event was dropped until the next
+// sensor flip. Extracting it lets the recovery guard below re-fire it on later
+// poll ticks. Idempotent: analyze-patterns recomputes deterministically from
+// power_events, so re-running it never duplicates a transition or its effects.
+async function triggerAnalyze(eventType: string, occurredAt: string): Promise<boolean> {
+  const analyzeUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/analyze-patterns`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(analyzeUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+          apikey: `${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+        },
+        body: JSON.stringify({ trigger: "poll-growatt", eventType, occurredAt }),
+        signal: AbortSignal.timeout(60000),
+      });
+      if (res.ok) {
+        console.log(`[poll-growatt] analyze-patterns triggered successfully (attempt ${attempt})`);
+        return true;
+      }
+      const bodyText = await res.text().catch(() => "");
+      console.error(`[poll-growatt] analyze-patterns HTTP ${res.status} (attempt ${attempt}):`, bodyText.slice(0, 200));
+    } catch (err) {
+      console.error(`[poll-growatt] analyze-patterns trigger failed (attempt ${attempt}):`, err);
+    }
+  }
+  console.error("[poll-growatt] analyze-patterns could NOT be triggered after 3 attempts — recovery will retry on the next poll tick");
+  return false;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -246,6 +280,41 @@ Deno.serve(async (req) => {
     // NOTE: prediction_accuracy_logs is now written by analyze-patterns (step 22)
     // after the day schedule is generated, giving it access to bias-corrected
     // slot durations. No accuracy logging here.
+  }
+
+  // ── 5b. Missed-trigger recovery (ISSUE-2 FIX) ─────────────────────────────
+  // The immediate trigger above is fire-and-forget: it retries 3 times then
+  // gives up. If it is missed, the User App — which is driven by
+  // utility_predictions, refreshed by analyze-patterns — would stay stale until
+  // the NEXT sensor flip: hours, sometimes days. This idempotent guard re-fires
+  // analyze-patterns on later poll ticks whenever the latest power event is
+  // newer than the last prediction's computed_at. It runs only when this tick
+  // did NOT just fire the fresh trigger, so it never double-triggers. Safe to
+  // retry: analyze-patterns recomputes deterministically from power_events, so
+  // re-running it never duplicates the transition, its notification, or any
+  // report-generated state.
+  if (!stateChanged) {
+    const nowMs = new Date(now).getTime();
+    const { data: lastEv } = await supabase
+      .from("power_events")
+      .select("event_type, occurred_at")
+      .order("occurred_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const lastEvMs = lastEv?.occurred_at ? new Date(lastEv.occurred_at).getTime() : 0;
+    if (lastEvMs > 0 && nowMs - lastEvMs < 30 * 60_000) {
+      const { data: prevPred } = await supabase
+        .from("utility_predictions")
+        .select("computed_at")
+        .eq("id", 1)
+        .maybeSingle();
+      const predMs = prevPred?.computed_at ? new Date(prevPred.computed_at).getTime() : 0;
+      if (lastEvMs > predMs) {
+        const eventType = lastEv.event_type as string;
+        console.log("[poll-growatt] Recovery: latest transition not yet reflected in utility_predictions — re-triggering analyze-patterns");
+        await triggerAnalyze(eventType, lastEv.occurred_at);
+      }
+    }
   }
 
   // ── 6. Upsert live state ───────────────────────────────────────────────────

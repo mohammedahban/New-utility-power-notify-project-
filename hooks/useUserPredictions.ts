@@ -1454,18 +1454,29 @@ export function useUserPredictions(
           // 1) The OFF slot feeding the predicted ON window — the OFF period
           //    the user was already in when the sensor flipped. Valid for the
           //    whole countdown (before AND after the predicted ON start).
+          //    ISSUE-1 GUARD: a genuine continuing-OFF MUST have started
+          //    BEFORE the sensor's ON flip, so we reject any OFF slot whose
+          //    start is at/after growattOnMsP — this excludes the engine's
+          //    FABRICATED POSITIVE_OFFSET_PENDING holding slot (startIso is
+          //    recomputed to "now" on every pass), which would otherwise pin
+          //    the "منذ" anchor to the rolling "now" and render "للتو".
           const feeder = [...slots].reverse().find((s: ShiftedScheduleSlot) =>
-            s.state === 'OFF' && new Date(s.startIso).getTime() < userOnStartMsP);
+            s.state === 'OFF' &&
+            new Date(s.startIso).getTime() < userOnStartMsP &&
+            new Date(s.startIso).getTime() < growattOnMsP);
           if (feeder) return feeder.startIso;
           // 2) Engine's own OFF start when the engine already shows OFF.
           if (v21Result.currentState === 'OFF' && v21Result.currentStateStartIso) {
             return v21Result.currentStateStartIso;
           }
-          // 3) Any OFF slot containing "now".
+          // 3) Any OFF slot containing "now" (excluding the fabricated
+          //    POSITIVE_OFFSET_PENDING slot, whose start is at/after the
+          //    sensor ON — same ISSUE-1 guard as above).
           const cur = slots.find((s: ShiftedScheduleSlot) =>
             s.state === 'OFF' &&
             new Date(s.startIso).getTime() <= nowV22 &&
-            (s.endIso ? new Date(s.endIso).getTime() : Infinity) > nowV22);
+            (s.endIso ? new Date(s.endIso).getTime() : Infinity) > nowV22 &&
+            new Date(s.startIso).getTime() < growattOnMsP);
           return cur?.startIso ?? null;
         })();
         // ELAPSED-CONTINUITY FALLBACK (Issue: "منذ للتو" after the flip):
@@ -1491,17 +1502,39 @@ export function useUserPredictions(
         // the live lookups come up empty, so the counter keeps counting from
         // the user's real OFF start. Display plumbing only — the countdown,
         // expiry (60-minute rebase) and report logic are untouched.
-        const resolvedOffStartIsoP = offStartIsoP ?? prevOffStartIsoP ?? null;
-        if (resolvedOffStartIsoP && resolvedOffStartIsoP !== growattOnIso) {
+        // ISSUE-1 FIX (UI showed "منذ للتو" for the whole Growatt-ON window):
+        // ROOT CAUSE — after analyze-patterns regenerates the schedule, the
+        // engine's POSITIVE_OFFSET_PENDING holding slot is FABRICATED with
+        // startIso = "now" and that start is recomputed on EVERY memo pass
+        // (verified: daySchedule[0].startIso = 06:00 → 06:30 → 07:00 …). The
+        // feeder lookup below was hitting that synthetic slot, so the "منذ"
+        // anchor was pinned to the rolling "now" and the UI rendered "للتو"
+        // (always < 1 min away) for the entire Growatt-ON window. The
+        // event-derived prev-OFF start (growattPrevOffIso + offset) is the
+        // user's REAL continuing-OFF start and is immune to schedule
+        // regeneration — it must therefore WIN over any schedule slot. Keep
+        // the engine's non-null currentStateStartIso as a further fallback so
+        // a Growatt flip can never become the user's OFF start.
+        const resolvedOffStartIsoP = prevOffStartIsoP ?? offStartIsoP ?? null;
+        const engineOffStartIsoP =
+          v21Result.currentState === 'OFF' && v21Result.currentStateStartIso
+            ? v21Result.currentStateStartIso
+            : null;
+        const bestOffStartIsoP = resolvedOffStartIsoP ?? engineOffStartIsoP ?? null;
+        if (bestOffStartIsoP && bestOffStartIsoP !== growattOnIso) {
           if (heldOffContinuityRef.current?.onMs !== growattOnMsP) {
-            heldOffContinuityRef.current = { onMs: growattOnMsP, iso: resolvedOffStartIsoP };
+            heldOffContinuityRef.current = { onMs: growattOnMsP, iso: bestOffStartIsoP };
           }
         }
         const carriedOffStartIsoP =
           heldOffContinuityRef.current?.onMs === growattOnMsP
             ? heldOffContinuityRef.current.iso
             : null;
-        const heldOffStartIsoP = resolvedOffStartIsoP ?? carriedOffStartIsoP ?? growattOnIso;
+        // Absolute last resort supplies a valid ISO; growattOnIso is only ever
+        // reached when NO real OFF start exists anywhere — for a user who was
+        // genuinely OFF before the flip the engine value / carry-forward /
+        // prev-OFF make that path unreachable.
+        const heldOffStartIsoP = bestOffStartIsoP ?? carriedOffStartIsoP ?? growattOnIso;
         const heldOffDurMinP = Math.max(0, Math.round((userOnStartMsP - new Date(heldOffStartIsoP).getTime()) / 60_000));
         const hdHP = Math.floor(heldOffDurMinP / 60); const hdMP = heldOffDurMinP % 60;
         const heldOffLabelP = heldOffDurMinP <= 0 ? '0د'

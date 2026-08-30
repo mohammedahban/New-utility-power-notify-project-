@@ -92,8 +92,8 @@ android {
         applicationId 'com.onspace.appfea5cdd7'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 3
-        versionName "1.0.1"
+        versionCode 10
+        versionName "2.0.8"
     }
     signingConfigs {
         debug {
